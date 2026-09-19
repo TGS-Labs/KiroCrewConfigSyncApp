@@ -1,0 +1,37 @@
+{
+  "name": "config-sync",
+  "version": "0.1.0",
+  "displayName": "Config Sync",
+  "description": "A Kiro Crew app: Config Sync",
+  "author": "developer",
+  "iconPath": "assets/icon.png",
+  "agents": [
+    "agents/sample-agent.json"
+  ],
+  "skills": [
+    "skills/sample-skill"
+  ],
+  "tags": [],
+  "backend": {
+    "entryPoint": "backend/server.py",
+    "port": "auto",
+    "healthCheck": "/health"
+  },
+  "ui": {
+    "entry": "dist/index.mjs",
+    "pages": [
+      {
+        "route": "/apps/config-sync",
+        "label": "Config Sync",
+        "icon": "Package"
+      }
+    ]
+  },
+  "crons": [
+    {
+      "name": "config-sync-check",
+      "every": 300,
+      "message": "Run periodic check for Config Sync"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "sample-agent",
+  "model": "auto",
+  "description": "A sample agent \u2014 customize this for your use case",
+  "prompt": "You are a helpful assistant.",
+  "tools": []
+}
