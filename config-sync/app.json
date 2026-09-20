@@ -1,0 +1,42 @@
+{
+  "name": "config-sync",
+  "version": "0.1.0",
+  "displayName": "Config Sync",
+  "description": "A Kiro Crew app: Config Sync",
+  "author": "developer",
+  "iconPath": "assets/icon.png",
+  "defaultEnabled": false,
+  "agents": [],
+  "skills": [],
+  "tags": [],
+  "backend": {
+    "entryPoint": "backend/server.py",
+    "port": "auto",
+    "healthCheck": "/health"
+  },
+  "ui": {
+    "entry": "dist/index.mjs",
+    "pages": [
+      {
+        "route": "/apps/config-sync",
+        "label": "Config Sync",
+        "icon": "Package"
+      }
+    ]
+  },
+  "crons": [
+    {
+      "name": "config-sync-push",
+      "every": 900,
+      "command": "python3 backend/push.py",
+      "enabled": false,
+      "silent": true
+    },
+    {
+      "name": "config-sync-poll",
+      "every": 900,
+      "command": "python3 backend/poll.py",
+      "enabled": false
+    }
+  ]
+}
