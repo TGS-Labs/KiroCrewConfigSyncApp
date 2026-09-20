@@ -156,9 +156,7 @@ def test_removing_a_server_changes_redacted_output(doc):
     removed_name = next(iter(doc["mcpServers"]))
     shrunk_doc = dict(doc)
     shrunk_doc["mcpServers"] = {
-        name: entry
-        for name, entry in doc["mcpServers"].items()
-        if name != removed_name
+        name: entry for name, entry in doc["mcpServers"].items() if name != removed_name
     }
     after = {"relpath/mcp.json": _as_bytes(shrunk_doc)}
 

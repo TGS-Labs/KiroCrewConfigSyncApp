@@ -23,7 +23,7 @@ from typing import Iterator
 
 import pytest
 
-import state
+from backend import state
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +237,7 @@ class TestLastSeenSha:
         store.record_seen_sha("0123456789abcdef0123456789abcdef01234567")
 
         reloaded = state.load_state()
-        assert (
-            reloaded.last_seen_sha == "0123456789abcdef0123456789abcdef01234567"
-        )
+        assert reloaded.last_seen_sha == "0123456789abcdef0123456789abcdef01234567"
 
     def test_record_seen_sha_overwrites_the_previous_value(
         self, isolated_roots: dict[str, Path]
@@ -249,9 +247,7 @@ class TestLastSeenSha:
         store.record_seen_sha("2222222222222222222222222222222222222222")
 
         reloaded = state.load_state()
-        assert (
-            reloaded.last_seen_sha == "2222222222222222222222222222222222222222"
-        )
+        assert reloaded.last_seen_sha == "2222222222222222222222222222222222222222"
 
 
 # ---------------------------------------------------------------------------
@@ -385,9 +381,7 @@ class TestBoundedHistory:
 
 
 class TestRestoreDirs:
-    def test_restore_dirs_starts_empty(
-        self, isolated_roots: dict[str, Path]
-    ) -> None:
+    def test_restore_dirs_starts_empty(self, isolated_roots: dict[str, Path]) -> None:
         store = state.load_state()
         assert store.restore_dirs == {}
 

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import os
 import re
-import stat
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -132,7 +132,10 @@ def test_git_argv_returns_git_dash_c_cwd_then_safe_config_then_args(tmp_path):
     assert argv[0] == "git"
     assert argv[1] == "-C"
     assert argv[2] == str(tmp_path)
-    assert tuple(argv[3 : 3 + len(git_safety.GIT_SAFE_CONFIG)]) == git_safety.GIT_SAFE_CONFIG
+    assert (
+        tuple(argv[3 : 3 + len(git_safety.GIT_SAFE_CONFIG)])
+        == git_safety.GIT_SAFE_CONFIG
+    )
     assert argv[3 + len(git_safety.GIT_SAFE_CONFIG) :] == ["status", "--short"]
 
 
@@ -150,9 +153,9 @@ def test_git_argv_pins_attributes_before_returning_on_a_real_repo(tmp_path):
     hardened argv against a repo whose in-tree `.gitattributes`
     filter/diff driver is still bound.
     """
-    _init_bare_worktree(tmp_path)
-    git_safety.git_argv(tmp_path, "status")
-    pin_path = tmp_path / ".git" / "info" / "attributes"
+    root = _init_bare_worktree(tmp_path)
+    git_safety.git_argv(root, "status")
+    pin_path = root / ".git" / "info" / "attributes"
     assert pin_path.is_file()
     assert pin_path.read_text(encoding="utf-8") == git_safety._ATTRIBUTES_PIN
 
@@ -187,7 +190,9 @@ def test_git_argv_on_a_non_repo_path_does_not_raise(tmp_path):
     attribute-execution surface to defend, so git_argv must let it through
     rather than refusing a harmless call.
     """
-    argv = git_safety.git_argv(tmp_path, "clone", "https://example.invalid/repo.git", ".")
+    argv = git_safety.git_argv(
+        tmp_path, "clone", "https://example.invalid/repo.git", "."
+    )
     assert argv[0] == "git"
     assert str(tmp_path) in argv
 
@@ -305,6 +310,10 @@ def test_reject_link_raises_on_a_symlinked_info_dir(tmp_path):
     root = _init_bare_worktree(tmp_path)
     real_info = tmp_path / "real-info"
     real_info.mkdir()
+    # `git init` (2.47.3) already creates `.git/info/` as a real directory
+    # (containing `exclude`) — remove it first so the symlink can actually
+    # be created where the test intends.
+    shutil.rmtree(root / ".git" / "info")
     (root / ".git" / "info").symlink_to(real_info)
 
     with pytest.raises(git_safety.GitSafetyError):
@@ -466,10 +475,12 @@ def test_linked_worktree_dot_git_file_repointed_at_foreign_gitdir_is_refused(
     # has no bidirectional pointer back to repo-a's worktree.
     (worktree_a / ".git").write_text(f"gitdir: {common_b}\n", encoding="utf-8")
 
-    foreign_pin_before = (common_b / "info" / "attributes")
+    foreign_pin_before = common_b / "info" / "attributes"
     foreign_existed_before = foreign_pin_before.exists()
     foreign_content_before = (
-        foreign_pin_before.read_text(encoding="utf-8") if foreign_existed_before else None
+        foreign_pin_before.read_text(encoding="utf-8")
+        if foreign_existed_before
+        else None
     )
 
     with pytest.raises(git_safety.GitSafetyError):
@@ -508,7 +519,9 @@ def test_linked_worktree_symlinked_gitdir_target_is_refused(tmp_path):
     real_target = per_worktree
     linked_elsewhere = tmp_path / "linked-per-worktree"
     linked_elsewhere.symlink_to(real_target)
-    (worktree_root / ".git").write_text(f"gitdir: {linked_elsewhere}\n", encoding="utf-8")
+    (worktree_root / ".git").write_text(
+        f"gitdir: {linked_elsewhere}\n", encoding="utf-8"
+    )
 
     with pytest.raises(git_safety.GitSafetyError):
         git_safety.git_argv(worktree_root, "status")
@@ -583,7 +596,9 @@ _GIT_SAFETY_MODULE = _THIS_FILE.parent / "git_safety.py"
 _SUBPROCESS_SPAWN_RE = re.compile(
     r"\bsubprocess\.(Popen|run|call|check_call|check_output)\s*\("
 )
-_LITERAL_GIT_ARGV_RE = re.compile(r"""(?:\[\s*["']git["']|^\s*["']git\b)""", re.MULTILINE)
+_LITERAL_GIT_ARGV_RE = re.compile(
+    r"""(?:\[\s*["']git["']|^\s*["']git\b)""", re.MULTILINE
+)
 
 
 def _iter_backend_python_files():
@@ -612,7 +627,9 @@ def test_no_backend_module_other_than_git_safety_spawns_subprocess_directly():
         text = path.read_text(encoding="utf-8")
         for lineno, line in enumerate(text.splitlines(), start=1):
             if _SUBPROCESS_SPAWN_RE.search(line):
-                offenders.append(f"{path.relative_to(_BACKEND_ROOT.parent)}:{lineno}: {line.strip()}")
+                offenders.append(
+                    f"{path.relative_to(_BACKEND_ROOT.parent)}:{lineno}: {line.strip()}"
+                )
     assert not offenders, (
         "found a direct subprocess spawn outside git_safety.py — every git "
         "invocation must go through git_safety.git_argv():\n" + "\n".join(offenders)
@@ -634,7 +651,9 @@ def test_no_backend_module_other_than_git_safety_builds_a_literal_git_argv():
             if stripped.startswith("#"):
                 continue
             if _LITERAL_GIT_ARGV_RE.search(line):
-                offenders.append(f"{path.relative_to(_BACKEND_ROOT.parent)}:{lineno}: {stripped}")
+                offenders.append(
+                    f"{path.relative_to(_BACKEND_ROOT.parent)}:{lineno}: {stripped}"
+                )
     assert not offenders, (
         "found a literal ['git', ...] argv built outside git_safety.py — "
         "route every git invocation through git_safety.git_argv():\n"
@@ -667,8 +686,13 @@ def _run_git(*args: str, cwd: Path) -> None:
         cwd=str(cwd),
         check=True,
         capture_output=True,
-        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"},
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+        },
     )
 
 
@@ -692,10 +716,17 @@ def _init_linked_worktree(base: Path, name: str = "repo") -> tuple[Path, Path, P
     _run_git("commit", "-q", "-m", "initial", cwd=main_root)
 
     worktree_root = base / f"{name}-worktree"
-    _run_git("worktree", "add", "-q", "-b", f"{name}-wt-branch", str(worktree_root), cwd=main_root)
+    _run_git(
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        f"{name}-wt-branch",
+        str(worktree_root),
+        cwd=main_root,
+    )
 
     common_gitdir = main_root / ".git"
-    worktree_id = worktree_root.name
     per_worktree_gitdir = common_gitdir / "worktrees" / worktree_root.name
     if not per_worktree_gitdir.is_dir():
         # git may pick a de-duplicated id if the name collides; discover it.

@@ -97,13 +97,10 @@ def test_every_entry_has_a_propagation_class():
     """
     entries = _all_entries()
     missing = [
-        entry
-        for entry in entries
-        if getattr(entry, "propagation_class", None) is None
+        entry for entry in entries if getattr(entry, "propagation_class", None) is None
     ]
     assert not missing, (
-        "the following allowlist entries have no PropagationClass: "
-        f"{missing!r}"
+        "the following allowlist entries have no PropagationClass: " f"{missing!r}"
     )
 
 
@@ -213,9 +210,9 @@ def test_never_tracked_paths_are_denylist_complete_against_every_entry():
     entries = _all_entries()
     for entry in entries:
         for relpath in NEVER_TRACKED_RELATIVE_PATHS:
-            assert not allowlist.entry_matches(entry, relpath), (
-                f"entry {entry!r} matches never-tracked path {relpath!r}"
-            )
+            assert not allowlist.entry_matches(
+                entry, relpath
+            ), f"entry {entry!r} matches never-tracked path {relpath!r}"
 
 
 def test_absence_from_a_denylist_is_not_how_inclusion_works():
@@ -316,9 +313,9 @@ def test_entry_patterns_contain_no_path_traversal_shape():
     """
     entries = _all_entries()
     for entry in entries:
-        assert ".." not in entry.pattern.split("/"), (
-            f"entry {entry!r} pattern contains a path-traversal segment"
-        )
+        assert ".." not in entry.pattern.split(
+            "/"
+        ), f"entry {entry!r} pattern contains a path-traversal segment"
 
 
 def test_lock_and_pid_glob_denial_holds_for_arbitrary_stems():
@@ -347,6 +344,5 @@ def test_no_entry_pattern_is_a_bare_wildcard():
     for entry in entries:
         stripped = entry.pattern.replace("*", "").replace("/", "")
         assert any(ch in literal_chars for ch in stripped), (
-            f"entry {entry!r} pattern has no literal component: "
-            f"{entry.pattern!r}"
+            f"entry {entry!r} pattern has no literal component: " f"{entry.pattern!r}"
         )

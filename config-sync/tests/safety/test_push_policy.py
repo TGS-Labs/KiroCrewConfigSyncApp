@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import importlib
 import sys
-from collections.abc import Iterator
 
 import pytest
 
@@ -55,9 +54,9 @@ class TestAuthorizeDirectPushProtectedBranches:
         allowed, reason = authorize_direct_push(branch=branch)
 
         assert allowed is False, f"push to {branch!r} must be refused"
-        assert isinstance(reason, str) and reason.strip(), (
-            "a refusal must carry a non-empty human-readable reason string"
-        )
+        assert (
+            isinstance(reason, str) and reason.strip()
+        ), "a refusal must carry a non-empty human-readable reason string"
 
     @pytest.mark.parametrize(
         "branch",
@@ -143,7 +142,9 @@ class TestAuthorizeDirectPushProtectedBranches:
         from backend.safety.push_policy import authorize_direct_push
 
         allowed, _ = authorize_direct_push(branch="origin/refs/heads/main")
-        assert allowed is False, "nested remote/ref prefixes must not bypass the denylist"
+        assert (
+            allowed is False
+        ), "nested remote/ref prefixes must not bypass the denylist"
 
     def test_release_prefix_is_not_stripped_as_a_remote(self) -> None:
         """'release/2026.1' must remain protected -- normalize_branch must
@@ -187,8 +188,8 @@ class TestScanContentForSecretsRefusesRatherThanRewrites:
         from backend.safety.push_policy import scan_content_for_secrets
 
         secret_bearing_text = (
-            'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n'
-            'github_token = ghp_1234567890abcdefghijklmnopqrstuvwxyz12\n'
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+            "github_token = ghp_1234567890abcdefghijklmnopqrstuvwxyz12\n"
         )
 
         clean, note = scan_content_for_secrets(secret_bearing_text)
@@ -202,15 +203,17 @@ class TestScanContentForSecretsRefusesRatherThanRewrites:
         message (f"found secret: {match}") would violate."""
         from backend.safety.push_policy import scan_content_for_secrets
 
-        distinctive_secret = "sk-VERY-DISTINCTIVE-SECRET-VALUE-should-never-leak-99887766"
+        distinctive_secret = (
+            "sk-ant-VERY-DISTINCTIVE-SECRET-VALUE-should-never-leak-99887766"
+        )
         secret_bearing_text = f"api_key = {distinctive_secret}\n"
 
         clean, note = scan_content_for_secrets(secret_bearing_text)
 
         assert clean is False
-        assert distinctive_secret not in note, (
-            "the refusal note must never contain the scanned secret value"
-        )
+        assert (
+            distinctive_secret not in note
+        ), "the refusal note must never contain the scanned secret value"
         # Guard against a partial-echo evasion too (e.g. logging half the key).
         assert distinctive_secret[:20] not in note
 
@@ -251,9 +254,9 @@ class TestScanContentForSecretsRefusesRatherThanRewrites:
         clean, note = scan_content_for_secrets(many_secrets_text)
 
         assert clean is False
-        assert any(ch.isdigit() for ch in note), (
-            "a multi-finding refusal must surface a count, not just a bare code"
-        )
+        assert any(
+            ch.isdigit() for ch in note
+        ), "a multi-finding refusal must surface a count, not just a bare code"
 
     def test_content_is_never_mutated_or_rewritten(self) -> None:
         """scan_content_for_secrets must return a VERDICT, never a modified
@@ -373,7 +376,8 @@ class TestScanContentForSecretsFailsClosed:
         except Exception as exc:  # noqa: BLE001 - the whole point of this test
             pytest.fail(
                 "scan_content_for_secrets must not raise when the scanner "
-                f"is unavailable; it must return a fail-closed verdict instead, got {exc!r}"
+                f"is unavailable; it must return a fail-closed verdict "
+                f"instead, got {exc!r}"
             )
 
         clean, _note = result
