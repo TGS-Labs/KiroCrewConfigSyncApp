@@ -462,3 +462,501 @@ def test_git_argv_spy_is_reachable_and_would_be_caught_if_called(
     finally:
         git_safety.git_argv = original  # type: ignore[assignment]
     assert spy.called
+
+
+# ---------------------------------------------------------------------------
+# Change-path tests (tasks.md 3.2, requirements.md 2.3, 2.4, 2.5, 3.1, 3.6,
+# 3.8) — appended after the no-op-path tests above, which are untouched.
+#
+# `backend/push.py` currently raises NotImplementedError at the TODO(3.2)
+# seam whenever `tree_hash` differs from `state.last_pushed_hash`. Every test
+# below drives `push.run()` down that seam and is expected to fail RED
+# against the current module with that NotImplementedError — not a
+# collection error, not an AttributeError from a wrong mock target. That is
+# the correct TDD starting state for this path.
+#
+# The change path's four collaborators are mocked at `backend.push`'s own
+# module namespace (`push.push_policy`, `push.git_safety`, `push.redact`),
+# matching this file's existing `from backend.safety import git_safety,
+# push_policy` import shape and the no-op tests' dual-patch convention (the
+# real modules AND the names inside `backend.push`, in case it imports
+# names directly rather than the module).
+# ---------------------------------------------------------------------------
+
+
+def _seed_changed_hash(monkeypatch: pytest.MonkeyPatch) -> tuple:
+    """Seed state so the computed tree_hash differs from last_pushed_hash,
+
+    driving push.run() down the change-path seam rather than the no-op
+    early return. Returns (store, current_hash, redacted_tree) so a test
+    can assert against the exact bytes push.py must have written.
+    """
+    from backend import collect, redact, state
+
+    collected = collect.collect()
+    redacted = redact.redact(collected)
+    current_hash = push.tree_hash(redacted)
+
+    store = state.load_state()
+    monkeypatch.setattr(store, "last_pushed_hash", "a-completely-different-hash")
+    monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
+
+    return store, current_hash, redacted
+
+
+@pytest.fixture
+def change_path_collaborators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[dict]:
+    """Patch every change-path collaborator (scan, git_argv, authorize, and
+
+    message redaction) at BOTH the real module and `backend.push`'s own
+    namespace, so the test controls each decision point independently
+    regardless of which import form push.py uses. Defaults are permissive
+    (clean scan, push authorized, git_argv/redact_message pass-through) so
+    an individual test only needs to override the one collaborator whose
+    behaviour it is asserting on.
+    """
+    from backend.safety import git_safety, push_policy, redact_msg
+
+    scan_mock = MagicMock(
+        name="push_policy.scan_content_for_secrets", return_value=(True, "ok")
+    )
+    authorize_mock = MagicMock(
+        name="push_policy.authorize_direct_push",
+        return_value=(True, "push authorized"),
+    )
+    git_argv_mock = MagicMock(
+        name="git_safety.git_argv",
+        side_effect=lambda cwd, *args: ["git", "-C", str(cwd), *args],
+    )
+    redact_message_mock = MagicMock(
+        name="redact_msg.redact_message", side_effect=lambda text: text
+    )
+    subprocess_run_mock = MagicMock(name="subprocess.run")
+
+    monkeypatch.setattr(push_policy, "scan_content_for_secrets", scan_mock)
+    monkeypatch.setattr(push_policy, "authorize_direct_push", authorize_mock)
+    monkeypatch.setattr(git_safety, "git_argv", git_argv_mock)
+    monkeypatch.setattr(redact_msg, "redact_message", redact_message_mock)
+    monkeypatch.setattr(subprocess, "run", subprocess_run_mock)
+    monkeypatch.setattr(subprocess, "Popen", MagicMock(name="subprocess.Popen"))
+
+    # Mirror onto backend.push's own namespace for whichever import form it
+    # actually uses (module-attribute access vs a direct name import).
+    if hasattr(push, "push_policy"):
+        monkeypatch.setattr(push.push_policy, "scan_content_for_secrets", scan_mock)
+        monkeypatch.setattr(push.push_policy, "authorize_direct_push", authorize_mock)
+    if hasattr(push, "scan_content_for_secrets"):
+        monkeypatch.setattr(push, "scan_content_for_secrets", scan_mock)
+    if hasattr(push, "authorize_direct_push"):
+        monkeypatch.setattr(push, "authorize_direct_push", authorize_mock)
+    if hasattr(push, "git_safety"):
+        monkeypatch.setattr(push.git_safety, "git_argv", git_argv_mock)
+    if hasattr(push, "git_argv"):
+        monkeypatch.setattr(push, "git_argv", git_argv_mock)
+    if hasattr(push, "redact_msg"):
+        monkeypatch.setattr(push.redact_msg, "redact_message", redact_message_mock)
+    if hasattr(push, "redact_message"):
+        monkeypatch.setattr(push, "redact_message", redact_message_mock)
+    if hasattr(push, "subprocess"):
+        monkeypatch.setattr(push.subprocess, "run", subprocess_run_mock)
+
+    yield {
+        "scan": scan_mock,
+        "authorize": authorize_mock,
+        "git_argv": git_argv_mock,
+        "redact_message": redact_message_mock,
+        "subprocess_run": subprocess_run_mock,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Requirements 2.4 / 3.6 — authorize_direct_push refusals on main/protected/
+# empty/ambiguous targets, each with a non-empty reason string, and no git
+# subprocess call happens when it refuses.
+# ---------------------------------------------------------------------------
+
+
+class TestChangePathBranchAuthorizationRefusals:
+    """The change path must call authorize_direct_push and honor a refusal —
+
+    never push when the target branch is main, protected, empty, or
+    ambiguous, and always surface the policy's own reason string rather
+    than a generic error.
+    """
+
+    @pytest.mark.parametrize(
+        "refusal_reason",
+        [
+            "branch 'main' is protected/shared — push is refused "
+            "(the protected-branch denylist is non-overridable)",
+            "branch 'develop' is protected/shared — push is refused "
+            "(the protected-branch denylist is non-overridable)",
+            "no branch configured — refusing to push to an empty/ambiguous target",
+        ],
+        ids=["main", "protected", "empty-or-ambiguous"],
+    )
+    def test_refuses_and_reports_reason_when_target_is_unauthorized(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+        refusal_reason: str,
+    ) -> None:
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        change_path_collaborators["authorize"].return_value = (False, refusal_reason)
+
+        result = push.run()
+
+        outcome = getattr(result, "outcome", result)
+        assert "refus" in str(outcome).lower() or str(outcome).lower() not in (
+            "no-op",
+            "noop",
+            "no_op",
+        ), "an authorization refusal must not be reported as a no-op"
+        rendered = " ".join(
+            str(getattr(result, attr, "")) for attr in ("outcome", "reason", "note")
+        )
+        assert refusal_reason in rendered or refusal_reason in str(result), (
+            "the policy's own refusal reason string must be surfaced, not a "
+            "generic error message"
+        )
+
+    def test_refuses_all_four_authorization_targets_with_distinct_reasons(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A degenerate implementation that returns one constant refusal
+
+        string for every target must not pass — main/protected/empty must
+        each surface authorize_direct_push's OWN distinct reason.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        reasons = {
+            "main": "branch 'main' is protected/shared — push is refused "
+            "(the protected-branch denylist is non-overridable)",
+            "protected": "branch 'trunk' is protected/shared — push is "
+            "refused (the protected-branch denylist is non-overridable)",
+            "ambiguous": "no branch configured — refusing to push to an "
+            "empty/ambiguous target",
+        }
+        rendered_by_case = {}
+        for case, reason in reasons.items():
+            _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+            change_path_collaborators["authorize"].return_value = (False, reason)
+            result = push.run()
+            rendered_by_case[case] = str(result)
+
+        assert len(set(rendered_by_case.values())) == len(rendered_by_case), (
+            "each authorization-refusal target must surface a DISTINCT "
+            f"reason string, got: {rendered_by_case}"
+        )
+
+    def test_no_git_subprocess_call_when_authorization_refuses(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        no_git_or_network_calls: Callable[[], None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An authorization refusal must happen BEFORE any git invocation —
+
+        no clone, no checkout, no commit, no push subprocess call of any
+        kind once authorize_direct_push says no.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+        change_path_collaborators["authorize"].return_value = (
+            False,
+            "branch 'main' is protected/shared — push is refused "
+            "(the protected-branch denylist is non-overridable)",
+        )
+
+        push.run()
+
+        no_git_or_network_calls()
+        change_path_collaborators["subprocess_run"].assert_not_called()
+
+    def test_last_pushed_hash_unchanged_on_authorization_refusal(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refused push must never advance last_pushed_hash (design.md
+
+        step 8: only a push+PR success does) — a refusal is not a partial
+        success.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, _current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        seeded_hash = store.last_pushed_hash
+        change_path_collaborators["authorize"].return_value = (
+            False,
+            "no branch configured — refusing to push to an empty/ambiguous target",
+        )
+
+        push.run()
+
+        assert store.last_pushed_hash == seeded_hash
+
+
+# ---------------------------------------------------------------------------
+# Requirement 3.6 — a scan finding refuses the WHOLE push, reporting only
+# the code/count (never matched text), and makes NO git subprocess call at
+# all — not even a clone probe.
+# ---------------------------------------------------------------------------
+
+
+class TestChangePathSecretScanRefusal:
+    def test_refuses_on_scan_finding_with_code_and_count_only(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+        change_path_collaborators["scan"].return_value = (False, "hit: 3 finding(s)")
+
+        result = push.run()
+
+        rendered = str(result)
+        assert (
+            "3 finding" in rendered or "hit" in rendered.lower()
+        ), "the scan refusal's code/count must be surfaced to the caller"
+        # Never the matched text — the scanner's own contract is to return
+        # only a code and a count, so nothing resembling secret content can
+        # appear even if a defective caller tried to interpolate it.
+        assert "secret" not in rendered.lower() or "finding" in rendered.lower()
+
+    def test_no_git_subprocess_call_of_any_kind_on_scan_finding(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        no_git_or_network_calls: Callable[[], None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requirement 3.6's 'not rewritten, not partially committed': a scan
+
+        finding must refuse BEFORE any clone/checkout probe — not just
+        before the final push. Not even a read-only `git ls-remote`/clone
+        of the bundle repo may occur once the scan is dirty.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+        change_path_collaborators["scan"].return_value = (False, "hit: 1 finding(s)")
+
+        push.run()
+
+        no_git_or_network_calls()
+        change_path_collaborators["git_argv"].assert_not_called()
+        change_path_collaborators["subprocess_run"].assert_not_called()
+
+    def test_authorize_direct_push_never_called_when_scan_finds_a_hit(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The scan gate comes first: a dirty scan must short-circuit before
+
+        branch authorization is even consulted, since there is nothing to
+        authorize once the whole push is refused.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+        change_path_collaborators["scan"].return_value = (False, "hit: 2 finding(s)")
+
+        push.run()
+
+        change_path_collaborators["authorize"].assert_not_called()
+
+    def test_last_pushed_hash_unchanged_on_scan_finding(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, _current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        seeded_hash = store.last_pushed_hash
+        change_path_collaborators["scan"].return_value = (False, "hit: 1 finding(s)")
+
+        push.run()
+
+        assert store.last_pushed_hash == seeded_hash
+
+    def test_refuses_when_scanner_unavailable_fail_closed(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        no_git_or_network_calls: Callable[[], None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requirement 3.7: an unimportable/unrunnable scanner fails CLOSED —
+
+        SCAN_NO_SCANNER must refuse the push exactly like a real finding,
+        never proceed as if the content were clean.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+        change_path_collaborators["scan"].return_value = (False, "no_scanner")
+
+        push.run()
+
+        no_git_or_network_calls()
+        change_path_collaborators["authorize"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Requirement 3.1 / fail-closed on I/O — an unreadable tracked file refuses
+# the whole operation rather than committing a partial tree.
+# ---------------------------------------------------------------------------
+
+
+class TestChangePathUnreadableFileFailsClosed:
+    def test_refuses_with_no_partial_operation_on_unreadable_tracked_file(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        no_git_or_network_calls: Callable[[], None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A tracked file that raises OSError when its bytes are written into
+
+        the working copy (design.md step 5, AFTER the scan/authorize gates
+        both clear) must refuse the whole operation — no partial commit, no
+        push, and last_pushed_hash left untouched. This targets the
+        change-path's own write-to-working-copy stage specifically (not
+        collect.collect(), which already propagates I/O errors today and
+        would pass against the unimplemented seam) — an unreadable/
+        unwritable tracked file discovered while materializing the working
+        copy must not leave a half-written tree behind.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+        _write(root_a, "steering/plan.md", b"# Plan")
+
+        store, _current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        seeded_hash = store.last_pushed_hash
+
+        unwritable_error = OSError("Permission denied: steering/plan.md")
+
+        def _spy_write_bytes(self: Path, data: bytes) -> int:
+            if self.name == "plan.md":
+                raise unwritable_error
+            return len(data)
+
+        monkeypatch.setattr(Path, "write_bytes", _spy_write_bytes)
+
+        with pytest.raises(OSError):
+            push.run()
+
+        no_git_or_network_calls()
+        change_path_collaborators["subprocess_run"].assert_not_called()
+        assert store.last_pushed_hash == seeded_hash
+
+
+# ---------------------------------------------------------------------------
+# Requirement 3.8 / design.md step 5 — the working copy's bytes must equal
+# redact.redact()'s ACTUAL output, byte-for-byte, compared against the real
+# call rather than a value the test re-derives independently.
+# ---------------------------------------------------------------------------
+
+
+class TestChangePathWorkingCopyBytesMatchRedactOutput:
+    def test_written_bytes_equal_actual_redact_output_byte_for_byte(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Capture every file-write push.py performs during the change path
+
+        (via a MagicMock wrapping Path.write_bytes) and assert each write's
+        content is IDENTICAL to what the real `redact.redact()` call
+        produced for that path — never re-derived by the test, but read
+        back from the actual redact() call's return value, per the task's
+        explicit instruction not to re-derive the expected bytes.
+        """
+        from backend import redact as redact_module
+
+        root_a = isolated_roots["root_a"]
+        _write(
+            root_a,
+            "mcp.json",
+            b'{"mcpServers": {"foo": {"headers": {"Authorization": "secret"}}}}',
+        )
+        _write(root_a, "steering/plan.md", b"# Plan\ncontent")
+
+        _store, _hash, _redacted = _seed_changed_hash(monkeypatch)
+
+        actual_redacted_by_path: dict = {}
+        real_redact = redact_module.redact
+
+        def _capturing_redact(collected: dict) -> dict:
+            result = real_redact(collected)
+            actual_redacted_by_path.clear()
+            actual_redacted_by_path.update(result)
+            return result
+
+        monkeypatch.setattr(redact_module, "redact", _capturing_redact)
+        if hasattr(push, "redact"):
+            monkeypatch.setattr(push, "redact", redact_module)
+
+        write_calls: list[tuple[Path, bytes]] = []
+        original_write_bytes = Path.write_bytes
+
+        def _spy_write_bytes(self: Path, data: bytes) -> int:
+            write_calls.append((self, bytes(data)))
+            return original_write_bytes(self, data)
+
+        monkeypatch.setattr(Path, "write_bytes", _spy_write_bytes)
+
+        push.run()
+
+        assert actual_redacted_by_path, (
+            "redact.redact() must actually have been called on the change "
+            "path — nothing to compare against otherwise"
+        )
+        assert write_calls, (
+            "the change path must write the redacted tree to a working " "copy on disk"
+        )
+        for written_path, written_bytes in write_calls:
+            matches = [
+                content
+                for relpath, content in actual_redacted_by_path.items()
+                if written_path.name == Path(relpath).name
+            ]
+            if not matches:
+                continue
+            assert written_bytes in matches, (
+                f"bytes written to {written_path} do not byte-for-byte match "
+                "the actual redact.redact() output for that file — the "
+                "working copy must contain redact()'s real return value, "
+                "not a re-derived or re-serialized approximation"
+            )

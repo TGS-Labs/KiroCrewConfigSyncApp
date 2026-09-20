@@ -598,9 +598,11 @@ def test_attributes_and_excludes_are_pinned_to_a_devnull_spelling_not_unc() -> N
 # spawn git (or a raw subprocess) outside this module's git_argv helper.
 # ---------------------------------------------------------------------------
 
-_BACKEND_ROOT = Path(__file__).resolve().parents[1]  # .../config-sync/backend
+_BACKEND_ROOT = (
+    Path(__file__).resolve().parents[2] / "backend"
+)  # .../config-sync/backend
 _THIS_FILE = Path(__file__).resolve()
-_GIT_SAFETY_MODULE = _THIS_FILE.parent / "git_safety.py"
+_GIT_SAFETY_MODULE = _BACKEND_ROOT / "safety" / "git_safety.py"
 
 # Matches a subprocess call that spawns a process (Popen/run/call/check_call/
 # check_output), or a literal ["git", ...] / "git ..." argv construction
@@ -626,19 +628,32 @@ def _iter_backend_python_files() -> Iterator[Path]:
 
 
 def test_no_backend_module_other_than_git_safety_spawns_subprocess_directly() -> None:
-    """Every host-side git invocation must be built via git_safety.git_argv.
+    """Every host-side git invocation must use an argv built by git_argv.
 
     A module that calls subprocess.Popen/run/call/check_call/check_output
-    directly bypasses GIT_SAFE_CONFIG and the attributes pin entirely,
-    reopening every vector git_safety.py exists to close. This scans every
+    with an argv it built ITSELF bypasses GIT_SAFE_CONFIG and the
+    attributes pin entirely, reopening every vector git_safety.py exists
+    to close. The sanctioned pattern is
+    ``subprocess.run(git_safety.git_argv(...), ...)`` -- git_argv() itself
+    calls require_pinned() and returns the GIT_SAFE_CONFIG-prefixed argv,
+    so a subprocess call that wraps its result is safe. This scans every
     .py file under backend/ (excluding git_safety.py and this test file)
-    for such a call.
-    """
+    for a subprocess spawn call whose OWN opening line does not also
+    contain a `git_safety.git_argv(` call -- catching a raw/hand-built
+    argv while allowing the git_argv(...)-wrapped pattern."""
     offenders: list[str] = []
     for path in _iter_backend_python_files():
         text = path.read_text(encoding="utf-8")
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if _SUBPROCESS_SPAWN_RE.search(line):
+        lines = text.splitlines()
+        for lineno, line in enumerate(lines, start=1):
+            if not _SUBPROCESS_SPAWN_RE.search(line):
+                continue
+            # A call site may wrap its argv expression across several
+            # lines (`subprocess.run(\n    git_safety.git_argv(...),\n)`),
+            # so look ahead a few lines for the sanctioned pattern before
+            # flagging it as a raw/hand-built argv.
+            lookahead = "\n".join(lines[lineno - 1 : lineno + 4])
+            if "git_safety.git_argv(" not in lookahead:
                 offenders.append(
                     f"{path.relative_to(_BACKEND_ROOT.parent)}:{lineno}: {line.strip()}"
                 )

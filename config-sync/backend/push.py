@@ -12,22 +12,42 @@ Pipeline (design.md step list):
 3. If ``tree_hash == state.last_pushed_hash``: return ``no-op``. No clone,
    no network, no tokens. This is the common case and it is the whole
    reason the push is a `command` cron rather than an agent prompt.
-4. (change path) scan for secrets, clone/branch/commit/push, open the PR.
-
-Only step 3 — the hash-gate no-op path — is implemented here. The change
-path (steps 4 onward: secret scan, clone/checkout, commit, push, PR) is a
-separate task; see the ``TODO(3.2)`` seam in :func:`run`.
+4. ``scan_content_for_secrets`` over every file's content. A finding
+   refuses the whole push (code + count only, never the matched text, and
+   never a git call — not even a clone probe).
+5. Clone/update the bundle repo into the app's own state directory, write
+   the redacted tree into a working copy, ``git add``.
+6. Branch: ``config-sync/<instance-id>-<short-hash>``.
+   ``authorize_direct_push`` guards the target; a protected, empty, or
+   ambiguous branch refuses before any git call.
+7. Commit (redacted message), push the named branch explicitly. Opening the
+   PR is a separate job (task 3.3, ``backend/buildo_pr.py``) — this module
+   stops at "branch pushed".
+8. Record ``last_pushed_hash`` only after a successful push — a refusal or
+   a mid-write failure never advances it, so the next tick retries.
 """
 
 from __future__ import annotations
 
 import hashlib
-import subprocess  # noqa: F401  # spied on by tests; used by the change path (3.2)
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
 
 from backend import collect, redact, state
-from backend.safety import git_safety, push_policy  # noqa: F401  # used by 3.2
+from backend.safety import git_safety, push_policy
+from backend.safety import redact_msg
+
+#: Name/URL of the bundle repo every sync push targets, matching
+#: `backend/buildo_pr.py`'s `TARGET_REPO` (`TGS-Labs/Kiro-Config-Bundles`).
+BUNDLE_REPO_URL = "https://github.com/TGS-Labs/Kiro-Config-Bundles.git"
+
+#: Directory name, under the app's own state directory
+#: (`state.get_state_dir()`), that holds the bundle repo's working clone.
+#: Never inside either tracked configuration root, matching state.py's own
+#: isolation guarantee.
+_BUNDLE_CLONE_DIRNAME = "bundle-repo"
 
 
 @dataclass(frozen=True)
@@ -36,6 +56,7 @@ class PushResult:
 
     outcome: str
     tree_hash: str
+    reason: str = ""
 
 
 def tree_hash(tree: Mapping[str, bytes]) -> str:
@@ -61,6 +82,66 @@ def tree_hash(tree: Mapping[str, bytes]) -> str:
     return digest.hexdigest()
 
 
+def _instance_id() -> str:
+    """A short, stable identifier for this host/instance.
+
+    Used only as one component of the push branch name
+    (``config-sync/<instance-id>-<short-hash>``) so two instances pushing
+    concurrently do not collide on the same branch. Derived from the app's
+    own state directory path — stable across ticks on the same host,
+    requires no new external dependency, and carries no credential or
+    hostname PII into a branch name that ends up on a public repo.
+    """
+    digest = hashlib.sha256(str(state.get_state_dir()).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def _branch_name(current_hash: str) -> str:
+    """The push target branch name, per design.md step 6.
+
+    ``config-sync/<instance-id>-<short-hash>``, where ``short-hash`` is the
+    first 12 hex characters of the tree hash — enough to make the branch
+    name unique per change without being unwieldy.
+    """
+    return f"config-sync/{_instance_id()}-{current_hash[:12]}"
+
+
+def _scan_tree_for_secrets(redacted: Mapping[str, bytes]) -> tuple[bool, str]:
+    """Run the content secret scan over every file in the redacted tree.
+
+    Concatenates each file's decoded text (best-effort; undecodable content
+    is skipped — `push_policy.scan_content_for_secrets` scans text, and a
+    binary blob that cannot decode carries no scannable credential text
+    either way) and scans it as one call, per push_policy's "one gate for
+    every exit" design. Returns the first non-clean verdict found, short
+    circuiting the moment one file scans dirty.
+    """
+    for _relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        clean, note = push_policy.scan_content_for_secrets(text)
+        if not clean:
+            return clean, note
+    return True, push_policy.SCAN_OK
+
+
+def _write_working_copy(clone_dir: Path, redacted: Mapping[str, bytes]) -> None:
+    """Write every file in the redacted tree into the working copy.
+
+    Bytes written are exactly `redacted`'s own values — never re-derived or
+    re-serialized — so the working copy is byte-for-byte what
+    `redact.redact()` actually produced. Fails closed: the first
+    unreadable/unwritable tracked file raises immediately (design.md step
+    5's "no partial commit"), before any git call.
+    """
+    for relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
+        target = clone_dir / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+
 def run() -> PushResult:
     """Run one push-job tick: the hash-gate, and (on a miss) the push itself.
 
@@ -82,15 +163,76 @@ def run() -> PushResult:
     if current_hash == store.last_pushed_hash:
         return PushResult(outcome="no-op", tree_hash=current_hash)
 
-    # TODO(3.2): implement the change path here — scan_content_for_secrets,
-    # clone/checkout the bundle repo via git_safety.git_argv, write the
-    # tree, branch as config-sync/<instance-id>-<short-hash>, commit
-    # (redacted message), push the named branch, open the PR, and only
-    # then call store.record_push_success(). Never construct a git_argv or
-    # touch subprocess before this seam.
-    raise NotImplementedError(
-        "backend.push change path is not yet implemented (task 3.2)"
+    # Step 4: scan every file's redacted content for secrets BEFORE any git
+    # call — not even a clone probe. A finding (or an unavailable scanner,
+    # which fails closed the same way) refuses the whole push and reports
+    # only the code/count push_policy handed back, never matched text.
+    clean, scan_note = _scan_tree_for_secrets(redacted)
+    if not clean:
+        store.record_push_failure(reason=scan_note)
+        return PushResult(
+            outcome="refused-secret-scan", tree_hash=current_hash, reason=scan_note
+        )
+
+    # Step 6 (authorization check ahead of any git call): decide the target
+    # branch and get authorize_direct_push's ruling. A refusal (main,
+    # protected, empty, ambiguous) stops here with the policy's own reason
+    # string — still no git call of any kind.
+    branch = _branch_name(current_hash)
+    authorized, auth_reason = push_policy.authorize_direct_push(branch=branch)
+    if not authorized:
+        store.record_push_failure(reason=auth_reason)
+        return PushResult(
+            outcome="refused-branch-authorization",
+            tree_hash=current_hash,
+            reason=auth_reason,
+        )
+
+    # Materialize the redacted tree into a scratch working copy BEFORE any
+    # git call of any kind (clone/fetch/checkout included) — an unreadable/
+    # unwritable tracked file must fail closed with no partial operation
+    # and no git invocation at all, not merely no push (design.md step 5's
+    # "no partial commit"; requirement 3.1). This first write is the
+    # fail-closed check; the bundle clone's own working tree is written
+    # again below once it exists on disk.
+    clone_dir = state.get_state_dir() / _BUNDLE_CLONE_DIRNAME
+    scratch_dir = state.get_state_dir() / "push-scratch"
+    _write_working_copy(scratch_dir, redacted)
+
+    # Steps 5/7: clone/update the bundle repo, write the checked tree into
+    # the working copy, commit (redacted message), push the named branch.
+    clone_dir.mkdir(parents=True, exist_ok=True)
+
+    if not (clone_dir / ".git").exists():
+        subprocess.run(
+            git_safety.git_argv(
+                clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
+            ),
+            check=True,
+        )
+    else:
+        subprocess.run(git_safety.git_argv(clone_dir, "fetch", "origin"), check=True)
+
+    subprocess.run(git_safety.git_argv(clone_dir, "checkout", "-B", branch), check=True)
+
+    _write_working_copy(clone_dir, redacted)
+
+    subprocess.run(git_safety.git_argv(clone_dir, "add", "-A"), check=True)
+
+    commit_message = redact_msg.redact_message(
+        f"chore(config-sync): sync configuration ({current_hash[:12]})"
     )
+    subprocess.run(
+        git_safety.git_argv(clone_dir, "commit", "-m", commit_message),
+        check=True,
+    )
+    subprocess.run(
+        git_safety.git_argv(clone_dir, "push", "-u", "origin", branch),
+        check=True,
+    )
+
+    store.record_push_success(tree_hash=current_hash, branch=branch, pr_url=None)
+    return PushResult(outcome="pushed", tree_hash=current_hash, reason=branch)
 
 
 if __name__ == "__main__":
