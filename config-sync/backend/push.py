@@ -20,11 +20,19 @@ Pipeline (design.md step list):
 6. Branch: ``config-sync/<instance-id>-<short-hash>``.
    ``authorize_direct_push`` guards the target; a protected, empty, or
    ambiguous branch refuses before any git call.
-7. Commit (redacted message), push the named branch explicitly. Opening the
-   PR is a separate job (task 3.3, ``backend/buildo_pr.py``) — this module
-   stops at "branch pushed".
-8. Record ``last_pushed_hash`` only after a successful push — a refusal or
-   a mid-write failure never advances it, so the next tick retries.
+7. Commit (redacted message), push the named branch explicitly. Record the
+   push via `state.record_branch_pushed` (which does NOT advance
+   ``last_pushed_hash`` — see step 8) then hand off to
+   `backend.pr_handoff.handle_pushed_branch`, which builds the PR payload,
+   records a pending-PR state entry, and notifies the operator. Opening the
+   PR itself happens out-of-band (task 3.3, ``backend/buildo_pr.py`` +
+   `backend/pr_handoff.py`'s ``confirm_pr_created``/
+   ``report_pr_creation_failed``) — this module's own `run()` stops at
+   "branch pushed" and handed off.
+8. Record ``last_pushed_hash`` only once the push AND PR creation both
+   succeed — via `pr_handoff.confirm_pr_created`. A refusal, a mid-write
+   failure, or a pushed branch with no confirmed PR yet never advances it,
+   so the next tick retries.
 """
 
 from __future__ import annotations
@@ -195,44 +203,73 @@ def run() -> PushResult:
     # "no partial commit"; requirement 3.1). This first write is the
     # fail-closed check; the bundle clone's own working tree is written
     # again below once it exists on disk.
+    #
+    # Everything from here through the final push is wrapped in one
+    # try/except: a `CalledProcessError` (a git subprocess) or `OSError`
+    # (an unreadable/unwritable tracked file) must be recorded via
+    # `record_push_failure` before propagating — requirement 2.7 requires
+    # every failure be recorded with its cause; it does not require the
+    # failure be swallowed instead of raised, so the original exception is
+    # re-raised after recording (matching the existing raise-based contract
+    # the no-op/refusal paths' callers already rely on).
     clone_dir = state.get_state_dir() / _BUNDLE_CLONE_DIRNAME
     scratch_dir = state.get_state_dir() / "push-scratch"
-    _write_working_copy(scratch_dir, redacted)
 
-    # Steps 5/7: clone/update the bundle repo, write the checked tree into
-    # the working copy, commit (redacted message), push the named branch.
-    clone_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_working_copy(scratch_dir, redacted)
 
-    if not (clone_dir / ".git").exists():
+        # Steps 5/7: clone/update the bundle repo, write the checked tree
+        # into the working copy, commit (redacted message), push the named
+        # branch.
+        clone_dir.mkdir(parents=True, exist_ok=True)
+
+        if not (clone_dir / ".git").exists():
+            subprocess.run(
+                git_safety.git_argv(
+                    clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
+                ),
+                check=True,
+            )
+        else:
+            subprocess.run(
+                git_safety.git_argv(clone_dir, "fetch", "origin"), check=True
+            )
+
         subprocess.run(
-            git_safety.git_argv(
-                clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
-            ),
+            git_safety.git_argv(clone_dir, "checkout", "-B", branch), check=True
+        )
+
+        _write_working_copy(clone_dir, redacted)
+
+        subprocess.run(git_safety.git_argv(clone_dir, "add", "-A"), check=True)
+
+        commit_message = redact_msg.redact_message(
+            f"chore(config-sync): sync configuration ({current_hash[:12]})"
+        )
+        subprocess.run(
+            git_safety.git_argv(clone_dir, "commit", "-m", commit_message),
             check=True,
         )
-    else:
-        subprocess.run(git_safety.git_argv(clone_dir, "fetch", "origin"), check=True)
+        subprocess.run(
+            git_safety.git_argv(clone_dir, "push", "-u", "origin", branch),
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        store.record_push_failure(reason=str(exc))
+        raise
 
-    subprocess.run(git_safety.git_argv(clone_dir, "checkout", "-B", branch), check=True)
+    # Step 7/8: a branch reached the remote, but no PR exists yet — record
+    # the push WITHOUT advancing `last_pushed_hash` (only a confirmed PR
+    # does that; requirement 2.6), then hand off to `pr_handoff` so the
+    # pending-PR record and operator notification actually happen.
+    store.record_branch_pushed(tree_hash=current_hash, branch=branch)
+    result = PushResult(outcome="pushed", tree_hash=current_hash, reason=branch)
 
-    _write_working_copy(clone_dir, redacted)
+    from backend import pr_handoff
 
-    subprocess.run(git_safety.git_argv(clone_dir, "add", "-A"), check=True)
+    pr_handoff.handle_pushed_branch(result, state=store)
 
-    commit_message = redact_msg.redact_message(
-        f"chore(config-sync): sync configuration ({current_hash[:12]})"
-    )
-    subprocess.run(
-        git_safety.git_argv(clone_dir, "commit", "-m", commit_message),
-        check=True,
-    )
-    subprocess.run(
-        git_safety.git_argv(clone_dir, "push", "-u", "origin", branch),
-        check=True,
-    )
-
-    store.record_push_success(tree_hash=current_hash, branch=branch, pr_url=None)
-    return PushResult(outcome="pushed", tree_hash=current_hash, reason=branch)
+    return result
 
 
 if __name__ == "__main__":

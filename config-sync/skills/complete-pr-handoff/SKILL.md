@@ -3,10 +3,10 @@ name: complete-pr-handoff
 description: >
   Complete a config-sync PR handoff by calling Buildo MCP's
   create_pull_request with the payload backend/buildo_pr.py built, and
-  record the result (pending, opened, or failed) in app state. Use when a
-  config-sync push job has produced a payload dict from
-  build_pull_request_payload and needs it turned into a real PR. Never pass
-  merge_method to Buildo.
+  report the result back via backend/pr_handoff.py's confirm_pr_created
+  (success) or report_pr_creation_failed (failure). Use when a config-sync
+  push job has produced a payload dict from build_pull_request_payload and
+  needs it turned into a real PR. Never pass merge_method to Buildo.
 ---
 
 # Complete PR Handoff (config-sync)
@@ -45,34 +45,31 @@ exactly this, in order:
 ## Reporting the outcome into app state
 
 **On success:** record the PR number, URL, and head branch against the
-sync job's state record. The provisional field name for this "PR pending /
-opened" state is:
-
-```
-pending_pr
-```
-
-This name is **provisional**. Task 3.3 (`pr_handoff.py`) has not landed yet
-as of this writing — when it does, reconcile this skill's field name and
-`buildo_pr.py`'s callers against whatever `pr_handoff.py` actually defines,
-rather than assuming `pending_pr` is final. Do not block current work on
-this reconciliation; it is a follow-up once 3.3 exists.
+sync job's state record. `backend/pr_handoff.py`'s `confirm_pr_created`
+is the entry point that does this — call it with the tree hash, branch,
+and PR URL once Buildo has actually opened the PR. This is the ONLY call
+that advances the sync job's recorded `last_pushed_hash` for the
+PR-handoff flow (requirements.md 2.6): a push whose branch never reaches
+this call leaves the hash unchanged, so the next tick retries.
 
 **On failure:** do not retry silently and do not swallow the error.
 Requirements.md 2.7 ("WHEN a push fails for any reason THEN the failure
 SHALL be recorded with its cause and surfaced in the app's UI") applies
 here exactly as it does to a push failure — a failed PR creation is a
-failure of the same class. Record:
+failure of the same class. Call `backend/pr_handoff.py`'s
+`report_pr_creation_failed(reason=..., state=...)` with:
 
 - The cause (the tool's error message/code, redacted through
   `backend/safety/redact_msg.py`'s `redact_message()` before storage, since
   a Buildo error payload could echo back caller-supplied text).
 - The head branch and payload's `repo`/`base`/`head` fields, so the failure
-  is traceable to a specific attempted PR.
-- That the last-pushed hash is **not** advanced (requirements.md 2.6: the
-  recorded last-pushed hash updates only after push AND PR creation both
-  succeed) — a failed PR creation must leave the sync job retryable on its
-  next run rather than being treated as done.
+  is traceable to a specific attempted PR (fold these into the `reason`
+  string, since `report_pr_creation_failed` records a single cause string).
+
+`report_pr_creation_failed` never advances `last_pushed_hash`
+(requirements.md 2.6: the recorded last-pushed hash updates only after
+push AND PR creation both succeed) — a failed PR creation leaves the sync
+job retryable on its next run rather than being treated as done.
 
 Surface the recorded failure in the app's UI exactly as any other push
 failure is surfaced; this skill does not introduce a second failure-display
@@ -83,5 +80,5 @@ path.
 - Building the payload itself — see `backend/buildo_pr.py`.
 - Retrying a failed push/PR cycle — that is the push job's own retry
   policy, not this skill.
-- Anything about `pr_handoff.py`'s eventual shape beyond the provisional
-  field name above.
+- The pending-PR record's exact on-disk shape — see `backend/state.py`'s
+  `pending_pr` / `pending_pr_failure` fields, owned by `pr_handoff.py`.

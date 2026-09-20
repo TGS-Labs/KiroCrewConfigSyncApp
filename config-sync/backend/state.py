@@ -200,10 +200,35 @@ class StateStore:
 
     # -- mutations --------------------------------------------------------
 
+    def record_branch_pushed(self, *, tree_hash: str, branch: str) -> None:
+        """Record a successfully pushed branch WITHOUT advancing
+
+        `last_pushed_hash`. This is the bare-push case: a branch reached
+        the remote but no PR has been created (or confirmed) yet, so the
+        change is not "delivered" per requirements.md 2.6 — only
+        `record_push_success` (via `confirm_pr_created`) advances the hash.
+        Shares `record_push_success`'s `last_push`/history recording shape
+        so `last_push` always reflects the most recent push attempt,
+        confirmed or not.
+        """
+        entry = {
+            "tree_hash": tree_hash,
+            "branch": branch,
+            "pr_url": None,
+            "time": _now_iso(),
+        }
+        self._payload["last_push"] = dict(entry)
+        self._append_history(entry)
+        self._save()
+
     def record_push_success(
         self, *, tree_hash: str, branch: str, pr_url: str | None
     ) -> None:
-        """Record a successful push. Only this advances `last_pushed_hash`."""
+        """Record a successful, PR-confirmed push. Only this (and its
+
+        caller `confirm_pr_created`) advances `last_pushed_hash` —
+        `record_branch_pushed` is the bare-push counterpart that does not.
+        """
         entry = {
             "tree_hash": tree_hash,
             "branch": branch,

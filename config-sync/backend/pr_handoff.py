@@ -66,7 +66,7 @@ def handle_pushed_branch(result: PushResult, *, state: StateStore) -> None:
     branch = result.reason
     try:
         payload = build_pull_request_payload(branch, _PR_TITLE, _PR_BODY)
-    except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+    except Exception as exc:  # broad: any failure recorded, not swallowed
         state.record_pr_pending_failure(reason=str(exc))
         return
 
@@ -74,7 +74,7 @@ def handle_pushed_branch(result: PushResult, *, state: StateStore) -> None:
 
     try:
         notify_operator(branch=branch, payload=payload)
-    except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+    except Exception as exc:  # broad: any failure recorded, not swallowed
         state.record_pr_pending_failure(reason=str(exc))
         return
 

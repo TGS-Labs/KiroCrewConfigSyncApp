@@ -960,3 +960,246 @@ class TestChangePathWorkingCopyBytesMatchRedactOutput:
                 "working copy must contain redact()'s real return value, "
                 "not a re-derived or re-serialized approximation"
             )
+
+
+# ---------------------------------------------------------------------------
+# Requirement 2.6 / review-fix C1+C2 — a bare successful branch push must
+# NOT advance `last_pushed_hash` on its own, and `run()`'s real production
+# entrypoint must actually reach `pr_handoff.handle_pushed_branch` with the
+# real `StateStore` (not just be testable in isolation via a fake, per
+# tests/test_pr_handoff.py). `last_pushed_hash` only advances once
+# `pr_handoff.confirm_pr_created` is called out-of-band — never at push
+# time, matching design.md step 8.
+# ---------------------------------------------------------------------------
+
+
+class TestChangePathSuccessDoesNotConfirmPrItself:
+    """A successful branch push through `push.run()`'s REAL entrypoint
+
+    (real `StateStore`, real `pr_handoff` module — only the git subprocess
+    calls and policy checks are mocked via `change_path_collaborators`)
+    must record the push, hand off to `pr_handoff`, and leave
+    `last_pushed_hash` unchanged — because no PR has been confirmed yet.
+    """
+
+    def test_last_pushed_hash_does_not_advance_on_bare_branch_push(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, _current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        seeded_hash = store.last_pushed_hash
+
+        # Let the real pr_handoff.handle_pushed_branch run against the real
+        # StateStore, but stub its own external calls (payload build +
+        # notify) so the test stays offline — this is the seam
+        # test_pr_handoff.py itself exercises in isolation; here we only
+        # need push.run()'s real entrypoint to actually reach it.
+        from backend import pr_handoff
+
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        result = push.run()
+
+        assert getattr(result, "outcome", None) == "pushed"
+        assert store.last_pushed_hash == seeded_hash, (
+            "a bare branch push must never advance last_pushed_hash — only "
+            "pr_handoff.confirm_pr_created (a confirmed PR) may do that"
+        )
+
+    def test_run_reaches_pr_handoff_with_the_real_state_store(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """push.run()'s production path must actually call
+
+        `pr_handoff.handle_pushed_branch` — not merely be structured so a
+        test COULD call it in isolation. Spies on the real `pr_handoff`
+        module's `handle_pushed_branch` (imported inside `push.run()`) and
+        asserts it was invoked with the real `StateStore` instance `run()`
+        loaded, proving the wiring exists in production, not only in
+        `tests/test_pr_handoff.py`'s per-module fakes.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, current_hash, _redacted = _seed_changed_hash(monkeypatch)
+
+        from backend import pr_handoff
+        from backend.state import StateStore
+
+        handoff_spy = MagicMock(wraps=pr_handoff.handle_pushed_branch)
+        monkeypatch.setattr(pr_handoff, "handle_pushed_branch", handoff_spy)
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        result = push.run()
+
+        handoff_spy.assert_called_once()
+        _args, kwargs = handoff_spy.call_args
+        called_result = handoff_spy.call_args.args[0]
+        called_state = kwargs.get("state") or handoff_spy.call_args.args[1]
+        assert called_result is result
+        assert isinstance(called_state, StateStore), (
+            "push.run() must hand off to pr_handoff with the REAL "
+            "StateStore instance it loaded, not a fake or a re-derived one"
+        )
+        assert called_state is store
+        assert called_state.last_pushed_hash != current_hash
+
+    def test_record_branch_pushed_is_called_instead_of_record_push_success(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The success path must call the NEW non-advancing
+
+        `record_branch_pushed` rather than `record_push_success` directly
+        — spying on both against the real `StateStore` class proves which
+        one `run()` actually calls.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, current_hash, _redacted = _seed_changed_hash(monkeypatch)
+
+        from backend import pr_handoff
+
+        branch_pushed_spy = MagicMock(wraps=store.record_branch_pushed)
+        push_success_spy = MagicMock(wraps=store.record_push_success)
+        monkeypatch.setattr(store, "record_branch_pushed", branch_pushed_spy)
+        monkeypatch.setattr(store, "record_push_success", push_success_spy)
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        push.run()
+
+        branch_pushed_spy.assert_called_once()
+        assert branch_pushed_spy.call_args.kwargs["tree_hash"] == current_hash
+        push_success_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Requirement 2.7 / review-fix H2 — a git subprocess or working-copy write
+# failure on the change path must be recorded via `record_push_failure`
+# with its cause BEFORE propagating, not silently lost.
+# ---------------------------------------------------------------------------
+
+
+class TestChangePathFailuresAreRecordedBeforeRaising:
+    def test_unreadable_tracked_file_is_recorded_via_record_push_failure(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        no_git_or_network_calls: Callable[[], None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requirement 2.7: the failure cause must be RECORDED, not merely
+
+        raised. Extends the existing unreadable-file test (which only
+        asserted the bare raise) to also assert `record_push_failure` was
+        called with the OSError's message before the exception propagates.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+        _write(root_a, "steering/plan.md", b"# Plan")
+
+        store, _current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        seeded_hash = store.last_pushed_hash
+
+        failure_spy = MagicMock(wraps=store.record_push_failure)
+        monkeypatch.setattr(store, "record_push_failure", failure_spy)
+
+        unwritable_error = OSError("Permission denied: steering/plan.md")
+
+        def _spy_write_bytes(self: Path, data: bytes) -> int:
+            if self.name == "plan.md":
+                raise unwritable_error
+            return len(data)
+
+        monkeypatch.setattr(Path, "write_bytes", _spy_write_bytes)
+
+        with pytest.raises(OSError):
+            push.run()
+
+        no_git_or_network_calls()
+        change_path_collaborators["subprocess_run"].assert_not_called()
+        failure_spy.assert_called_once()
+        assert "Permission denied" in failure_spy.call_args.kwargs["reason"]
+        assert store.last_pushed_hash == seeded_hash
+
+    def test_git_subprocess_failure_is_recorded_via_record_push_failure(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `CalledProcessError` from any git subprocess call (clone,
+
+        fetch, checkout, add, commit, push) must be recorded with its
+        cause via `record_push_failure` and then re-raised — never silently
+        swallowed and never left unrecorded.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, _current_hash, _redacted = _seed_changed_hash(monkeypatch)
+        seeded_hash = store.last_pushed_hash
+
+        failure_spy = MagicMock(wraps=store.record_push_failure)
+        monkeypatch.setattr(store, "record_push_failure", failure_spy)
+
+        git_error = subprocess.CalledProcessError(
+            returncode=128, cmd=["git", "push"], output=b"", stderr=b"remote rejected"
+        )
+        change_path_collaborators["subprocess_run"].side_effect = git_error
+
+        with pytest.raises(subprocess.CalledProcessError):
+            push.run()
+
+        failure_spy.assert_called_once()
+        assert store.last_pushed_hash == seeded_hash
