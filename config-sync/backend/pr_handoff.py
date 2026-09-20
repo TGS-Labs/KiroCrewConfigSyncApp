@@ -67,7 +67,9 @@ def handle_pushed_branch(result: PushResult, *, state: StateStore) -> None:
     try:
         payload = build_pull_request_payload(branch, _PR_TITLE, _PR_BODY)
     except Exception as exc:  # broad: any failure recorded, not swallowed
-        state.record_pr_pending_failure(reason=str(exc))
+        state.record_pr_pending_failure(
+            reason=str(exc), tree_hash=result.tree_hash, branch=branch
+        )
         return
 
     state.record_pr_pending(branch=branch, tree_hash=result.tree_hash, payload=payload)
@@ -75,7 +77,9 @@ def handle_pushed_branch(result: PushResult, *, state: StateStore) -> None:
     try:
         notify_operator(branch=branch, payload=payload)
     except Exception as exc:  # broad: any failure recorded, not swallowed
-        state.record_pr_pending_failure(reason=str(exc))
+        state.record_pr_pending_failure(
+            reason=str(exc), tree_hash=result.tree_hash, branch=branch
+        )
         return
 
 
@@ -100,7 +104,9 @@ def confirm_pr_created(
     state.confirm_pr_created(tree_hash=tree_hash, branch=branch, pr_url=pr_url)
 
 
-def report_pr_creation_failed(*, reason: str, state: StateStore) -> None:
+def report_pr_creation_failed(
+    *, reason: str, tree_hash: str, branch: str, state: StateStore
+) -> None:
     """Report that the out-of-band PR creation itself failed.
 
     Called from a KiroCrew agent context via the `complete-pr-handoff`
@@ -110,6 +116,13 @@ def report_pr_creation_failed(*, reason: str, state: StateStore) -> None:
 
     Args:
         reason: the failure's cause (e.g. Buildo's error message/code).
+        tree_hash: the tree hash the failed PR attempt was for — the same
+            value the caller was originally handed when the push happened.
+            Used to check this report is still about the CURRENT
+            `pending_pr` (H-NEW-2): a report that arrives after a newer
+            push has already superseded it is recorded as stale rather
+            than clearing the newer pending-PR record.
+        branch: the branch the failed PR attempt was for.
         state: the state store to record the failure into.
     """
-    state.record_pr_pending_failure(reason=reason)
+    state.record_pr_pending_failure(reason=reason, tree_hash=tree_hash, branch=branch)

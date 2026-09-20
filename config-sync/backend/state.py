@@ -7,8 +7,10 @@ the app's own bookkeeping can never be swept into a commit it makes.
 Persists: ``last_pushed_hash``, ``last_push`` (time/branch/PR URL),
 ``last_seen_sha``, ``pending`` (sha/author/subject/classified paths),
 ``pending_pr`` / ``pending_pr_failure`` (the PR-handoff pending/failure
-record — see `backend/pr_handoff.py`), a bounded ``history``, and
-``restore_dirs``.
+record — see `backend/pr_handoff.py`), ``pending_pr_stale`` (a superseded
+confirmation/failure report ignored because a newer push had already
+overwritten ``pending_pr`` — see `confirm_pr_created`/
+`record_pr_pending_failure`), a bounded ``history``, and ``restore_dirs``.
 
 Writes are atomic: every write goes to a temp file in the same directory,
 then ``os.replace()``s it into place, so a reader never observes a
@@ -41,6 +43,7 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "pending": None,
     "pending_pr": None,
     "pending_pr_failure": None,
+    "pending_pr_stale": None,
     "history": [],
     "restore_dirs": {},
 }
@@ -191,6 +194,18 @@ class StateStore:
         return cast("dict[str, Any] | None", self._payload["pending_pr_failure"])
 
     @property
+    def pending_pr_stale(self) -> dict[str, Any] | None:
+        """The most recent superseded confirmation/failure report, if any.
+
+        Set by `confirm_pr_created` or `record_pr_pending_failure` when the
+        caller's ``tree_hash``/``branch`` no longer matches the CURRENT
+        `pending_pr` — i.e. a newer push already overwrote it before this
+        report arrived. Never cleared automatically; a fresh occurrence
+        overwrites it, same as `pending_pr_failure`.
+        """
+        return cast("dict[str, Any] | None", self._payload["pending_pr_stale"])
+
+    @property
     def history(self) -> list[dict[str, Any]]:
         return cast("list[dict[str, Any]]", self._payload["history"])
 
@@ -267,17 +282,69 @@ class StateStore:
         self._append_history(dict(entry))
         self._save()
 
-    def record_pr_pending_failure(self, *, reason: str) -> None:
+    def record_pr_pending_failure(
+        self,
+        *,
+        reason: str,
+        tree_hash: str | None = None,
+        branch: str | None = None,
+    ) -> None:
         """Record a PR-handoff failure with its cause.
 
         Covers a payload-build failure, a notify failure, or a reported
         failed PR creation (requirements.md 2.7). Never changes
         `last_pushed_hash`.
+
+        `tree_hash`/`branch` identify which attempt this failure is about.
+        Three cases, checked against the CURRENT `pending_pr`:
+
+        1. No `tree_hash` given: unconditional legacy behaviour — records
+           `pending_pr_failure` and clears `pending_pr`. No caller uses
+           this today; kept only so an existing caller with no attempt
+           identity to give still degrades safely.
+        2. `tree_hash` given and it MATCHES the current `pending_pr` (or
+           `pending_pr` is empty — the payload-build-failure case, which
+           runs before `record_pr_pending` has recorded anything for this
+           attempt): this failure is about the CURRENT/newest attempt.
+           Records `pending_pr_failure` and clears `pending_pr` (H-NEW-1:
+           without this the next tick's hash-gate sees the same
+           `pending_pr.tree_hash` and returns `awaiting-pr-confirmation`
+           forever).
+        3. `tree_hash` given but `pending_pr` names a DIFFERENT attempt:
+           this report is either (a) a stale out-of-band
+           `report_pr_creation_failed` call for an attempt a NEWER push
+           already superseded, or (b) an in-tick failure for an attempt
+           whose OWN `pending_pr` entry hasn't been written yet while an
+           older, still-genuinely-pending different attempt occupies the
+           slot. Either way the safe action is identical: never touch the
+           current `pending_pr` (it may be the real, still-pending
+           newer/older attempt), and record this failure to
+           `pending_pr_stale` for observability instead of silently
+           dropping it (H-NEW-2).
         """
+        current = self._payload["pending_pr"]
+
+        if (
+            tree_hash is not None
+            and current is not None
+            and (
+                current.get("tree_hash") != tree_hash or current.get("branch") != branch
+            )
+        ):
+            self._payload["pending_pr_stale"] = {
+                "reason": reason,
+                "tree_hash": tree_hash,
+                "branch": branch,
+                "time": _now_iso(),
+            }
+            self._save()
+            return
+
         self._payload["pending_pr_failure"] = {
             "reason": reason,
             "time": _now_iso(),
         }
+        self._payload["pending_pr"] = None
         self._save()
 
     def confirm_pr_created(self, *, tree_hash: str, branch: str, pr_url: str) -> None:
@@ -289,7 +356,32 @@ class StateStore:
         PR. Delegates to `record_push_success` since that is the only
         existing path that persists `last_pushed_hash` and pairs it with a
         `last_push` record (requirements.md 2.6).
+
+        Validated against the CURRENT `pending_pr` before mutating anything
+        (H-NEW-2): if `tree_hash`/`branch` no longer match `pending_pr` —
+        because a newer push already overwrote it before this confirmation
+        arrived — this call does NOT advance `last_pushed_hash` and does
+        NOT clear the current `pending_pr` (which names the newer, still-
+        pending change). The stale confirmation is instead recorded to
+        `pending_pr_stale` so it is observable rather than silently
+        swallowed.
         """
+        current = self._payload["pending_pr"]
+        if (
+            current is None
+            or current.get("tree_hash") != tree_hash
+            or current.get("branch") != branch
+        ):
+            self._payload["pending_pr_stale"] = {
+                "reason": "confirm_pr_created for a superseded tree_hash",
+                "tree_hash": tree_hash,
+                "branch": branch,
+                "pr_url": pr_url,
+                "time": _now_iso(),
+            }
+            self._save()
+            return
+
         self.record_push_success(tree_hash=tree_hash, branch=branch, pr_url=pr_url)
         self._payload["pending_pr"] = None
         self._save()

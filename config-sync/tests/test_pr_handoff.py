@@ -44,17 +44,22 @@ This module therefore assumes `backend/pr_handoff.py` extends
 - ``record_pr_pending(*, branch, tree_hash, payload)`` — records the
   pending-PR state after a successful branch push, before PR creation is
   confirmed. Mirrors `record_push_failure`'s keyword-only shape.
-- ``record_pr_pending_failure(*, reason)`` — records a PR-handoff failure
-  (payload-build failure, notify failure, or a reported failed PR creation)
-  with its cause, WITHOUT touching `last_pushed_hash`.
+- ``record_pr_pending_failure(*, reason, tree_hash=None, branch=None)`` —
+  records a PR-handoff failure (payload-build failure, notify failure, or
+  a reported failed PR creation) with its cause, WITHOUT touching
+  `last_pushed_hash`. Clears `pending_pr` when the failure is about the
+  attempt currently recorded there (or none exists yet); when `tree_hash`/
+  `branch` name a DIFFERENT attempt than the current `pending_pr` — a
+  stale out-of-band report superseded by a newer push — records to
+  `pending_pr_stale` instead and leaves the current `pending_pr` alone.
 - ``confirm_pr_created(*, tree_hash, branch, pr_url)`` — the explicit,
   out-of-band confirmation entry point (arriving via the
   `complete-pr-handoff` skill from a KiroCrew agent context) that advances
-  `last_pushed_hash` to `tree_hash`. This is expected to delegate to (or
-  behave identically to) `record_push_success`, since that is the only
-  existing method that advances `last_pushed_hash` — the tests below assert
-  the OBSERVABLE property (last_pushed_hash advances, a `last_push` record
-  appears) rather than requiring a specific delegation shape internally.
+  `last_pushed_hash` to `tree_hash`. Delegates to (or behaves identically
+  to) `record_push_success`. Validated against the current `pending_pr`
+  first: a mismatch (superseded by a newer push) records to
+  `pending_pr_stale` instead of advancing the hash or clearing the
+  current, still-pending record.
 
 None of the three names above is guessed blindly: they are the natural
 extension point implied by task 3.3's own text ("records ... as *PR
@@ -100,6 +105,8 @@ class _FakeStateStore:
     """
 
     last_pushed_hash: str | None = None
+    pending_pr: dict[str, Any] | None = None
+    pending_stale_calls: list[dict[str, Any]] = field(default_factory=list)
     pending_calls: list[dict[str, Any]] = field(default_factory=list)
     pending_failure_calls: list[dict[str, Any]] = field(default_factory=list)
     confirm_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -112,11 +119,48 @@ class _FakeStateStore:
         self.pending_calls.append(
             {"branch": branch, "tree_hash": tree_hash, "payload": payload}
         )
+        self.pending_pr = {"branch": branch, "tree_hash": tree_hash}
 
-    def record_pr_pending_failure(self, *, reason: str) -> None:
+    def record_pr_pending_failure(
+        self,
+        *,
+        reason: str,
+        tree_hash: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        """Mirrors backend/state.py::StateStore.record_pr_pending_failure's
+
+        ownership semantics: a mismatch against the current `pending_pr`
+        is recorded as stale and leaves `pending_pr` untouched, matching
+        H-NEW-1/H-NEW-2's fix.
+        """
+        current = self.pending_pr
+        if (
+            tree_hash is not None
+            and current is not None
+            and (
+                current.get("tree_hash") != tree_hash or current.get("branch") != branch
+            )
+        ):
+            self.pending_stale_calls.append(
+                {"reason": reason, "tree_hash": tree_hash, "branch": branch}
+            )
+            return
+
         self.pending_failure_calls.append({"reason": reason})
+        self.pending_pr = None
 
     def confirm_pr_created(self, *, tree_hash: str, branch: str, pr_url: str) -> None:
+        current = self.pending_pr
+        if (
+            current is None
+            or current.get("tree_hash") != tree_hash
+            or (current.get("branch") != branch)
+        ):
+            self.pending_stale_calls.append(
+                {"tree_hash": tree_hash, "branch": branch, "pr_url": pr_url}
+            )
+            return
         self.confirm_calls.append(
             {"tree_hash": tree_hash, "branch": branch, "pr_url": pr_url}
         )
@@ -124,6 +168,7 @@ class _FakeStateStore:
         # ONLY call in this fake that advances last_pushed_hash, matching
         # requirements.md 2.6.
         self.last_pushed_hash = tree_hash
+        self.pending_pr = None
         self.push_success_calls.append(
             {"tree_hash": tree_hash, "branch": branch, "pr_url": pr_url}
         )
@@ -377,6 +422,10 @@ class TestConfirmationEntryPoint:
     ) -> None:
         pr_handoff = _import_module()
         fake_state.last_pushed_hash = None
+        fake_state.pending_pr = {
+            "branch": "config-sync/deadbeef-eeeeee",
+            "tree_hash": "e" * 64,
+        }
 
         pr_handoff.confirm_pr_created(
             tree_hash="e" * 64,
@@ -391,6 +440,10 @@ class TestConfirmationEntryPoint:
         self, fake_state: _FakeStateStore
     ) -> None:
         pr_handoff = _import_module()
+        fake_state.pending_pr = {
+            "branch": "config-sync/deadbeef-ffffff",
+            "tree_hash": "f" * 64,
+        }
 
         pr_handoff.confirm_pr_created(
             tree_hash="f" * 64,
@@ -534,9 +587,15 @@ class TestFailurePathsAreRecordedWithCause:
         point that records the cause and leaves `last_pushed_hash` alone."""
         pr_handoff = _import_module()
         fake_state.last_pushed_hash = "untouched-hash"
+        fake_state.pending_pr = {
+            "branch": "config-sync/deadbeef-422422",
+            "tree_hash": "g" * 64,
+        }
 
         pr_handoff.report_pr_creation_failed(
             reason="Buildo create_pull_request returned 422",
+            tree_hash="g" * 64,
+            branch="config-sync/deadbeef-422422",
             state=fake_state,
         )
 

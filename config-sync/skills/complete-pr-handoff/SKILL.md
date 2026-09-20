@@ -57,14 +57,23 @@ Requirements.md 2.7 ("WHEN a push fails for any reason THEN the failure
 SHALL be recorded with its cause and surfaced in the app's UI") applies
 here exactly as it does to a push failure — a failed PR creation is a
 failure of the same class. Call `backend/pr_handoff.py`'s
-`report_pr_creation_failed(reason=..., state=...)` with:
+`report_pr_creation_failed(reason=..., tree_hash=..., branch=..., state=...)`
+with:
 
 - The cause (the tool's error message/code, redacted through
   `backend/safety/redact_msg.py`'s `redact_message()` before storage, since
   a Buildo error payload could echo back caller-supplied text).
-- The head branch and payload's `repo`/`base`/`head` fields, so the failure
-  is traceable to a specific attempted PR (fold these into the `reason`
-  string, since `report_pr_creation_failed` records a single cause string).
+- `tree_hash` and `branch`: the SAME values this agent context was
+  originally handed when the push happened (from the payload's `head`
+  field and the pushed tree hash) — required, not optional. `state.py`
+  checks these against the CURRENT `pending_pr` before mutating anything:
+  if a NEWER push has already superseded this attempt (its `pending_pr`
+  now names a different tree_hash), this report is recorded to
+  `pending_pr_stale` instead, and the current, still-genuinely-pending
+  attempt is left untouched. Passing the wrong or stale values here is
+  exactly the failure mode this check exists to catch — always use the
+  values from THIS attempt's own payload, never re-derive them from
+  whatever `pending_pr` happens to hold at report time.
 
 `report_pr_creation_failed` never advances `last_pushed_hash`
 (requirements.md 2.6: the recorded last-pushed hash updates only after
@@ -81,4 +90,5 @@ path.
 - Retrying a failed push/PR cycle — that is the push job's own retry
   policy, not this skill.
 - The pending-PR record's exact on-disk shape — see `backend/state.py`'s
-  `pending_pr` / `pending_pr_failure` fields, owned by `pr_handoff.py`.
+  `pending_pr` / `pending_pr_failure` / `pending_pr_stale` fields, owned by
+  `pr_handoff.py`.

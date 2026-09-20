@@ -1318,4 +1318,78 @@ class TestReentrantTickAwaitsPrConfirmation:
         push.run()  # tick 2 — must not fabricate a failure
 
         failure_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Senior-review H-NEW-1 — a reported PR-creation failure must CLEAR
+# pending_pr so the NEXT tick's hash-gate falls through to a genuine
+# change-path retry, instead of seeing the same pending_pr.tree_hash and
+# returning awaiting-pr-confirmation forever with zero retry.
+# ---------------------------------------------------------------------------
+
+
+class TestPrCreationFailureRetriesOnNextTick:
+    def test_after_reported_pr_failure_next_tick_with_same_hash_retries(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """record_pr_pending -> report_pr_creation_failed -> run() again
+
+        with the SAME tree_hash must take the genuine change path (retry
+        the push+PR attempt from scratch), not `awaiting-pr-confirmation`.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, current_hash, _redacted = _seed_changed_hash(monkeypatch)
+
+        from backend import pr_handoff
+
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        # Tick 1: genuine push, records pending_pr for current_hash.
+        tick1_result = push.run()
+        assert getattr(tick1_result, "outcome", None) == "pushed"
+        assert store.pending_pr is not None
+        assert store.pending_pr.get("tree_hash") == current_hash
+
+        # Out-of-band: the agent context reports PR creation failed.
+        pr_handoff.report_pr_creation_failed(
+            reason="Buildo create_pull_request returned 422",
+            tree_hash=current_hash,
+            branch=str(store.pending_pr.get("branch")),
+            state=store,
+        )
+
+        # H-NEW-1: pending_pr must be cleared, not left naming current_hash.
+        assert store.pending_pr is None
+        assert store.pending_pr_failure is not None
+
+        # Reset spies so tick 2's assertions are about tick 2 only.
+        change_path_collaborators["git_argv"].reset_mock()
+        change_path_collaborators["subprocess_run"].reset_mock()
+
+        # Tick 2, same tree_hash (nothing about the tracked config changed):
+        # must take the genuine change path again, not awaiting-pr-
+        # confirmation — the hash-gate has nothing stale to match against.
+        tick2_result = push.run()
+
+        assert getattr(tick2_result, "outcome", None) == "pushed"
+        assert tick2_result.tree_hash == current_hash
+        change_path_collaborators["git_argv"].assert_called()
         assert store.last_push_failure is None

@@ -126,6 +126,13 @@ there is no proposal to score, no candidate to gate, no agent run to ledger.
 8. Record `last_pushed_hash` **only after** push and PR both succeed, so a
    failure retries on the next tick instead of being swallowed.
 
+This flow assumes **one change in flight at a time**. If a new tree hash is
+pushed while an earlier push's PR is still unconfirmed, the earlier attempt's
+pending-PR record is treated as superseded: it is marked stale in state, not
+delivered, and not silently discarded. Two truly concurrent unconfirmed pushes
+are an edge case outside the ratified 15-minute notify-and-approve design, not
+the common path this component is built for.
+
 ### `backend/poll.py` — the poll job (cron `command` target, 15 min)
 
 `git ls-remote <bundle-repo> <default-branch>` → head SHA. Unchanged → exit.
