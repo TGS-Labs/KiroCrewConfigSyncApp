@@ -5,12 +5,9 @@
   "description": "A Kiro Crew app: Config Sync",
   "author": "developer",
   "iconPath": "assets/icon.png",
-  "agents": [
-    "agents/sample-agent.json"
-  ],
-  "skills": [
-    "skills/sample-skill"
-  ],
+  "defaultEnabled": false,
+  "agents": [],
+  "skills": [],
   "tags": [],
   "backend": {
     "entryPoint": "backend/server.py",
@@ -29,9 +26,17 @@
   },
   "crons": [
     {
-      "name": "config-sync-check",
-      "every": 300,
-      "message": "Run periodic check for Config Sync"
+      "name": "config-sync-push",
+      "every": 900,
+      "command": "python3 backend/push.py",
+      "enabled": false,
+      "silent": true
+    },
+    {
+      "name": "config-sync-poll",
+      "every": 900,
+      "command": "python3 backend/poll.py",
+      "enabled": false
     }
   ]
 }
