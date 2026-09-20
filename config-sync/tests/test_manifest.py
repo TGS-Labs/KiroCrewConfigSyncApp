@@ -144,6 +144,89 @@ class TestCrons:
             "not the same cron matching both labels"
         )
 
+    def test_push_cron_command_resolves_the_backend_package_import(self) -> None:
+        """Senior-review P1: `python3 backend/push.py` launches push.py as a
+
+        plain script, so `sys.path[0]` resolves to `.../backend` (the
+        script's own directory) — `from backend import collect, redact,
+        state` inside push.py would then raise ModuleNotFoundError, because
+        no ancestor of `sys.path[0]` is the app root containing the
+        `backend` package. `python3 -m backend.push` only resolves
+        correctly when the process's cwd IS the app root (there is no
+        cwd/working-directory field in the app-manifest cron schema —
+        verified against `kiro_crew.apps.manifest.CronEntry`, which declares
+        no such field), so the fix must ALSO `cd` into the app's installed
+        directory before invoking the module.
+
+        This test proves both parts by reusing the declared command's own
+        `cd ... &&` prefix verbatim (so the cwd-resolution logic under test
+        is the real one, not a re-derived guess) while swapping the trailing
+        `python3 -m backend.push` for `python3 -c "import backend.push"` —
+        an IMPORT-only probe that exercises the identical package-resolution
+        seam without triggering `push.run()`'s real git/network side
+        effects, which would be unsafe to invoke from a test. Launched
+        exactly as the cron scheduler would (`sh -c <command>`, inheriting
+        HOME, with NO app-relative cwd of its own — see
+        `kiro_crew.cron_script.run_command_sandboxed`, which calls
+        `popen_limited` with no `cwd=` argument at all) from a fixture tree
+        shaped like the real installed-app layout.
+        """
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        manifest = _load_app_json()
+        crons = manifest.get("crons", [])
+        push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
+        command = push_cron.get("command", "")
+        assert command, "the push cron must declare a 'command'"
+        assert "python3 -m backend.push" in command, (
+            "the push cron's command must invoke the module by dotted path "
+            f"(`python3 -m backend.push`), not a script path; got: {command!r}"
+        )
+        import_probe_command = command.replace(
+            "python3 -m backend.push", 'python3 -c "import backend.push"'
+        )
+
+        with tempfile.TemporaryDirectory() as fake_home_str:
+            fake_home = Path(fake_home_str)
+            installed_app_dir = fake_home / ".kiro" / "crew" / "apps" / "config-sync"
+            installed_app_dir.mkdir(parents=True)
+            # Mirror only what push.py's import chain needs to resolve:
+            # backend/ as an importable package rooted at the app dir, plus
+            # its own dependency modules — not a full app install.
+            shutil.copytree(APP_ROOT / "backend", installed_app_dir / "backend")
+
+            env = {
+                "HOME": str(fake_home),
+                "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+            }
+            # No KIROCREW_HOME override here — this fixture deliberately
+            # exercises the `$HOME/.kiro/crew` fallback half of
+            # `${KIROCREW_HOME:-$HOME/.kiro/crew}`, matching an operator who
+            # never set the override. The cron scheduler launches the
+            # command via `sh -c` with NO cwd of its own, so this
+            # subprocess's OWN cwd must not matter to the outcome either;
+            # confirm that by deliberately launching from outside the fake
+            # app dir.
+            result = subprocess.run(
+                ["sh", "-c", import_probe_command],
+                cwd=str(fake_home),
+                env=env,
+                executable=shutil.which("sh") or "/bin/sh",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+
+        assert result.returncode == 0 and "ModuleNotFoundError" not in result.stderr, (
+            "the push cron command must resolve `backend`'s package "
+            f"imports regardless of the launching shell's own cwd; stderr:\n"
+            f"{result.stderr}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # app.json: scaffold sample-agent / sample-skill entries removed

@@ -6,7 +6,8 @@ requirements.md 2.1 / 2.2:
 
 - 2.1: the push job runs as a `command`/`script` cron target (never
   `message`), so a tick consumes no LLM tokens. `app.json` already declares
-  `"command": "python3 backend/push.py"` — a plain script entrypoint with no
+  `"command": "cd \"${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/config-sync\" &&
+  python3 -m backend.push"` — a plain module invocation with no
   agent/LLM call in its invocation shape. These tests assert the module
   itself carries no LLM/agent-invocation surface at import time (no
   top-level agent/session/spawn call), which is the property that keeps a
@@ -379,7 +380,7 @@ def test_module_declares_no_llm_or_agent_invocation_names() -> None:
     payload builder) — the module's own symbol table is the property that
     keeps a no-op tick from ever being capable of spending a token, matching
     requirements.md 2.1's "never `message`" cron-target constraint and
-    app.json's `"command": "python3 backend/push.py"` declaration.
+    app.json's `"command": "... python3 -m backend.push"` declaration.
     """
     forbidden_substrings = ("spawn_run", "spawn_sub_agents", "agent_runner")
     module_names = set(dir(push))
@@ -400,7 +401,7 @@ def test_run_is_callable_with_no_arguments_matching_a_command_cron_target(
 ) -> None:
     """push.run() (or an equivalent zero-argument entrypoint the `command`
 
-    cron invokes via `python3 backend/push.py`) must be callable with no
+    cron invokes via `python3 -m backend.push`) must be callable with no
     arguments and no LLM/agent context — proving the entrypoint shape is a
     plain script call, not something that requires an agent session to
     invoke.
@@ -1203,3 +1204,118 @@ class TestChangePathFailuresAreRecordedBeforeRaising:
 
         failure_spy.assert_called_once()
         assert store.last_pushed_hash == seeded_hash
+
+
+# ---------------------------------------------------------------------------
+# Senior-review N1 — a second tick before confirm_pr_created must not
+# re-enter the change path against the same tree_hash. The persistent
+# bundle-repo clone already has that exact commit on that branch, so
+# re-running commit/push would find nothing to commit, fail, and get
+# recorded as a fabricated push failure for a push that already succeeded.
+# ---------------------------------------------------------------------------
+
+
+class TestReentrantTickAwaitsPrConfirmation:
+    def test_second_tick_before_confirmation_makes_no_git_or_network_call(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tick 1 pushes a genuinely new change (mocked git calls, as the
+
+        existing change-path tests do). With NO `confirm_pr_created` call in
+        between, tick 2 must recognize `state.pending_pr` already names the
+        CURRENT tree_hash and return early — asserting `assert_not_called()`
+        on every git/subprocess mock, proving zero git/network calls on the
+        re-entrant tick.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, current_hash, _redacted = _seed_changed_hash(monkeypatch)
+
+        from backend import pr_handoff
+
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        # Tick 1: genuinely new tree_hash, goes down the change path and
+        # records a pending_pr entry naming this exact tree_hash.
+        tick1_result = push.run()
+        assert getattr(tick1_result, "outcome", None) == "pushed"
+        assert store.pending_pr is not None
+        assert store.pending_pr.get("tree_hash") == current_hash
+
+        # Reset every git/subprocess spy so tick 2's assertions are clean —
+        # tick 1 legitimately called them; only tick 2 must not.
+        change_path_collaborators["git_argv"].reset_mock()
+        change_path_collaborators["subprocess_run"].reset_mock()
+
+        # Tick 2: no confirm_pr_created call happened in between, and the
+        # tree hasn't changed (current_hash is unchanged, last_pushed_hash
+        # still doesn't match it — the seam this bug lived in). This must
+        # NOT re-enter the change path.
+        tick2_result = push.run()
+
+        change_path_collaborators["git_argv"].assert_not_called()
+        change_path_collaborators["subprocess_run"].assert_not_called()
+        assert getattr(tick2_result, "outcome", None) == "awaiting-pr-confirmation"
+        assert tick2_result.tree_hash == current_hash
+
+    def test_second_tick_does_not_record_a_fabricated_push_failure(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The exact regression: before the fix, tick 2 re-entered the
+
+        change path, `git commit` found nothing to commit, raised, and
+        `record_push_failure` recorded a FABRICATED failure for a push that
+        had already succeeded. Proves tick 2 never calls
+        `record_push_failure` at all.
+        """
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        store, current_hash, _redacted = _seed_changed_hash(monkeypatch)
+
+        from backend import pr_handoff
+
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        push.run()  # tick 1
+
+        failure_spy = MagicMock(wraps=store.record_push_failure)
+        monkeypatch.setattr(store, "record_push_failure", failure_spy)
+
+        push.run()  # tick 2 — must not fabricate a failure
+
+        failure_spy.assert_not_called()
+        assert store.last_push_failure is None

@@ -1,9 +1,11 @@
 """The push job (design.md `backend/push.py`), a cron `command` target.
 
-Runs as a plain script (``python3 backend/push.py``, per `app.json`'s
-``"command"`` cron entry) — never a `message` cron target — so a quiet tick
-costs zero LLM tokens (requirements.md 2.1). This module therefore defines
-no LLM/agent-invocation surface anywhere in its symbol table.
+Runs as a plain module invocation (``python3 -m backend.push``, per
+`app.json`'s ``"command"`` cron entry, which ``cd``'s into the app's own
+installed directory first so the ``backend`` package import resolves) —
+never a `message` cron target — so a quiet tick costs zero LLM tokens
+(requirements.md 2.1). This module therefore defines no LLM/agent-invocation
+surface anywhere in its symbol table.
 
 Pipeline (design.md step list):
 
@@ -12,6 +14,18 @@ Pipeline (design.md step list):
 3. If ``tree_hash == state.last_pushed_hash``: return ``no-op``. No clone,
    no network, no tokens. This is the common case and it is the whole
    reason the push is a `command` cron rather than an agent prompt.
+3a. Else if ``tree_hash`` matches the tree hash already recorded on
+    ``state.pending_pr`` (i.e. this exact change was already pushed on a
+    prior tick and is only waiting on the out-of-band
+    `pr_handoff.confirm_pr_created`/`report_pr_creation_failed` call):
+    return ``awaiting-pr-confirmation``. Also no clone, no network, no git
+    invocation of any kind — a re-entrant tick before confirmation arrives
+    must never repeat the push. This is a THIRD case, distinct from both the
+    no-op above (hash already delivered) and the change path below (hash
+    genuinely new): the bundle-repo clone already has this exact commit on
+    its branch, so re-running the commit/push sequence would find nothing
+    to commit and fail, and that failure must not be recorded as a
+    fabricated push failure for a push that already succeeded.
 4. ``scan_content_for_secrets`` over every file's content. A finding
    refuses the whole push (code + count only, never the matched text, and
    never a git call — not even a clone probe).
@@ -154,7 +168,7 @@ def run() -> PushResult:
     """Run one push-job tick: the hash-gate, and (on a miss) the push itself.
 
     Zero-argument, matching the `command` cron entrypoint shape
-    (`python3 backend/push.py`) — no agent/LLM context is required to call
+    (`python3 -m backend.push`) — no agent/LLM context is required to call
     it (requirements.md 2.1).
 
     Returns:
@@ -170,6 +184,23 @@ def run() -> PushResult:
     store = state.load_state()
     if current_hash == store.last_pushed_hash:
         return PushResult(outcome="no-op", tree_hash=current_hash)
+
+    # Step 3a: this exact change was already pushed on a prior tick and is
+    # still waiting on the out-of-band PR-confirmation call — re-entering
+    # the change path below would re-run commit/push against a bundle-repo
+    # clone that already holds this exact commit on that branch (the branch
+    # name is derived from the hash), so `git commit` would find nothing to
+    # commit, fail, and get recorded as a FABRICATED push failure for a push
+    # that actually already succeeded. Detect it and return a distinct
+    # outcome instead, with zero git/network calls — same zero-call
+    # guarantee as the no-op path above, just gated on a different field.
+    pending_pr = store.pending_pr
+    if pending_pr is not None and pending_pr.get("tree_hash") == current_hash:
+        return PushResult(
+            outcome="awaiting-pr-confirmation",
+            tree_hash=current_hash,
+            reason=str(pending_pr.get("branch", "")),
+        )
 
     # Step 4: scan every file's redacted content for secrets BEFORE any git
     # call — not even a clone probe. A finding (or an unavailable scanner,
