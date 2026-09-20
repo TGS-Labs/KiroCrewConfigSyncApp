@@ -5,8 +5,10 @@ either tracked configuration root (``KIROCREW_HOME`` / ``KIRO_HOME``), so
 the app's own bookkeeping can never be swept into a commit it makes.
 
 Persists: ``last_pushed_hash``, ``last_push`` (time/branch/PR URL),
-``last_seen_sha``, ``pending`` (sha/author/subject/classified paths), a
-bounded ``history``, and ``restore_dirs``.
+``last_seen_sha``, ``pending`` (sha/author/subject/classified paths),
+``pending_pr`` / ``pending_pr_failure`` (the PR-handoff pending/failure
+record — see `backend/pr_handoff.py`), a bounded ``history``, and
+``restore_dirs``.
 
 Writes are atomic: every write goes to a temp file in the same directory,
 then ``os.replace()``s it into place, so a reader never observes a
@@ -37,6 +39,8 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "last_push_failure": None,
     "last_seen_sha": None,
     "pending": None,
+    "pending_pr": None,
+    "pending_pr_failure": None,
     "history": [],
     "restore_dirs": {},
 }
@@ -179,6 +183,14 @@ class StateStore:
         return cast("dict[str, Any] | None", self._payload["pending"])
 
     @property
+    def pending_pr(self) -> dict[str, Any] | None:
+        return cast("dict[str, Any] | None", self._payload["pending_pr"])
+
+    @property
+    def pending_pr_failure(self) -> dict[str, Any] | None:
+        return cast("dict[str, Any] | None", self._payload["pending_pr_failure"])
+
+    @property
     def history(self) -> list[dict[str, Any]]:
         return cast("list[dict[str, Any]]", self._payload["history"])
 
@@ -209,6 +221,52 @@ class StateStore:
             "reason": reason,
             "time": _now_iso(),
         }
+        self._save()
+
+    def record_pr_pending(
+        self, *, branch: str, tree_hash: str, payload: dict[str, Any]
+    ) -> None:
+        """Record a pending-PR state entry after a successful branch push.
+
+        Called BEFORE PR creation is confirmed (see `confirm_pr_created`)
+        — never changes `last_pushed_hash`, matching requirements.md 2.6's
+        "only after the push and PR creation both succeed" rule.
+        """
+        entry = {
+            "branch": branch,
+            "tree_hash": tree_hash,
+            "payload": dict(payload),
+            "time": _now_iso(),
+        }
+        self._payload["pending_pr"] = entry
+        self._append_history(dict(entry))
+        self._save()
+
+    def record_pr_pending_failure(self, *, reason: str) -> None:
+        """Record a PR-handoff failure with its cause.
+
+        Covers a payload-build failure, a notify failure, or a reported
+        failed PR creation (requirements.md 2.7). Never changes
+        `last_pushed_hash`.
+        """
+        self._payload["pending_pr_failure"] = {
+            "reason": reason,
+            "time": _now_iso(),
+        }
+        self._save()
+
+    def confirm_pr_created(self, *, tree_hash: str, branch: str, pr_url: str) -> None:
+        """Confirm a pending PR was actually created — the only call that
+        advances `last_pushed_hash` for the PR-handoff flow.
+
+        Called out-of-band, from a KiroCrew agent context via the
+        `complete-pr-handoff` skill, once Buildo has actually opened the
+        PR. Delegates to `record_push_success` since that is the only
+        existing path that persists `last_pushed_hash` and pairs it with a
+        `last_push` record (requirements.md 2.6).
+        """
+        self.record_push_success(tree_hash=tree_hash, branch=branch, pr_url=pr_url)
+        self._payload["pending_pr"] = None
         self._save()
 
     def record_seen_sha(self, sha: str) -> None:

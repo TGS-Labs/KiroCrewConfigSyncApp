@@ -489,6 +489,127 @@ class TestRestoreDirs:
 
 
 # ---------------------------------------------------------------------------
+# Pending-PR bookkeeping — record_pr_pending / record_pr_pending_failure /
+# confirm_pr_created (backend/pr_handoff.py's extension point, task 3.3)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingPr:
+    def test_no_pending_pr_record_by_default(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        assert store.pending_pr is None
+        assert store.pending_pr_failure is None
+
+    def test_record_pr_pending_persists_branch_hash_and_payload(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-abc123",
+            tree_hash="abc123",
+            payload={"repo": "TGS-Labs/Kiro-Config-Bundles", "head": "x"},
+        )
+
+        reloaded = state.load_state()
+        pending_pr = reloaded.pending_pr
+        assert pending_pr is not None
+        assert pending_pr["branch"] == "config-sync/instance-abc123"
+        assert pending_pr["tree_hash"] == "abc123"
+        assert pending_pr["payload"] == {
+            "repo": "TGS-Labs/Kiro-Config-Bundles",
+            "head": "x",
+        }
+        assert "time" in pending_pr
+
+    def test_record_pr_pending_does_not_change_last_pushed_hash(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_push_success(
+            tree_hash="prior-hash", branch="config-sync/instance-prior", pr_url=None
+        )
+
+        store.record_pr_pending(
+            branch="config-sync/instance-new",
+            tree_hash="new-hash",
+            payload={"repo": "x"},
+        )
+
+        assert store.last_pushed_hash == "prior-hash"
+
+    def test_record_pr_pending_failure_persists_the_cause(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending_failure(reason="malformed branch name")
+
+        reloaded = state.load_state()
+        failure = reloaded.pending_pr_failure
+        assert failure is not None
+        assert failure["reason"] == "malformed branch name"
+        assert "time" in failure
+
+    def test_record_pr_pending_failure_does_not_change_last_pushed_hash(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_push_success(
+            tree_hash="stable-hash", branch="config-sync/instance-stable", pr_url=None
+        )
+
+        store.record_pr_pending_failure(reason="notification channel down")
+
+        assert store.last_pushed_hash == "stable-hash"
+
+    def test_confirm_pr_created_advances_last_pushed_hash_and_records_push(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-confirmed",
+            tree_hash="confirmed-hash",
+            payload={"repo": "x"},
+        )
+
+        store.confirm_pr_created(
+            tree_hash="confirmed-hash",
+            branch="config-sync/instance-confirmed",
+            pr_url="https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/7",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.last_pushed_hash == "confirmed-hash"
+        last_push = reloaded.last_push
+        assert last_push is not None
+        assert last_push["branch"] == "config-sync/instance-confirmed"
+        assert (
+            last_push["pr_url"]
+            == "https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/7"
+        )
+
+    def test_confirm_pr_created_clears_the_pending_pr_record(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-cleared",
+            tree_hash="cleared-hash",
+            payload={"repo": "x"},
+        )
+
+        store.confirm_pr_created(
+            tree_hash="cleared-hash",
+            branch="config-sync/instance-cleared",
+            pr_url="https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/8",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.pending_pr is None
+
+
+# ---------------------------------------------------------------------------
 # Atomic writes — no partial/corrupt state file survives an interrupted write
 # ---------------------------------------------------------------------------
 
