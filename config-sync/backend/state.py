@@ -150,6 +150,18 @@ class StateStore:
     def last_pushed_hash(self) -> str | None:
         return cast("str | None", self._payload["last_pushed_hash"])
 
+    @last_pushed_hash.setter
+    def last_pushed_hash(self, value: str | None) -> None:
+        """Allow direct assignment for test setup (e.g. seeding a store to
+
+        simulate an already-pushed hash before exercising the push-job
+        hash-gate). Production code should use `record_push_success`,
+        which is the only path that persists the change to disk and pairs
+        it with a `last_push` record; this setter mutates the in-memory
+        value only and does not call `_save()`.
+        """
+        self._payload["last_pushed_hash"] = value
+
     @property
     def last_push(self) -> dict[str, Any] | None:
         return cast("dict[str, Any] | None", self._payload["last_push"])
