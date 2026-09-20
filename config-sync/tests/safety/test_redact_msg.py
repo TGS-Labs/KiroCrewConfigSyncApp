@@ -51,6 +51,8 @@ state, not a test defect.
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 import pytest
 
 # A credential shape that is genuinely long enough to satisfy the real
@@ -70,7 +72,7 @@ _EXFIL_URL = (
 )
 
 
-def _import_redact_message():
+def _import_redact_message() -> Callable[[str], str]:
     """Import helper so every test raises the same clear failure while the
     module doesn't exist yet, and so a future rename only needs one edit."""
     from backend.safety.redact_msg import redact_message
@@ -239,6 +241,86 @@ class TestRedactMessageRemovesExfiltrationUrls:
 # ---------------------------------------------------------------------------
 # Combined / edge cases
 # ---------------------------------------------------------------------------
+
+
+class TestRedactMessageFailsClosed:
+    """Requirement 3.8 / 8.4: an unimportable or unrunnable scanner must
+    fail CLOSED -- returning the fixed placeholder, never the original
+    (possibly credential-carrying) text. Mirrors the same fail-closed
+    discipline as push_policy.py's TestScanContentForSecretsFailsClosed,
+    forcing the failure explicitly so the test never depends on whether the
+    scanner dependency happens to be installed in this environment."""
+
+    def test_fails_closed_when_scanner_module_is_unimportable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Force the underlying `kiro_crew.security` import to raise, and
+        confirm redact_message returns the fixed placeholder rather than
+        the original text -- an unscannable message must never leak a
+        credential into a log line, commit message, or UI field."""
+        import builtins
+        import importlib
+        import sys
+
+        real_import = builtins.__import__
+
+        def _hostile_import(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "kiro_crew.security" or name.startswith("kiro_crew.security"):
+                raise ImportError("simulated: scanner unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _hostile_import)
+
+        sys.modules.pop("backend.safety.redact_msg", None)
+        module = importlib.import_module("backend.safety.redact_msg")
+
+        result = module.redact_message(f"api_key = {_SK_ANT_CREDENTIAL}")
+
+        assert result == module.REDACTION_UNAVAILABLE_PLACEHOLDER, (
+            "an unimportable scanner must withhold the original text, "
+            "never return it unredacted"
+        )
+        assert _SK_ANT_CREDENTIAL not in result
+
+    def test_fails_closed_when_scanner_raises_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The scanner import succeeds, but the underlying redaction call
+        itself raises (e.g. a crash inside the scanner). redact_message
+        must still withhold the original text rather than propagate the
+        exception or return the raw input."""
+        import kiro_crew.security as security_mod
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("simulated: scanner crashed at call time")
+
+        monkeypatch.setattr(security_mod, "redact_credentials", _boom)
+        monkeypatch.setattr(security_mod, "redact_exfiltration_urls", _boom)
+
+        import backend.safety.redact_msg as module
+
+        result = module.redact_message(f"api_key = {_SK_ANT_CREDENTIAL}")
+
+        assert result == module.REDACTION_UNAVAILABLE_PLACEHOLDER
+        assert _SK_ANT_CREDENTIAL not in result
+
+    def test_empty_string_short_circuits_before_the_scanner_is_called(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """redact_message("") returns "" even when the scanner would raise
+        if called -- confirming the empty-text short-circuit happens before
+        any scanner invocation, not merely that it happens to work."""
+        import kiro_crew.security as security_mod
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("must not be called for empty text")
+
+        monkeypatch.setattr(security_mod, "redact_credentials", _boom)
+        monkeypatch.setattr(security_mod, "redact_exfiltration_urls", _boom)
+
+        import backend.safety.redact_msg as module
+
+        assert module.redact_message("") == ""
 
 
 class TestRedactMessageCombinedAndEdgeCases:

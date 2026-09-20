@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -48,7 +48,7 @@ PLACEHOLDER_ICON_MAX_BYTES = 512
 
 
 def _load_app_json() -> dict[str, Any]:
-    return json.loads(APP_JSON_PATH.read_text(encoding="utf-8"))
+    return cast(dict[str, Any], json.loads(APP_JSON_PATH.read_text(encoding="utf-8")))
 
 
 def _load_readme() -> str:

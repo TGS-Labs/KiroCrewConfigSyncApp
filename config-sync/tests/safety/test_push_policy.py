@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from typing import Any
 
 import pytest
 
@@ -79,7 +80,9 @@ class TestAuthorizeDirectPushProtectedBranches:
         assert reason.strip()
 
     @pytest.mark.parametrize("branch", ["", "   ", None])
-    def test_refuses_push_to_empty_or_ambiguous_target(self, branch) -> None:
+    def test_refuses_push_to_empty_or_ambiguous_target(
+        self, branch: str | None
+    ) -> None:
         """An empty/blank/absent branch must fail closed (refused), not pass."""
         from backend.safety.push_policy import authorize_direct_push
 
@@ -301,7 +304,7 @@ class TestScanContentForSecretsFailsClosed:
 
         real_import = builtins.__import__
 
-        def _hostile_import(name, *args, **kwargs):
+        def _hostile_import(name: str, *args: Any, **kwargs: Any) -> Any:
             if name == "kiro_crew.security" or name.startswith("kiro_crew.security"):
                 raise ImportError("simulated: scanner unavailable")
             return real_import(name, *args, **kwargs)
@@ -330,7 +333,7 @@ class TestScanContentForSecretsFailsClosed:
         sys.modules.pop("backend.safety.push_policy", None)
         push_policy = importlib.import_module("backend.safety.push_policy")
 
-        def _boom(*_args, **_kwargs):
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
             raise RuntimeError("simulated: scanner crashed at call time")
 
         # Patch whichever underlying scanner call the module makes. We patch
@@ -361,7 +364,7 @@ class TestScanContentForSecretsFailsClosed:
 
         real_import = builtins.__import__
 
-        def _hostile_import(name, *args, **kwargs):
+        def _hostile_import(name: str, *args: Any, **kwargs: Any) -> Any:
             if name == "kiro_crew.security" or name.startswith("kiro_crew.security"):
                 raise ImportError("simulated: scanner unavailable")
             return real_import(name, *args, **kwargs)

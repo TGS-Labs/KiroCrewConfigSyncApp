@@ -22,6 +22,7 @@ starting state, not a test defect.
 from __future__ import annotations
 
 import string
+from pathlib import Path
 
 import pytest
 
@@ -57,7 +58,7 @@ NEVER_TRACKED_RELATIVE_PATHS = [
 ]
 
 
-def _all_entries():
+def _all_entries() -> list:
     """Return the full flat list of allowlist entries across both roots."""
     entries = allowlist.ALLOWLIST
     assert not callable(entries), (
@@ -73,13 +74,13 @@ def _all_entries():
 # ---------------------------------------------------------------------------
 
 
-def test_allowlist_is_a_nonempty_data_collection():
+def test_allowlist_is_a_nonempty_data_collection() -> None:
     """ALLOWLIST is an iterable/sequence of entries, not executable logic."""
     entries = _all_entries()
     assert len(entries) > 0
 
 
-def test_every_entry_declares_a_root():
+def test_every_entry_declares_a_root() -> None:
     """Each entry names which configuration root (A or B) it belongs to."""
     entries = _all_entries()
     for entry in entries:
@@ -90,7 +91,7 @@ def test_every_entry_declares_a_root():
         assert entry.root in ("A", "B")
 
 
-def test_every_entry_has_a_propagation_class():
+def test_every_entry_has_a_propagation_class() -> None:
     """requirements.md 1.6: a test SHALL fail if any entry lacks a
 
     PropagationClass. This is that test.
@@ -104,7 +105,7 @@ def test_every_entry_has_a_propagation_class():
     )
 
 
-def test_propagation_class_is_one_of_the_defined_kinds():
+def test_propagation_class_is_one_of_the_defined_kinds() -> None:
     """Every entry's PropagationClass is a real, defined classification —
 
     not an arbitrary string — so downstream reporting (requirements.md 5.9)
@@ -119,7 +120,7 @@ def test_propagation_class_is_one_of_the_defined_kinds():
         )
 
 
-def test_root_a_entries_cover_every_required_config_class():
+def test_root_a_entries_cover_every_required_config_class() -> None:
     """requirements.md 1.1: root A must enumerate each named tracked class.
 
     This does not assert the exact entry count (that would be a snapshot);
@@ -144,7 +145,7 @@ def test_root_a_entries_cover_every_required_config_class():
         )
 
 
-def test_root_b_admits_only_agents_json_files():
+def test_root_b_admits_only_agents_json_files() -> None:
     """requirements.md 1.2: root B tracks `agents/*.json` only.
 
     kiro_home()'s own contract is that only the agents directory follows
@@ -170,7 +171,7 @@ def test_root_b_admits_only_agents_json_files():
         )
 
 
-def test_root_b_entries_declare_root_b_only():
+def test_root_b_entries_declare_root_b_only() -> None:
     """No root-B entry may also serve as a root-A pattern (or vice versa) —
 
     the two roots are separate namespaces, not a merged one.
@@ -192,14 +193,14 @@ def test_root_b_entries_declare_root_b_only():
 
 @pytest.mark.parametrize("relpath", NEVER_TRACKED_RELATIVE_PATHS)
 @pytest.mark.parametrize("root", ["A", "B"])
-def test_never_tracked_paths_match_no_allowlist_entry(root: str, relpath: str):
+def test_never_tracked_paths_match_no_allowlist_entry(root: str, relpath: str) -> None:
     assert not allowlist.is_tracked(root, relpath), (
         f"path {relpath!r} on root {root!r} matched an allowlist entry, but "
         "requirements.md 1.4 requires it be structurally unreachable"
     )
 
 
-def test_never_tracked_paths_are_denylist_complete_against_every_entry():
+def test_never_tracked_paths_are_denylist_complete_against_every_entry() -> None:
     """Belt-and-braces: directly check every individual entry's pattern
 
     against every never-tracked path, rather than only the matcher's public
@@ -215,7 +216,7 @@ def test_never_tracked_paths_are_denylist_complete_against_every_entry():
             ), f"entry {entry!r} matches never-tracked path {relpath!r}"
 
 
-def test_absence_from_a_denylist_is_not_how_inclusion_works():
+def test_absence_from_a_denylist_is_not_how_inclusion_works() -> None:
     """requirements.md 1.3: a file is included only on an allowlist HIT,
 
     never merely because it fails to match anything forbidden. A wholly
@@ -239,7 +240,7 @@ def test_absence_from_a_denylist_is_not_how_inclusion_works():
 # ---------------------------------------------------------------------------
 
 
-def test_steering_glob_matches_nested_markdown_only():
+def test_steering_glob_matches_nested_markdown_only() -> None:
     assert allowlist.is_tracked("A", "steering/plan.md")
     assert allowlist.is_tracked("A", "steering/nested/dir/rule.md")
     # A markdown file must be tracked; a same-named non-markdown sibling
@@ -248,14 +249,14 @@ def test_steering_glob_matches_nested_markdown_only():
     assert not allowlist.is_tracked("A", "steering/notes.json")
 
 
-def test_skill_md_glob_matches_any_depth_but_only_skill_md_files():
+def test_skill_md_glob_matches_any_depth_but_only_skill_md_files() -> None:
     assert allowlist.is_tracked("A", "skills/foo/SKILL.md")
     assert allowlist.is_tracked("A", "skills/nested/foo/SKILL.md")
     assert not allowlist.is_tracked("A", "skills/foo/README.md")
     assert not allowlist.is_tracked("A", "skills/foo/skill.md")  # case
 
 
-def test_skill_scripts_glob_matches_nested_script_files():
+def test_skill_scripts_glob_matches_nested_script_files() -> None:
     assert allowlist.is_tracked("A", "skills/foo/scripts/run.sh")
     assert allowlist.is_tracked("A", "skills/foo/scripts/lib/helper.py")
     assert not allowlist.is_tracked("A", "skills/foo/assets/icon.png")
@@ -272,7 +273,7 @@ def test_skill_scripts_glob_matches_nested_script_files():
         "instances.json",
     ],
 )
-def test_root_a_top_level_singleton_files_are_exact_matches_only(relpath):
+def test_root_a_top_level_singleton_files_are_exact_matches_only(relpath: str) -> None:
     """Each single named config file is tracked at its exact top-level path,
 
     and a same-named file nested elsewhere is not swept in by a careless
@@ -290,7 +291,7 @@ def test_root_a_top_level_singleton_files_are_exact_matches_only(relpath):
 # ---------------------------------------------------------------------------
 
 
-def test_matcher_is_a_pure_predicate_not_a_filesystem_check(tmp_path):
+def test_matcher_is_a_pure_predicate_not_a_filesystem_check(tmp_path: Path) -> None:
     """is_tracked() must answer purely from the path string; it must not
 
     stat the filesystem, so collect.py (not allowlist.py) owns "absent
@@ -305,7 +306,7 @@ def test_matcher_is_a_pure_predicate_not_a_filesystem_check(tmp_path):
     assert allowlist.is_tracked("A", "crons.json")
 
 
-def test_entry_patterns_contain_no_path_traversal_shape():
+def test_entry_patterns_contain_no_path_traversal_shape() -> None:
     """Defence against a data-authoring mistake: no allowlist entry pattern
 
     may itself contain a `..` traversal segment, which would make "matches
@@ -318,7 +319,7 @@ def test_entry_patterns_contain_no_path_traversal_shape():
         ), f"entry {entry!r} pattern contains a path-traversal segment"
 
 
-def test_lock_and_pid_glob_denial_holds_for_arbitrary_stems():
+def test_lock_and_pid_glob_denial_holds_for_arbitrary_stems() -> None:
     """The lock/pid exclusion in requirements.md 1.4 is a suffix property,
 
     not a fixed filename list — assert it holds for stems built from a
@@ -332,7 +333,7 @@ def test_lock_and_pid_glob_denial_holds_for_arbitrary_stems():
             assert not allowlist.is_tracked("B", relpath)
 
 
-def test_no_entry_pattern_is_a_bare_wildcard():
+def test_no_entry_pattern_is_a_bare_wildcard() -> None:
     """Guard against a degenerate entry like `**` or `*` that would trivially
 
     satisfy 'is data' while defeating every denylist property above by

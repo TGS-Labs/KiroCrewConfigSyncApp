@@ -21,6 +21,7 @@ a future conftest.py registering the same "dev"/"ci" profile names.
 
 import json
 import os
+from typing import Any
 
 from hypothesis import given, settings, strategies as st
 
@@ -58,7 +59,7 @@ _SERVER_NAME_STRATEGY = st.from_regex(r"[a-z][a-z0-9_-]{0,20}", fullmatch=True)
 
 
 @st.composite
-def _headers_map(draw, min_size=1, max_size=5):
+def _headers_map(draw: Any, min_size: int = 1, max_size: int = 5) -> dict[str, str]:
     """A small non-empty dict of header-name -> secret-shaped value."""
     keys = draw(
         st.lists(_KEY_STRATEGY, min_size=min_size, max_size=max_size, unique=True)
@@ -67,7 +68,7 @@ def _headers_map(draw, min_size=1, max_size=5):
 
 
 @st.composite
-def _mcp_server_entry(draw):
+def _mcp_server_entry(draw: Any) -> dict[str, Any]:
     """One mcpServers entry carrying a headers block and/or an env block."""
     entry = {
         "command": draw(st.sampled_from(["npx", "python3", "node", "uvx"])),
@@ -81,7 +82,9 @@ def _mcp_server_entry(draw):
 
 
 @st.composite
-def _mcp_document(draw, min_servers=1, max_servers=4):
+def _mcp_document(
+    draw: Any, min_servers: int = 1, max_servers: int = 4
+) -> dict[str, Any]:
     """An mcp.json-shaped document: {"mcpServers": {name: entry, ...}}."""
     names = draw(
         st.lists(
@@ -102,7 +105,7 @@ def _as_bytes(doc: dict) -> bytes:
 def _rotate_values(doc: dict, new_value: str) -> dict:
     """Return a deep-ish copy of an mcp.json-shaped doc with every headers/env
     value replaced by `new_value`, keeping every key and server unchanged."""
-    rotated = {"mcpServers": {}}
+    rotated: dict[str, Any] = {"mcpServers": {}}
     for name, entry in doc["mcpServers"].items():
         new_entry = dict(entry)
         for block_name in ("headers", "env"):
@@ -118,7 +121,9 @@ def _rotate_values(doc: dict, new_value: str) -> dict:
 
 
 @given(doc=_mcp_document(min_servers=1, max_servers=4), new_name=_SERVER_NAME_STRATEGY)
-def test_adding_a_server_changes_redacted_output(doc, new_name):
+def test_adding_a_server_changes_redacted_output(
+    doc: dict[str, Any], new_name: str
+) -> None:
     """Property: adding a new mcpServers entry changes the redacted output.
 
     Requirements 3.2, 3.3 — structural drift in mcp.json (a server added)
@@ -145,7 +150,7 @@ def test_adding_a_server_changes_redacted_output(doc, new_name):
 
 
 @given(doc=_mcp_document(min_servers=2, max_servers=4))
-def test_removing_a_server_changes_redacted_output(doc):
+def test_removing_a_server_changes_redacted_output(doc: dict[str, Any]) -> None:
     """Property: removing an mcpServers entry changes the redacted output.
 
     Requirements 3.2, 3.3 — the inverse of the addition case: a server
@@ -174,8 +179,8 @@ def test_removing_a_server_changes_redacted_output(doc):
 
 @given(doc=_mcp_document(min_servers=1, max_servers=4), rotated_value=_VALUE_STRATEGY)
 def test_rotating_header_and_env_values_is_byte_identical_after_redaction(
-    doc, rotated_value
-):
+    doc: dict[str, Any], rotated_value: str
+) -> None:
     """Property: rotating header/env values (same keys, same servers) leaves
     the redacted output byte-identical to the original redacted output.
 
@@ -197,7 +202,7 @@ def test_rotating_header_and_env_values_is_byte_identical_after_redaction(
 # --------------------------------------------------------------------------
 
 
-def test_every_headers_and_env_value_replaced_with_redacted_literal():
+def test_every_headers_and_env_value_replaced_with_redacted_literal() -> None:
     """Every value inside a `headers` or `env` object becomes "<redacted>",
     while server names and header/env keys are preserved verbatim."""
     doc = {
@@ -231,7 +236,7 @@ def test_every_headers_and_env_value_replaced_with_redacted_literal():
     assert server["args"] == ["-y", "server-github"]
 
 
-def test_key_order_and_json_structure_preserved():
+def test_key_order_and_json_structure_preserved() -> None:
     """Key order within `headers`/`env` and the surrounding document
     structure (server names, nesting, non-secret keys) survive redaction."""
     doc = {
@@ -271,7 +276,7 @@ def test_key_order_and_json_structure_preserved():
     ]
 
 
-def test_relpath_keys_and_non_json_content_are_not_dropped():
+def test_relpath_keys_and_non_json_content_are_not_dropped() -> None:
     """The output mapping still carries every input relpath; a file with no
     headers/env block passes through with its content unchanged in shape."""
     doc_no_secrets = {"mcpServers": {"plain": {"command": "npx", "args": []}}}
@@ -287,7 +292,7 @@ def test_relpath_keys_and_non_json_content_are_not_dropped():
     assert json.loads(result["mcp.json"]) == doc_no_secrets
 
 
-def test_deterministic_reserialization_same_input_twice_is_byte_identical():
+def test_deterministic_reserialization_same_input_twice_is_byte_identical() -> None:
     """Redacting the exact same input mapping twice produces byte-identical
     output both times, so an unchanged file never produces a spurious diff."""
     doc = {
@@ -309,7 +314,7 @@ def test_deterministic_reserialization_same_input_twice_is_byte_identical():
     assert first["mcp.json"] == second["mcp.json"]
 
 
-def test_env_and_headers_both_redacted_in_same_document():
+def test_env_and_headers_both_redacted_in_same_document() -> None:
     """A document with both a `headers` block and an `env` block on the same
     server has every value in both blocks replaced, independently."""
     doc = {
@@ -329,5 +334,52 @@ def test_env_and_headers_both_redacted_in_same_document():
 
     assert server["headers"]["Authorization"] == "<redacted>"
     assert server["env"]["API_KEY"] == "<redacted>"
+
+
+def test_non_json_content_passes_through_unchanged() -> None:
+    """A file whose content is not valid JSON (e.g. a shell script or plain
+    text) passes through byte-for-byte unchanged -- redact() only ever
+    touches parsed JSON documents; it never guesses at other formats."""
+    plain_text = b"#!/bin/bash\necho hello\n"
+    not_utf8 = b"\xff\xfe\x00\x01invalid-utf8"
+    collected = {
+        "scripts/run.sh": plain_text,
+        "binary.bin": not_utf8,
+        "mcp.json": json.dumps(
+            {"mcpServers": {"svc": {"command": "npx", "env": {"K": "v"}}}}
+        ).encode("utf-8"),
+    }
+
+    result = redact(collected)
+
+    assert result["scripts/run.sh"] == plain_text
+    assert result["binary.bin"] == not_utf8
+    # The one genuinely JSON file is still redacted normally.
+    parsed = json.loads(result["mcp.json"])
+    assert parsed["mcpServers"]["svc"]["env"]["K"] == "<redacted>"
+
+
+def test_headers_or_env_value_that_is_not_a_mapping_passes_through_unchanged() -> None:
+    """A `headers`/`env` key whose value is not itself a mapping (e.g. a
+    string, number, list, or null placed there by a malformed or unusual
+    mcp.json) is returned unchanged rather than guessed at -- only an actual
+    mapping's values are replaced with the placeholder."""
+    doc = {
+        "mcpServers": {
+            "weird": {
+                "command": "npx",
+                "headers": "not-a-mapping",
+                "env": None,
+            }
+        }
+    }
+    collected = {"mcp.json": json.dumps(doc).encode("utf-8")}
+
+    result = redact(collected)
+    parsed = json.loads(result["mcp.json"])
+    server = parsed["mcpServers"]["weird"]
+
+    assert server["headers"] == "not-a-mapping"
+    assert server["env"] is None
     assert "secret-header-value" not in result["mcp.json"].decode("utf-8")
     assert "secret-env-value" not in result["mcp.json"].decode("utf-8")

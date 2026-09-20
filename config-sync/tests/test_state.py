@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 
@@ -52,7 +52,7 @@ def isolated_roots(
 
 
 @pytest.fixture
-def state_store(isolated_roots: dict[str, Path]):
+def state_store(isolated_roots: dict[str, Path]) -> Any:
     """A fresh state store instance/module state, isolated per test."""
     return state.load_state()
 
@@ -87,6 +87,71 @@ class TestStateDirectoryLocation:
             "app state directory must never live inside KIRO_HOME "
             "(root B) or it could be swept into a tracked-tree commit"
         )
+
+    def test_state_dir_is_outside_real_default_kiro_home_when_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reproduces the real-host scenario (checkpoint 1.5): KIRO_HOME is
+        genuinely absent from the environment (the common case — most hosts
+        never set it explicitly), and only KIROCROW_HOME is configured.
+
+        get_state_dir() must still resolve OUTSIDE the real default
+        KIRO_HOME (``Path.home() / ".kiro"``) per requirements.md 2.2. The
+        pre-existing test above cannot catch a regression here because its
+        fixture sets KIRO_HOME to a synthetic tmp_path sibling that the code
+        never actually reads — it does not exercise the real ancestor
+        relationship between KIROCROW_HOME's parent and KIRO_HOME's true
+        default.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "kirocrew_home"))
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.delenv("CONFIG_SYNC_STATE_DIR", raising=False)
+
+        state_dir = Path(state.get_state_dir())
+        real_default_kiro_home = Path.home() / ".kiro"
+
+        assert not _is_descendant(state_dir, real_default_kiro_home), (
+            "with KIRO_HOME unset, get_state_dir() must not resolve to a "
+            "descendant of the real default KIRO_HOME (~/.kiro) — "
+            "get_state_dir() must actually read KIRO_HOME rather than only "
+            "ever deriving the state dir from KIROCROW_HOME's parent"
+        )
+
+    def test_config_sync_state_dir_override_is_honored_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONFIG_SYNC_STATE_DIR, when set, is used as-is with no anchor
+        walk — the explicit operator/test override always wins."""
+        override_dir = tmp_path / "explicit-override"
+        monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(override_dir))
+
+        state_dir = Path(state.get_state_dir())
+
+        assert state_dir == override_dir
+        assert state_dir.is_dir()
+
+    def test_anchor_walk_stops_at_filesystem_root_without_looping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pathological configuration where both roots resolve to '/'
+        must not loop forever walking up parents — the anchor walk breaks
+        once ``anchor.parent == anchor`` (the filesystem root), even though
+        '/' is still technically an ancestor of both tracked roots. This
+        checks the walk terminates quickly rather than that true isolation
+        is achieved, since the inputs themselves leave no room for it."""
+        monkeypatch.setenv("KIROCREW_HOME", "/")
+        monkeypatch.setenv("KIRO_HOME", "/")
+        monkeypatch.delenv("CONFIG_SYNC_STATE_DIR", raising=False)
+
+        # mkdir() on a real root-anchored path is outside what this test
+        # needs to prove (it would require actual filesystem write access
+        # to '/'), so patch it out — the property under test is that the
+        # resolution loop terminates and returns a root-anchored path, not
+        # that directory creation there succeeds.
+        monkeypatch.setattr(Path, "mkdir", lambda self, *a, **k: None)
+
+        state_dir = state.get_state_dir()
+        assert Path(state_dir).as_posix().startswith("/")
 
     def test_state_file_lives_under_the_state_dir(
         self, isolated_roots: dict[str, Path]
@@ -431,7 +496,7 @@ class TestAtomicWrites:
         opened_modes_on_real_path: list[str] = []
         real_open = open
 
-        def spy_open(path, mode="r", *args, **kwargs):
+        def spy_open(path: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
             if Path(path) == state_path and "w" in mode:
                 opened_modes_on_real_path.append(mode)
             return real_open(path, mode, *args, **kwargs)
@@ -460,7 +525,7 @@ class TestAtomicWrites:
         state_path = Path(state.get_state_path())
         good_bytes = state_path.read_bytes()
 
-        def failing_replace(*args, **kwargs):
+        def failing_replace(*args: Any, **kwargs: Any) -> Any:
             raise OSError("simulated crash during atomic rename")
 
         monkeypatch.setattr(os, "replace", failing_replace)

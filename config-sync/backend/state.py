@@ -42,6 +42,29 @@ _DEFAULT_FIELDS: dict[str, Any] = {
 }
 
 
+_ROOT_A_ENV = "KIROCREW_HOME"
+_ROOT_B_ENV = "KIRO_HOME"
+
+
+def _root_a_path() -> Path:
+    """Resolve root A: ``KIROCREW_HOME``, defaulting to ``~/.kiro/crew``."""
+    override = os.environ.get(_ROOT_A_ENV)
+    return Path(override) if override else Path.home() / ".kiro" / "crew"
+
+
+def _root_b_path() -> Path:
+    """Resolve root B: ``KIRO_HOME``, defaulting to ``~/.kiro``."""
+    override = os.environ.get(_ROOT_B_ENV)
+    return Path(override) if override else Path.home() / ".kiro"
+
+
+def _is_descendant_or_same(candidate: Path, ancestor: Path) -> bool:
+    """True if ``candidate`` resolves to ``ancestor`` or lives under it."""
+    candidate = candidate.resolve()
+    ancestor = ancestor.resolve()
+    return candidate == ancestor or ancestor in candidate.parents
+
+
 def get_state_dir() -> Path:
     """Return the app's own state directory, creating it if needed.
 
@@ -50,19 +73,37 @@ def get_state_dir() -> Path:
     this app's bookkeeping can never land inside a tree it syncs.
 
     Honors ``CONFIG_SYNC_STATE_DIR`` as an explicit override for operators
-    and tests. Otherwise the state directory sits as a **sibling** of
-    ``KIROCREW_HOME`` (never a descendant of it, or of ``KIRO_HOME``):
-    ``<KIROCREW_HOME's parent>/config-sync-state``. This keeps the state
-    directory correctly isolated per KiroCrew installation (and, in tests,
-    per ``tmp_path``) without hardcoding an unrelated real-filesystem path.
+    and tests. Otherwise both roots are resolved (matching
+    ``backend.collect``'s ``_root_a_path`` / ``_root_b_path`` convention:
+    env var override, else the real default) and the state directory is
+    anchored at the *shallowest common ancestor* of both resolved roots'
+    parents, walking further up if that ancestor still turns out to be a
+    descendant of (or equal to) either root. This is provably outside both
+    roots regardless of their actual on-disk relationship — on a real host
+    ``KIROCREW_HOME`` (``~/.kiro/crew``) is itself a descendant of
+    ``KIRO_HOME``'s default (``~/.kiro``), so anchoring merely one level
+    above one root is not sufficient in general; walking up from the
+    shallower root's parent until clear of both is.
     """
     override = os.environ.get(_STATE_DIR_ENV)
     if override:
         state_dir = Path(override)
     else:
-        kirocrew_home = os.environ.get("KIROCREW_HOME")
-        base = Path(kirocrew_home) if kirocrew_home else Path.home() / ".kiro" / "crew"
-        state_dir = base.parent / "config-sync-state"
+        root_a = _root_a_path().resolve()
+        root_b = _root_b_path().resolve()
+        # Start from whichever root is shallower (fewer path parts), since
+        # its parent is the more likely candidate to already sit outside
+        # the other root too.
+        anchor = min(root_a.parent, root_b.parent, key=lambda p: len(p.parts))
+        while _is_descendant_or_same(anchor, root_a) or _is_descendant_or_same(
+            anchor, root_b
+        ):
+            if anchor.parent == anchor:
+                # Reached the filesystem root without clearing either tree
+                # (pathological input) — stop rather than loop forever.
+                break
+            anchor = anchor.parent
+        state_dir = anchor / "config-sync-state"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 
