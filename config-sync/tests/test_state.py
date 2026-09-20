@@ -35,12 +35,19 @@ from backend import state
 def isolated_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[dict[str, Path]]:
-    """Point both tracked configuration roots at disposable directories.
+    """Point both tracked configuration roots at disposable directories,
+    and isolate the app's own state directory too.
 
     KIROCREW_HOME (root A) and KIRO_HOME (root B) are the two trees this app
     tracks and commits from. The app's own state directory must resolve
     OUTSIDE both, so tests give each an unambiguous, distinct path under
     tmp_path and assert the state directory is not a descendant of either.
+
+    The default state directory (``~/.config-sync/state``) is a fixed,
+    real-home location by design (Requirement 2.2) — it no longer varies
+    with KIROCREW_HOME / KIRO_HOME. Tests therefore isolate it explicitly
+    via CONFIG_SYNC_STATE_DIR so state from one test run never leaks into
+    another or touches the real ``~/.config-sync``.
     """
     root_a = tmp_path / "kirocrew_home"
     root_b = tmp_path / "kiro_home"
@@ -48,6 +55,7 @@ def isolated_roots(
     root_b.mkdir()
     monkeypatch.setenv("KIROCREW_HOME", str(root_a))
     monkeypatch.setenv("KIRO_HOME", str(root_b))
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(tmp_path / "state"))
     yield {"root_a": root_a, "root_b": root_b, "tmp_path": tmp_path}
 
 
@@ -93,35 +101,35 @@ class TestStateDirectoryLocation:
     ) -> None:
         """Reproduces the real-host scenario (checkpoint 1.5): KIRO_HOME is
         genuinely absent from the environment (the common case — most hosts
-        never set it explicitly), and only KIROCROW_HOME is configured.
+        never set it explicitly), and only KIROCREW_HOME is configured.
 
-        get_state_dir() must still resolve OUTSIDE the real default
-        KIRO_HOME (``Path.home() / ".kiro"``) per requirements.md 2.2. The
-        pre-existing test above cannot catch a regression here because its
-        fixture sets KIRO_HOME to a synthetic tmp_path sibling that the code
-        never actually reads — it does not exercise the real ancestor
-        relationship between KIROCROW_HOME's parent and KIRO_HOME's true
-        default.
+        get_state_dir() must still resolve OUTSIDE the default KIRO_HOME
+        (``home / ".kiro"``) per requirements.md 2.2. The fixed, independent
+        ``<home>/.config-sync/state`` location satisfies this by naming
+        rather than by any relationship to KIRO_HOME's value, so this holds
+        regardless of whether KIRO_HOME is set. A fake home under
+        ``tmp_path`` keeps this isolated from the real user home.
         """
+        fake_home = tmp_path / "fake-home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "kirocrew_home"))
         monkeypatch.delenv("KIRO_HOME", raising=False)
         monkeypatch.delenv("CONFIG_SYNC_STATE_DIR", raising=False)
 
         state_dir = Path(state.get_state_dir())
-        real_default_kiro_home = Path.home() / ".kiro"
+        default_kiro_home = fake_home / ".kiro"
 
-        assert not _is_descendant(state_dir, real_default_kiro_home), (
+        assert not _is_descendant(state_dir, default_kiro_home), (
             "with KIRO_HOME unset, get_state_dir() must not resolve to a "
-            "descendant of the real default KIRO_HOME (~/.kiro) — "
-            "get_state_dir() must actually read KIRO_HOME rather than only "
-            "ever deriving the state dir from KIROCROW_HOME's parent"
+            "descendant of the default KIRO_HOME (~/.kiro)"
         )
 
     def test_config_sync_state_dir_override_is_honored_verbatim(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """CONFIG_SYNC_STATE_DIR, when set, is used as-is with no anchor
-        walk — the explicit operator/test override always wins."""
+        """CONFIG_SYNC_STATE_DIR, when set, is used as-is — the explicit
+        operator/test override always wins over the fixed default."""
         override_dir = tmp_path / "explicit-override"
         monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(override_dir))
 
@@ -130,28 +138,31 @@ class TestStateDirectoryLocation:
         assert state_dir == override_dir
         assert state_dir.is_dir()
 
-    def test_anchor_walk_stops_at_filesystem_root_without_looping(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_default_state_dir_does_not_depend_on_tracked_root_values(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A pathological configuration where both roots resolve to '/'
-        must not loop forever walking up parents — the anchor walk breaks
-        once ``anchor.parent == anchor`` (the filesystem root), even though
-        '/' is still technically an ancestor of both tracked roots. This
-        checks the walk terminates quickly rather than that true isolation
-        is achieved, since the inputs themselves leave no room for it."""
+        """The default state directory is a fixed, named location — it must
+        not shift when KIROCREW_HOME / KIRO_HOME point at unusual or
+        colliding values (e.g. both pointing at the same directory, or one
+        nested inside the other). This replaces the removed walk-up-anchor
+        mechanism's pathological-input test: the new contract has no
+        anchor-walk to loop, so the property to prove is that the default
+        is stable and independent of these env vars entirely. A fake home
+        under ``tmp_path`` keeps this isolated from the real user home."""
+        fake_home = tmp_path / "fake-home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        monkeypatch.delenv("CONFIG_SYNC_STATE_DIR", raising=False)
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        baseline = Path(state.get_state_dir())
+
         monkeypatch.setenv("KIROCREW_HOME", "/")
         monkeypatch.setenv("KIRO_HOME", "/")
-        monkeypatch.delenv("CONFIG_SYNC_STATE_DIR", raising=False)
+        same_root_state_dir = Path(state.get_state_dir())
 
-        # mkdir() on a real root-anchored path is outside what this test
-        # needs to prove (it would require actual filesystem write access
-        # to '/'), so patch it out — the property under test is that the
-        # resolution loop terminates and returns a root-anchored path, not
-        # that directory creation there succeeds.
-        monkeypatch.setattr(Path, "mkdir", lambda self, *a, **k: None)
-
-        state_dir = state.get_state_dir()
-        assert Path(state_dir).as_posix().startswith("/")
+        assert same_root_state_dir == baseline
+        assert same_root_state_dir == Path.home() / ".config-sync" / "state"
 
     def test_state_file_lives_under_the_state_dir(
         self, isolated_roots: dict[str, Path]

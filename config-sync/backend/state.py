@@ -42,68 +42,34 @@ _DEFAULT_FIELDS: dict[str, Any] = {
 }
 
 
-_ROOT_A_ENV = "KIROCREW_HOME"
-_ROOT_B_ENV = "KIRO_HOME"
-
-
-def _root_a_path() -> Path:
-    """Resolve root A: ``KIROCREW_HOME``, defaulting to ``~/.kiro/crew``."""
-    override = os.environ.get(_ROOT_A_ENV)
-    return Path(override) if override else Path.home() / ".kiro" / "crew"
-
-
-def _root_b_path() -> Path:
-    """Resolve root B: ``KIRO_HOME``, defaulting to ``~/.kiro``."""
-    override = os.environ.get(_ROOT_B_ENV)
-    return Path(override) if override else Path.home() / ".kiro"
-
-
-def _is_descendant_or_same(candidate: Path, ancestor: Path) -> bool:
-    """True if ``candidate`` resolves to ``ancestor`` or lives under it."""
-    candidate = candidate.resolve()
-    ancestor = ancestor.resolve()
-    return candidate == ancestor or ancestor in candidate.parents
+_STATE_DIR_NAME = (".config-sync", "state")
 
 
 def get_state_dir() -> Path:
     """Return the app's own state directory, creating it if needed.
 
-    Deliberately independent of ``KIROCREW_HOME`` and ``KIRO_HOME`` — the
-    two tracked configuration roots this app reads from and commits — so
-    this app's bookkeeping can never land inside a tree it syncs.
-
     Honors ``CONFIG_SYNC_STATE_DIR`` as an explicit override for operators
-    and tests. Otherwise both roots are resolved (matching
-    ``backend.collect``'s ``_root_a_path`` / ``_root_b_path`` convention:
-    env var override, else the real default) and the state directory is
-    anchored at the *shallowest common ancestor* of both resolved roots'
-    parents, walking further up if that ancestor still turns out to be a
-    descendant of (or equal to) either root. This is provably outside both
-    roots regardless of their actual on-disk relationship — on a real host
-    ``KIROCREW_HOME`` (``~/.kiro/crew``) is itself a descendant of
-    ``KIRO_HOME``'s default (``~/.kiro``), so anchoring merely one level
-    above one root is not sufficient in general; walking up from the
-    shallower root's parent until clear of both is.
+    and tests. Otherwise the state directory is a fixed, KiroCrew-owned
+    location named ``~/.config-sync/state`` — a dedicated top-level
+    dot-directory of its own, never nested under ``.kiro`` at all.
+
+    This is outside both tracked configuration roots (``KIROCREW_HOME`` /
+    ``KIRO_HOME``) *by construction/naming*, not by walking either root's
+    ancestry: no allowlist entry (``backend/allowlist.py``) can ever match a
+    path under ``config-sync/state/**`` in the first place, so isolation
+    from the tracked roots was never actually at risk regardless of where
+    they resolve to. A prior version of this function derived the state
+    directory from ``KIROCREW_HOME``'s and ``KIRO_HOME``'s resolved parents,
+    walking up until clear of both — that bought a property that was never
+    threatened while risking landing on an unwritable or arbitrary anchor
+    (e.g. a shared root's parent). Naming a fixed, independent location
+    avoids both the walk-up complexity and that risk.
     """
     override = os.environ.get(_STATE_DIR_ENV)
     if override:
         state_dir = Path(override)
     else:
-        root_a = _root_a_path().resolve()
-        root_b = _root_b_path().resolve()
-        # Start from whichever root is shallower (fewer path parts), since
-        # its parent is the more likely candidate to already sit outside
-        # the other root too.
-        anchor = min(root_a.parent, root_b.parent, key=lambda p: len(p.parts))
-        while _is_descendant_or_same(anchor, root_a) or _is_descendant_or_same(
-            anchor, root_b
-        ):
-            if anchor.parent == anchor:
-                # Reached the filesystem root without clearing either tree
-                # (pathological input) — stop rather than loop forever.
-                break
-            anchor = anchor.parent
-        state_dir = anchor / "config-sync-state"
+        state_dir = Path.home().joinpath(*_STATE_DIR_NAME)
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 

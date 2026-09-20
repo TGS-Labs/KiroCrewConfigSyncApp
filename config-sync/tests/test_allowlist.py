@@ -55,6 +55,18 @@ NEVER_TRACKED_RELATIVE_PATHS = [
     "server.lock",
     "some.lock",
     "some.pid",
+    # Nested spellings under skills/**/scripts/** — H2 regression guard.
+    # skills/**/scripts/** would otherwise admit these through its
+    # trailing "**" segment; requirements.md 1.4 must hold even nested
+    # under an otherwise-matching allowlist entry.
+    "skills/my-skill/scripts/.env",
+    "skills/my-skill/scripts/trust/sel_hmac.key",
+    "skills/my-skill/scripts/id_rsa",
+    "skills/my-skill/scripts/lib/id_rsa",
+    "skills/nested/dir/my-skill/scripts/.env",
+    "skills/my-skill/scripts/sessions/abc123.jsonl",
+    "skills/my-skill/scripts/some.lock",
+    "skills/my-skill/scripts/some.pid",
 ]
 
 
@@ -118,6 +130,75 @@ def test_propagation_class_is_one_of_the_defined_kinds() -> None:
             f"entry {entry!r} carries an undefined PropagationClass "
             f"{entry.propagation_class!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Exact per-entry classification: design.md's propagation table (see also
+# requirements.md 5.2, 5.7, 5.8, 5.9) names exactly four non-collapsible
+# propagation classes, and every entry must land in the one class design.md
+# assigns it — not merely *some* defined class. A prior version of this test
+# only checked "every entry has a class" (vacuous: it passed even when an
+# entry carried the wrong class), so it could not catch a misclassification
+# like tracking config.json as immediate or SKILL.md as new-session-only.
+# This table pins every entry, by (root, pattern), to its exact class.
+# ---------------------------------------------------------------------------
+
+EXPECTED_CLASSIFICATION = {
+    ("A", "steering/**/*.md"): allowlist.PropagationClass.LIVE_IN_NEW_SESSION,
+    ("A", "skills/**/SKILL.md"): allowlist.PropagationClass.LIVE_IMMEDIATE,
+    ("A", "skills/**/scripts/**"): allowlist.PropagationClass.LIVE_IMMEDIATE,
+    ("A", "config.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    ("A", "hooks.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    (
+        "A",
+        "agent_model_state.json",
+    ): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    ("A", "mcp.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    ("A", "crons.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    ("A", "instances.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    ("B", "agents/*.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+}
+
+
+def test_every_entry_is_pinned_to_its_exact_expected_propagation_class() -> None:
+    """Pin every allowlist entry, by (root, pattern), to the exact
+
+    PropagationClass design.md's propagation table assigns it — not merely
+    to some defined class. Fails loudly on any future misclassification
+    (e.g. re-introducing a fifth/renamed class, or moving an entry to the
+    wrong one of the four).
+    """
+    entries = _all_entries()
+    seen_keys = {(entry.root, entry.pattern) for entry in entries}
+
+    assert seen_keys == set(EXPECTED_CLASSIFICATION), (
+        "EXPECTED_CLASSIFICATION and the live ALLOWLIST have drifted apart — "
+        f"missing from ALLOWLIST: {set(EXPECTED_CLASSIFICATION) - seen_keys}; "
+        "missing from EXPECTED_CLASSIFICATION: "
+        f"{seen_keys - set(EXPECTED_CLASSIFICATION)}"
+    )
+
+    for entry in entries:
+        key = (entry.root, entry.pattern)
+        expected = EXPECTED_CLASSIFICATION[key]
+        assert entry.propagation_class is expected, (
+            f"entry {key!r} is classified {entry.propagation_class!r}, but "
+            f"design.md's propagation table requires {expected!r}"
+        )
+
+
+def test_exactly_four_propagation_classes_are_defined() -> None:
+    """design.md's propagation table names exactly four non-collapsible
+
+    states. A fifth class (or a collapse to fewer) is a taxonomy drift this
+    test catches even before checking any individual entry.
+    """
+    assert {member.name for member in allowlist.PropagationClass} == {
+        "LIVE_IN_NEW_SESSION",
+        "LIVE_IMMEDIATE",
+        "LIVE_WITHIN_60S",
+        "LIVE_ON_NEXT_RESOLUTION",
+    }
 
 
 def test_root_a_entries_cover_every_required_config_class() -> None:
@@ -260,6 +341,33 @@ def test_skill_scripts_glob_matches_nested_script_files() -> None:
     assert allowlist.is_tracked("A", "skills/foo/scripts/run.sh")
     assert allowlist.is_tracked("A", "skills/foo/scripts/lib/helper.py")
     assert not allowlist.is_tracked("A", "skills/foo/assets/icon.png")
+
+
+def test_skill_scripts_glob_never_readmits_never_tracked_shapes() -> None:
+    """H2 regression guard: skills/**/scripts/**'s trailing "**" segment
+
+    spans arbitrarily many nested components, so a naive translation of
+    that glob re-admits a requirements.md-1.4 never-tracked path merely
+    because it happens to live under some skill's scripts/ tree. A
+    legitimate script must still match; a credential/secret/log-shaped
+    basename nested at any depth underneath must not.
+    """
+    assert allowlist.is_tracked("A", "skills/foo/scripts/run.sh")
+    never_tracked_nested = [
+        "skills/my-skill/scripts/.env",
+        "skills/my-skill/scripts/trust/sel_hmac.key",
+        "skills/my-skill/scripts/id_rsa",
+        "skills/my-skill/scripts/lib/id_rsa",
+        "skills/nested/dir/my-skill/scripts/.env",
+        "skills/my-skill/scripts/sessions/abc123.jsonl",
+        "skills/my-skill/scripts/some.lock",
+        "skills/my-skill/scripts/some.pid",
+    ]
+    for relpath in never_tracked_nested:
+        assert not allowlist.is_tracked("A", relpath), (
+            f"{relpath!r} matched skills/**/scripts/** but requirements.md "
+            "1.4 requires it be structurally unreachable"
+        )
 
 
 @pytest.mark.parametrize(
