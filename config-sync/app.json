@@ -7,7 +7,7 @@
   "iconPath": "assets/icon.png",
   "defaultEnabled": false,
   "agents": [],
-  "skills": [],
+  "skills": ["skills/complete-pr-handoff"],
   "tags": [],
   "backend": {
     "entryPoint": "backend/server.py",
@@ -28,7 +28,7 @@
     {
       "name": "config-sync-push",
       "every": 900,
-      "command": "python3 backend/push.py",
+      "command": "cd \"${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/config-sync\" && python3 -m backend.push",
       "enabled": false,
       "silent": true
     },

@@ -489,6 +489,270 @@ class TestRestoreDirs:
 
 
 # ---------------------------------------------------------------------------
+# Pending-PR bookkeeping — record_pr_pending / record_pr_pending_failure /
+# confirm_pr_created (backend/pr_handoff.py's extension point, task 3.3)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingPr:
+    def test_no_pending_pr_record_by_default(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        assert store.pending_pr is None
+        assert store.pending_pr_failure is None
+
+    def test_record_pr_pending_persists_branch_hash_and_payload(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-abc123",
+            tree_hash="abc123",
+            payload={"repo": "TGS-Labs/Kiro-Config-Bundles", "head": "x"},
+        )
+
+        reloaded = state.load_state()
+        pending_pr = reloaded.pending_pr
+        assert pending_pr is not None
+        assert pending_pr["branch"] == "config-sync/instance-abc123"
+        assert pending_pr["tree_hash"] == "abc123"
+        assert pending_pr["payload"] == {
+            "repo": "TGS-Labs/Kiro-Config-Bundles",
+            "head": "x",
+        }
+        assert "time" in pending_pr
+
+    def test_record_pr_pending_does_not_change_last_pushed_hash(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_push_success(
+            tree_hash="prior-hash", branch="config-sync/instance-prior", pr_url=None
+        )
+
+        store.record_pr_pending(
+            branch="config-sync/instance-new",
+            tree_hash="new-hash",
+            payload={"repo": "x"},
+        )
+
+        assert store.last_pushed_hash == "prior-hash"
+
+    def test_record_pr_pending_failure_persists_the_cause(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending_failure(reason="malformed branch name")
+
+        reloaded = state.load_state()
+        failure = reloaded.pending_pr_failure
+        assert failure is not None
+        assert failure["reason"] == "malformed branch name"
+        assert "time" in failure
+
+    def test_record_pr_pending_failure_does_not_change_last_pushed_hash(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_push_success(
+            tree_hash="stable-hash", branch="config-sync/instance-stable", pr_url=None
+        )
+
+        store.record_pr_pending_failure(reason="notification channel down")
+
+        assert store.last_pushed_hash == "stable-hash"
+
+    def test_confirm_pr_created_advances_last_pushed_hash_and_records_push(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-confirmed",
+            tree_hash="confirmed-hash",
+            payload={"repo": "x"},
+        )
+
+        store.confirm_pr_created(
+            tree_hash="confirmed-hash",
+            branch="config-sync/instance-confirmed",
+            pr_url="https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/7",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.last_pushed_hash == "confirmed-hash"
+        last_push = reloaded.last_push
+        assert last_push is not None
+        assert last_push["branch"] == "config-sync/instance-confirmed"
+        assert (
+            last_push["pr_url"]
+            == "https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/7"
+        )
+
+    def test_confirm_pr_created_clears_the_pending_pr_record(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-cleared",
+            tree_hash="cleared-hash",
+            payload={"repo": "x"},
+        )
+
+        store.confirm_pr_created(
+            tree_hash="cleared-hash",
+            branch="config-sync/instance-cleared",
+            pr_url="https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/8",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.pending_pr is None
+
+
+# ---------------------------------------------------------------------------
+# Senior-review H-NEW-1 — record_pr_pending_failure must clear pending_pr
+# ---------------------------------------------------------------------------
+
+
+class TestPrFailureClearsPendingPr:
+    def test_record_pr_pending_failure_clears_pending_pr_for_current_attempt(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-abc",
+            tree_hash="abc-hash",
+            payload={"repo": "x"},
+        )
+
+        store.record_pr_pending_failure(
+            reason="Buildo create_pull_request returned 422",
+            tree_hash="abc-hash",
+            branch="config-sync/instance-abc",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.pending_pr is None
+        assert reloaded.pending_pr_failure is not None
+        assert reloaded.pending_pr_stale is None
+
+    def test_record_pr_pending_failure_with_no_pending_pr_yet_still_records(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """The in-tick payload-build-failure case: no pending_pr entry for
+
+        this attempt exists yet (record_pr_pending hasn't run). Must still
+        record the failure cleanly with nothing to clear."""
+        store = state.load_state()
+
+        store.record_pr_pending_failure(
+            reason="malformed branch name", tree_hash="new-hash", branch="b"
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.pending_pr is None
+        assert reloaded.pending_pr_failure is not None
+
+    def test_record_pr_pending_failure_for_a_different_attempt_leaves_current_alone(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """A failure report naming a DIFFERENT tree_hash/branch than the
+
+        current pending_pr must not clear it -- the current entry may be a
+        genuinely still-pending different attempt (H-NEW-2's sibling
+        case)."""
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-current",
+            tree_hash="current-hash",
+            payload={"repo": "x"},
+        )
+
+        store.record_pr_pending_failure(
+            reason="stale report",
+            tree_hash="old-hash",
+            branch="config-sync/instance-old",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.pending_pr is not None
+        assert reloaded.pending_pr.get("tree_hash") == "current-hash"
+        assert reloaded.pending_pr_stale is not None
+        assert reloaded.pending_pr_stale["tree_hash"] == "old-hash"
+
+
+# ---------------------------------------------------------------------------
+# Senior-review H-NEW-2 — confirm_pr_created / record_pr_pending_failure
+# must validate against the CURRENT pending_pr before mutating anything, so
+# a stale confirmation/failure for a superseded hash cannot regress
+# last_pushed_hash or destroy the real current pending_pr.
+# ---------------------------------------------------------------------------
+
+
+class TestStaleConfirmationOwnershipCheck:
+    def test_confirm_created_for_superseded_hash_does_not_regress_hash_or_clear_current(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """push A -> push C (supersedes A) -> confirm_pr_created(A's hash)
+
+        must NOT set last_pushed_hash to A, and pending_pr must still name
+        C -- the stale confirmation is recorded, not silently swallowed."""
+        store = state.load_state()
+
+        # Push A: pending_pr now names A.
+        store.record_pr_pending(
+            branch="config-sync/instance-A", tree_hash="hash-A", payload={"repo": "x"}
+        )
+        # A second, distinct change (C) arrives before A is confirmed and
+        # overwrites the single pending_pr slot -- exactly push.py's
+        # documented fall-through-to-change-path behaviour.
+        store.record_pr_pending(
+            branch="config-sync/instance-C", tree_hash="hash-C", payload={"repo": "x"}
+        )
+        assert store.pending_pr is not None
+        assert store.pending_pr.get("tree_hash") == "hash-C"
+
+        # An external agent, still holding A's original branch/hash, now
+        # reports A's PR as created.
+        store.confirm_pr_created(
+            tree_hash="hash-A",
+            branch="config-sync/instance-A",
+            pr_url="https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/1",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.last_pushed_hash != "hash-A"
+        assert reloaded.pending_pr is not None
+        assert reloaded.pending_pr.get("tree_hash") == "hash-C"
+        assert reloaded.pending_pr_stale is not None
+        assert reloaded.pending_pr_stale["tree_hash"] == "hash-A"
+
+    def test_confirm_created_for_the_current_matching_attempt_still_works(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """Regression guard: the normal, non-superseded matching case must
+
+        behave exactly as before the H-NEW-2 fix."""
+        store = state.load_state()
+        store.record_pr_pending(
+            branch="config-sync/instance-only",
+            tree_hash="only-hash",
+            payload={"repo": "x"},
+        )
+
+        store.confirm_pr_created(
+            tree_hash="only-hash",
+            branch="config-sync/instance-only",
+            pr_url="https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/2",
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.last_pushed_hash == "only-hash"
+        assert reloaded.pending_pr is None
+        assert reloaded.pending_pr_stale is None
+
+
+# ---------------------------------------------------------------------------
 # Atomic writes — no partial/corrupt state file survives an interrupted write
 # ---------------------------------------------------------------------------
 
