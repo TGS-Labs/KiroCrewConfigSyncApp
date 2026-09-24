@@ -387,15 +387,148 @@ class TestRetryPrOnlyAfterReportedPrFailure:
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             push.run()
 
-        # The real git failure is exactly "nothing to commit" — proving the
-        # fallthrough reached a genuine `git commit` on an unchanged tree,
-        # not some unrelated error.
-        stderr_or_output = str(exc_info.value.stderr or "") + str(
-            exc_info.value.output or ""
-        )
-        assert "nothing to commit" in stderr_or_output.lower() or (
-            exc_info.value.returncode == 1
-        ), (
+        # push.py's own `subprocess.run` calls never pass `capture_output`
+        # (nor `stderr=subprocess.PIPE`), so on a real `CalledProcessError`
+        # `exc.stderr` and `exc.output` are always `None` here — asserting
+        # against them would be dead code that can never actually run.
+        # `returncode` is the only signal push.py's own call shape actually
+        # populates; real `git commit` on a clean/unchanged tree exits 1.
+        assert exc_info.value.returncode == 1, (
             "reverting the fix must reproduce git's real 'nothing to "
-            f"commit' failure, got: {exc_info.value!r}"
+            f"commit' failure (exit 1), got: {exc_info.value!r}"
+        )
+
+
+class TestRetryPrOnlyWithStalePendingPrForOlderHash:
+    """Round-5 H1: the `retry-pr-only` gate must not require
+
+    `pending_pr is None`. `pending_pr` can legitimately hold a STALE entry
+    naming an OLDER, different hash (H-NEW-2's own design: an older
+    unconfirmed `pending_pr` can coexist while `last_push` names a newer
+    hash whose own PR-attempt failed). Gating on `pending_pr is None`
+    wrongly falls through to the full change path in that state, and real
+    `git commit` fails with "nothing to commit" against a branch that is
+    already correctly pushed — the N1 defect class recurring a third time.
+
+    Sequence: tick 1 pushes hash X (`pending_pr` becomes X, real git
+    push). Tick 2 pushes a new hash Y where the PR-open payload-build step
+    fails: `last_push` becomes Y with `pr_url=None`, but `pending_pr`
+    STAYS as X (stale-for-a-different-attempt, per
+    `state.record_pr_pending_failure` case 3 — the failure report names Y
+    while the current `pending_pr` still names X, so it is recorded to
+    `pending_pr_stale` and the CURRENT `pending_pr` entry for X is left
+    untouched, never cleared). Tick 3, content still at Y, must resolve to
+    `retry-pr-only` with ZERO git subprocess calls.
+    """
+
+    def test_stale_pending_pr_for_older_hash_does_not_block_retry_pr_only(
+        self,
+        isolated_roots: dict,
+        bare_remote: Path,
+        real_git_change_path_collaborators: dict,
+        stub_pr_handoff_external_calls: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(push, "BUNDLE_REPO_URL", str(bare_remote))
+
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        from backend import state
+
+        store = state.load_state()
+        monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
+
+        # --- Tick 1: push hash X for real. pending_pr becomes X. ----------
+        tick1_result = push.run()
+        assert tick1_result.outcome == "pushed"
+        hash_x = tick1_result.tree_hash
+        assert store.pending_pr is not None
+        assert store.pending_pr.get("tree_hash") == hash_x
+        branch_x = store.pending_pr.get("branch")
+        assert branch_x
+
+        # --- Tick 2: change content to Y, push for real, PR-open fails. --
+        # X's pending_pr entry is left exactly as-is (never confirmed or
+        # reported failed) — it is the STALE entry this test targets.
+        _write(root_a, "config.json", b'{"key": "value2"}')
+
+        build_mock = stub_pr_handoff_external_calls["build"]
+        build_mock.side_effect = RuntimeError("Buildo create_pull_request 500")
+
+        tick2_result = push.run()
+        assert tick2_result.outcome == "pushed"
+        hash_y = tick2_result.tree_hash
+        assert hash_y != hash_x
+
+        # last_push now names Y with no PR yet.
+        assert store.last_push is not None
+        assert store.last_push.get("tree_hash") == hash_y
+        assert store.last_push.get("pr_url") is None
+        branch_y = store.last_push.get("branch")
+        assert branch_y != branch_x
+
+        # pending_pr STILL names the older, stale X entry -- the
+        # payload-build failure for Y named a tree_hash/branch that did
+        # not match the current pending_pr (X), so
+        # state.record_pr_pending_failure's case-3 (H-NEW-2) path recorded
+        # it to pending_pr_stale and left the current pending_pr (X)
+        # completely untouched, rather than clearing it.
+        assert store.pending_pr is not None, (
+            "the older X entry must remain in pending_pr -- this is the "
+            "legitimate stale-slot state H1 exists to unblock"
+        )
+        assert store.pending_pr.get("tree_hash") == hash_x
+        assert store.pending_pr.get("branch") == branch_x
+        assert store.pending_pr_stale is not None
+        assert store.pending_pr_stale.get("tree_hash") == hash_y
+
+        # Verify tick 2's push of Y genuinely reached the real remote.
+        show_ref = subprocess.run(
+            ["git", "show-ref", "--verify", f"refs/heads/{branch_y}"],
+            cwd=str(bare_remote),
+            capture_output=True,
+            text=True,
+        )
+        assert show_ref.returncode == 0, (
+            f"tick 2 must have genuinely pushed {branch_y!r} to the real "
+            f"bare remote: {show_ref.stderr}"
+        )
+
+        # --- Tick 3: content still at Y. Must NOT touch git. --------------
+        build_mock.side_effect = None
+        build_mock.reset_mock()
+
+        failure_spy = MagicMock(wraps=store.record_push_failure)
+        monkeypatch.setattr(store, "record_push_failure", failure_spy)
+
+        real_subprocess_run = subprocess.run
+        run_spy = MagicMock(name="subprocess.run", wraps=real_subprocess_run)
+        monkeypatch.setattr(subprocess, "run", run_spy)
+        if hasattr(push, "subprocess"):
+            monkeypatch.setattr(push.subprocess, "run", run_spy)
+
+        tick3_result = push.run()
+
+        assert tick3_result.outcome == "retry-pr-only", (
+            "tick 3 must reach retry-pr-only even with a STALE pending_pr "
+            "entry naming a different (older) hash -- the gate must not "
+            "require pending_pr is None"
+        )
+        assert tick3_result.tree_hash == hash_y
+        assert tick3_result.reason == branch_y
+
+        run_spy.assert_not_called()
+        failure_spy.assert_not_called()
+
+        # The PR-open step for Y was retried, and pending_pr now correctly
+        # reflects Y (overwriting the stale X entry).
+        build_mock.assert_called_once()
+        assert store.pending_pr is not None
+        assert store.pending_pr.get("tree_hash") == hash_y
+        assert store.pending_pr.get("branch") == branch_y
+        assert store.last_pushed_hash is None, (
+            "retry-pr-only must not itself confirm the PR -- only "
+            "pr_handoff.confirm_pr_created (out-of-band) may advance "
+            "last_pushed_hash"
         )
