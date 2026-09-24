@@ -26,6 +26,22 @@ Pipeline (design.md step list):
     its branch, so re-running the commit/push sequence would find nothing
     to commit and fail, and that failure must not be recorded as a
     fabricated push failure for a push that already succeeded.
+3b. Else if ``state.last_push`` names this exact ``tree_hash`` with
+    ``pr_url is None`` (i.e. a prior tick pushed this exact content and
+    handed off to `pr_handoff`, but the out-of-band PR-open attempt for it
+    was later reported failed via `report_pr_creation_failed` — which
+    clears ``pending_pr`` per H-NEW-1 so the hash-gate does not loop
+    forever on 3a — leaving no `pending_pr` entry even though the branch
+    is still sitting on the remote with that exact commit): return
+    ``retry-pr-only``. This is a FOURTH case, distinct from 3a: no clone,
+    no fetch, no checkout, no commit, no push — none of the git pipeline
+    runs at all, because the content is already on the remote branch and
+    `git commit` would find nothing to commit (the exact regression this
+    case exists to prevent — a second occurrence of the N1 class of bug,
+    this time reachable through the PR-failure retry path rather than the
+    pre-confirmation path 3a already covers). Only the PR-open step is
+    retried, via `pr_handoff.handle_pushed_branch`, reusing the branch
+    `last_push` already recorded.
 4. ``scan_content_for_secrets`` over every file's content. A finding
    refuses the whole push (code + count only, never the matched text, and
    never a git call — not even a clone probe).
@@ -201,6 +217,42 @@ def run() -> PushResult:
             tree_hash=current_hash,
             reason=str(pending_pr.get("branch", "")),
         )
+
+    # Step 3b: a prior tick pushed this exact content and handed off to
+    # pr_handoff, but the out-of-band PR-open attempt was later reported
+    # failed via `report_pr_creation_failed` — which clears `pending_pr`
+    # (H-NEW-1), so this tick's `pending_pr` is None even though the branch
+    # is still sitting on the remote with this exact commit.
+    # `state.last_push` is the one record that survives that clear:
+    # `record_branch_pushed` set it when the branch was pushed and nothing
+    # since has overwritten it (only `record_push_success` — a CONFIRMED
+    # PR — would, and that also advances `last_pushed_hash`, which the
+    # no-op check above would have already caught). So
+    # `last_push.tree_hash == current_hash and last_push.pr_url is None`
+    # unambiguously means: this content is already on the remote branch,
+    # nothing to commit or push, only the PR-open step needs retrying.
+    # Skip clone/fetch/checkout/commit/push ENTIRELY — re-running any of
+    # them would hit `git commit`'s "nothing to commit" and fabricate a
+    # push failure for a push that already succeeded (the N1 class of bug,
+    # reachable here through the PR-failure retry path rather than 3a's
+    # pre-confirmation path).
+    last_push = store.last_push
+    if (
+        pending_pr is None
+        and last_push is not None
+        and last_push.get("tree_hash") == current_hash
+        and last_push.get("pr_url") is None
+    ):
+        branch = str(last_push.get("branch", ""))
+        result = PushResult(
+            outcome="retry-pr-only", tree_hash=current_hash, reason=branch
+        )
+
+        from backend import pr_handoff
+
+        pr_handoff.handle_pushed_branch(result, state=store)
+
+        return result
 
     # Step 4: scan every file's redacted content for secrets BEFORE any git
     # call — not even a clone probe. A finding (or an unavailable scanner,

@@ -27,12 +27,17 @@ from backend.buildo_pr import build_pull_request_payload
 from backend.push import PushResult
 from backend.state import StateStore
 
-#: Outcome value push.run() returns for a successfully pushed branch — the
-#: only outcome this module acts on. Every other outcome (a no-op hash-gate
-#: hit, or any `refused-*` policy refusal) already carries no branch to
-#: open a PR from, or already recorded its own failure inside push.run(),
-#: so the handoff does nothing for it.
-_PUSHED_OUTCOME = "pushed"
+#: Outcome values `push.run()` returns that `handle_pushed_branch` acts on.
+#: `"pushed"` is the ordinary bare-branch-push handoff (design.md step 7).
+#: `"retry-pr-only"` is push.py's fourth state (H-NEW-1's follow-on fix):
+#: the branch was already pushed on a prior tick and only the PR-open step
+#: failed and is being retried — same payload-build/pending-pr/notify shape,
+#: just entered without a fresh git push. Every other outcome (a no-op
+#: hash-gate hit, `awaiting-pr-confirmation`, or any `refused-*` policy
+#: refusal) already carries no branch to open a PR from, or already
+#: recorded its own failure inside push.run(), so the handoff does nothing
+#: for it.
+_HANDOFF_OUTCOMES = frozenset({"pushed", "retry-pr-only"})
 
 _PR_TITLE = "chore: sync configuration"
 _PR_BODY = "Automated config sync."
@@ -60,7 +65,7 @@ def handle_pushed_branch(result: PushResult, *, state: StateStore) -> None:
         result: the `PushResult` `push.run()` returned this tick.
         state: the state store to record the handoff's outcome into.
     """
-    if result.outcome != _PUSHED_OUTCOME:
+    if result.outcome not in _HANDOFF_OUTCOMES:
         return
 
     branch = result.reason

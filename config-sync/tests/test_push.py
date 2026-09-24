@@ -1321,10 +1321,16 @@ class TestReentrantTickAwaitsPrConfirmation:
 
 
 # ---------------------------------------------------------------------------
-# Senior-review H-NEW-1 — a reported PR-creation failure must CLEAR
-# pending_pr so the NEXT tick's hash-gate falls through to a genuine
-# change-path retry, instead of seeing the same pending_pr.tree_hash and
-# returning awaiting-pr-confirmation forever with zero retry.
+# Senior-review H-NEW-1 (refined by round-4's retry-pr-only fix) — a
+# reported PR-creation failure must CLEAR pending_pr so the NEXT tick's
+# hash-gate falls through past `awaiting-pr-confirmation`. It must NOT fall
+# all the way through to the genuine change path, though: the branch this
+# attempt already pushed is still sitting on the remote with this exact
+# commit, so re-running clone/commit/push would hit `git commit`'s
+# "nothing to commit" and fabricate a push failure for a push that already
+# succeeded (round-4's finding — the N1 defect class recurring through this
+# retry path). The correct landing state is `retry-pr-only`: skip git
+# entirely, retry only the PR-open step.
 # ---------------------------------------------------------------------------
 
 
@@ -1337,8 +1343,12 @@ class TestPrCreationFailureRetriesOnNextTick:
     ) -> None:
         """record_pr_pending -> report_pr_creation_failed -> run() again
 
-        with the SAME tree_hash must take the genuine change path (retry
-        the push+PR attempt from scratch), not `awaiting-pr-confirmation`.
+        with the SAME tree_hash must take the NEW `retry-pr-only` state
+        (round-4's fix): the branch is already pushed with this exact
+        content, so only the PR-open step is retried — no clone, no
+        commit, no push — instead of re-entering the full change path
+        (which round-3's H-NEW-1 fix alone would have done, and which is
+        exactly the fabricated-push-failure regression round-4 found).
         """
         root_a = isolated_roots["root_a"]
         _write(root_a, "config.json", b'{"key": "value"}')
@@ -1385,11 +1395,13 @@ class TestPrCreationFailureRetriesOnNextTick:
         change_path_collaborators["subprocess_run"].reset_mock()
 
         # Tick 2, same tree_hash (nothing about the tracked config changed):
-        # must take the genuine change path again, not awaiting-pr-
-        # confirmation — the hash-gate has nothing stale to match against.
+        # must land on retry-pr-only — no git call of any kind, since the
+        # branch already holds this exact commit; only the PR-open step is
+        # retried.
         tick2_result = push.run()
 
-        assert getattr(tick2_result, "outcome", None) == "pushed"
+        assert getattr(tick2_result, "outcome", None) == "retry-pr-only"
         assert tick2_result.tree_hash == current_hash
-        change_path_collaborators["git_argv"].assert_called()
+        change_path_collaborators["git_argv"].assert_not_called()
+        change_path_collaborators["subprocess_run"].assert_not_called()
         assert store.last_push_failure is None
