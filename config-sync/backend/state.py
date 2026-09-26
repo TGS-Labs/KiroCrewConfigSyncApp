@@ -398,13 +398,28 @@ class StateStore:
         author: str,
         subject: str,
         classified_paths: dict[str, str],
+        ignored_paths: list[str] | None = None,
+        touched_classes: list[str] | None = None,
     ) -> None:
-        """Record a pending commit awaiting approval or decline."""
+        """Record a pending commit awaiting approval or decline.
+
+        ``ignored_paths`` and ``touched_classes`` (senior-review round-2
+        M2) carry `classify.classify_paths`'s ``Result.ignored`` /
+        ``Result.touched_classes`` (already reduced to plain strings by
+        the caller) into the pending record, so a later consumer (e.g.
+        Deployment 4's apply/approval UI) can see what the commit touched
+        and what it deliberately skipped WITHOUT re-fetching and
+        re-classifying the commit itself. Both are additive/optional —
+        default to an empty list — so an existing caller that only ever
+        passed the original four keyword arguments is unaffected.
+        """
         self._payload["pending"] = {
             "sha": sha,
             "author": author,
             "subject": subject,
             "classified_paths": dict(classified_paths),
+            "ignored_paths": list(ignored_paths or []),
+            "touched_classes": list(touched_classes or []),
         }
         self._save()
 

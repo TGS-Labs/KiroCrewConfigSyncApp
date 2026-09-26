@@ -21,6 +21,15 @@ Outcomes:
 3. ``ls-remote`` failure (non-zero exit or raised exception), or an
    unresolvable head (empty SHA): exit non-zero, ``state.last_seen_sha``
    left unchanged, no notification.
+4. Any failure AFTER the head is resolved as changed — the bundle-repo
+   clone/fetch, the commit-metadata/changed-path git calls, or classification
+   itself (senior-review round-2 H-new-1): exit non-zero via
+   ``outcome="fetch-failed"``, ``state.last_seen_sha`` left unchanged (so the
+   next tick re-attempts the SAME head rather than skipping it), no
+   notification. Without this, a persistently failing poll — the app.json
+   cron is ``"silent": true`` — was completely invisible: no ``PollResult``
+   reached the caller, nothing was recorded, and the raised exception simply
+   propagated out of ``run()``.
 
 A commit that is already pending (recorded on a prior tick, not yet
 approved/declined) never triggers a second classify/notify cycle: once
@@ -78,14 +87,42 @@ prior boundary to range against. Author/subject for the record come from a
 separate, valid single-commit call: ``git show -s --format=%an%x09%s
 <head_sha>`` (``-s`` alone, no ``--name-only``, so the flag conflict above
 does not apply).
+
+## Concurrent-clone lock (senior review round-2 M-new-2)
+
+``config-sync-push`` and ``config-sync-poll`` are both declared in
+``app.json`` on the same ``every: 900`` cadence and both read/write the
+SAME ``_BUNDLE_CLONE_DIRNAME`` directory (poll fetches/reads it; push
+clones/fetches/commits/pushes it). Two ticks landing at the same wall-clock
+moment could both see no ``.git`` directory yet and both start a `clone`
+into the identical path concurrently — one of git's own clone attempts can
+then fail (target directory not empty / lock contention on
+``.git/index.lock`` or the object store), leaving a directory that exists,
+is non-empty, but has no working ``.git`` — a state
+`_ensure_bundle_clone`'s own `.git`-exists check can never self-heal from,
+because every later tick's ``clone`` attempt fails the same way against
+that already-non-empty directory forever.
+
+`_clone_lock` takes a simple, timeout-bounded ``flock`` (POSIX advisory
+file lock, stdlib `fcntl`) on a dedicated lockfile living NEXT TO the clone
+directory (not inside it, so the lock survives even a wedged/partial clone)
+before either job touches the shared clone. Both `poll.py`'s
+`_ensure_bundle_clone` and `push.py`'s inline clone-or-fetch step must hold
+this same lock for the same directory to actually serialize against each
+other; this fix updates `poll.py`'s call-site only — see the module-level
+docstring note directing a follow-up for `push.py`.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 from backend import classify, state
 from backend.safety import git_safety
@@ -104,6 +141,15 @@ BUNDLE_DEFAULT_BRANCH = "main"
 #: object-fetch needs never trigger a second one).
 _BUNDLE_CLONE_DIRNAME = "bundle-repo"
 
+#: How long `_clone_lock` waits to acquire the shared clone-directory lock
+#: before giving up and raising — bounded so a wedged/dead lock holder
+#: cannot hang a poll tick forever. 60s comfortably exceeds a clone/fetch
+#: of the bundle repo on a normal connection.
+_CLONE_LOCK_TIMEOUT_SECS = 60.0
+
+#: Poll interval, in seconds, between `_clone_lock` acquisition attempts.
+_CLONE_LOCK_POLL_INTERVAL_SECS = 0.2
+
 #: Root ids `classify.classify_paths` is tried against, matching
 #: `backend/collect.py`'s `_roots()` — the bundle repo's tree interleaves
 #: both roots' relpaths with no per-root prefix (`collect.collect()` merges
@@ -117,16 +163,27 @@ _ROOT_IDS: Tuple[str, ...] = ("A", "B")
 class PollResult:
     """Outcome of a single poll-job tick.
 
-    ``outcome`` distinguishes the three cases this module reports:
+    ``outcome`` distinguishes the four cases this module reports:
     ``"unchanged"`` (head matches `state.last_seen_sha`), ``"changed"``
-    (head differs — the signal task 4.2/4.3 consumes), and
-    ``"ls-remote-failed"`` (the resolution itself failed). ``head_sha`` is
-    the newly resolved head SHA on ``"changed"``; ``None`` otherwise.
+    (head differs — the signal task 4.2/4.3 consumes), ``"ls-remote-failed"``
+    (the head resolution itself failed), and ``"fetch-failed"`` (the head
+    resolved as changed, but a LATER step — the bundle-repo clone/fetch, the
+    commit-metadata/changed-path git calls, or classification — raised;
+    senior-review round-2 H-new-1). ``head_sha`` is the newly resolved head
+    SHA on ``"changed"`` or ``"fetch-failed"``; ``None`` otherwise.
     """
 
     outcome: str
     head_sha: str | None = None
     reason: str = ""
+
+
+#: Outcomes that represent a failed tick — used by the ``__main__`` guard to
+#: decide the process exit code (design.md's error table: "Poll exits
+#: non-zero"). Kept as one named set rather than a per-call-site string
+#: comparison so a THIRD failure outcome added later cannot be missed at
+#: only one of the two exit-code call-sites.
+_FAILURE_OUTCOMES = frozenset({"ls-remote-failed", "fetch-failed"})
 
 
 def notify_operator(*, head_sha: str, reason: str = "") -> None:
@@ -176,6 +233,66 @@ def _resolve_remote_head(state_dir_owner: str) -> str:
     return head_sha
 
 
+@contextlib.contextmanager
+def _clone_lock(clone_dir: Path) -> Iterator[None]:
+    """Hold an exclusive, timeout-bounded advisory lock serializing access
+
+    to ``clone_dir`` across processes (senior-review round-2 M-new-2).
+
+    ``config-sync-push`` and ``config-sync-poll`` are both scheduled every
+    900s and both touch the SAME `_BUNDLE_CLONE_DIRNAME` directory with no
+    coordination between them; two ticks landing close together could both
+    see no ``.git`` yet and both start a `clone` into the identical path,
+    and a losing concurrent `clone` can leave the directory non-empty but
+    without a working ``.git`` — a state nothing here self-heals from,
+    since every later tick's own `.git`-exists check then takes the
+    (broken) `fetch` branch instead of ever re-cloning.
+
+    The lockfile lives NEXT TO ``clone_dir`` (``<clone_dir>.lock``, a
+    sibling, not a child) so it survives even if ``clone_dir`` itself ends
+    up in that wedged non-empty-no-``.git`` state, and so
+    `backend.allowlist`'s `*.lock` exclusion (this file is never inside
+    either tracked configuration root regardless — the app's own state
+    directory is structurally excluded — but the naming makes the "never a
+    tracked artifact" property doubly obvious) applies to it by
+    construction.
+
+    Raises:
+        TimeoutError: if the lock cannot be acquired within
+            `_CLONE_LOCK_TIMEOUT_SECS` — bounded so a wedged/dead lock
+            holder cannot hang a poll tick forever; the caller's own
+            try/except around the whole changed-head path (H-new-1) turns
+            this into a reported ``"fetch-failed"`` outcome rather than an
+            uncaught hang.
+    """
+    import fcntl
+
+    clone_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = clone_dir.parent / f"{clone_dir.name}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + _CLONE_LOCK_TIMEOUT_SECS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out waiting for the bundle-repo clone lock "
+                        f"at {lock_path}"
+                    ) from exc
+                time.sleep(_CLONE_LOCK_POLL_INTERVAL_SECS)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _ensure_bundle_clone(clone_dir: Path) -> None:
     """Make sure ``clone_dir`` holds a git clone of the bundle repo, cloning
 
@@ -188,24 +305,31 @@ def _ensure_bundle_clone(clone_dir: Path) -> None:
 
     Never a full clone on every tick: after the first call the ``.git``
     directory already exists and this degrades to a plain ``fetch``.
+
+    The whole clone-or-fetch decision AND action runs under `_clone_lock`
+    (senior-review round-2 M-new-2): the ``.git``-exists check and the
+    `clone`/`fetch` it selects must be atomic with respect to a concurrent
+    `push.py` tick touching the same directory, or two processes can both
+    observe "no `.git` yet" and both start a `clone` into the same path.
     """
-    clone_dir.mkdir(parents=True, exist_ok=True)
-    if not (clone_dir / ".git").exists():
-        subprocess.run(
-            git_safety.git_argv(
-                clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    else:
-        subprocess.run(
-            git_safety.git_argv(clone_dir, "fetch", "origin"),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    with _clone_lock(clone_dir):
+        clone_dir.mkdir(parents=True, exist_ok=True)
+        if not (clone_dir / ".git").exists():
+            subprocess.run(
+                git_safety.git_argv(
+                    clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            subprocess.run(
+                git_safety.git_argv(clone_dir, "fetch", "origin"),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
 
 def _changed_paths_for_range(
@@ -226,6 +350,14 @@ def _changed_paths_for_range(
     repo's own history looks: PRs merge into `main` one at a time, so
     `--first-parent` never diverges from that single line.
 
+    Invoked with ``-c core.quotePath=false`` (senior-review round-2 M3):
+    git's default ``core.quotePath=true`` renders any non-ASCII filename
+    (e.g. ``steering/café.md``) as a quoted string with C-style octal
+    escapes (``"steering/caf\\303\\251.md"``), which never matches an
+    allowlist entry written against the real UTF-8 relpath — silently
+    dropping that file from `classify_paths`'s input. Disabling
+    ``quotePath`` for this call makes git emit the raw UTF-8 path instead.
+
     Args:
         clone_dir: the bundle repo's local clone (must already hold
             ``new_sha`` — the caller fetches first).
@@ -242,6 +374,8 @@ def _changed_paths_for_range(
     """
     if old_sha:
         args = [
+            "-c",
+            "core.quotePath=false",
             "log",
             "--first-parent",
             "--name-only",
@@ -249,7 +383,16 @@ def _changed_paths_for_range(
             f"{old_sha}..{new_sha}",
         ]
     else:
-        args = ["log", "--first-parent", "--name-only", "--format=", "-1", new_sha]
+        args = [
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--first-parent",
+            "--name-only",
+            "--format=",
+            "-1",
+            new_sha,
+        ]
 
     completed = subprocess.run(
         git_safety.git_argv(clone_dir, *args),
@@ -316,25 +459,39 @@ def _fetch_commit_details(
     return (author, subject, changed_paths)
 
 
-def _classify_changed_paths(changed_paths: List[str]) -> Dict[str, str]:
+def _classify_changed_paths(
+    changed_paths: List[str],
+) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Classify ``changed_paths`` against every tracked root and merge
 
-    the results into one ``{relpath: propagation_class.value}`` mapping
-    suitable for `state.set_pending`'s ``classified_paths`` argument.
+    the results into ``(classified, ignored, touched_classes)`` — the
+    ``classified`` mapping suitable for `state.set_pending`'s
+    ``classified_paths`` argument, plus the paths ``classify.classify_paths``
+    matched against NO root (``ignored``) and the distinct propagation
+    classes actually represented in ``classified`` (``touched_classes``,
+    each rendered as its ``.value`` string — senior-review round-2 M2).
 
     The bundle repo's tree interleaves both roots' relpaths with no
     per-root prefix (`backend/collect.py`'s `collect()`), so a changed
     path cannot be pre-sorted by root before classifying — each path is
     tried against every root in `_ROOT_IDS` via `classify.classify_paths`
     (never a reimplemented matcher), and a path classified under any root
-    is kept.
+    is kept. A path counts as ``ignored`` only if it matched NO root at
+    all — a path classified under one root is never also reported ignored
+    just because a different root's allowlist doesn't recognize it too.
     """
     merged: Dict[str, str] = {}
+    ignored_candidates: Dict[str, None] = {}
+    touched: set[str] = set()
     for root_id in _ROOT_IDS:
         result = classify.classify_paths(root_id, changed_paths)
         for relpath, propagation_class in result.classified.items():
             merged[relpath] = propagation_class.value
-    return merged
+            touched.add(propagation_class.value)
+        for relpath in result.ignored:
+            ignored_candidates.setdefault(relpath, None)
+    ignored = [relpath for relpath in ignored_candidates if relpath not in merged]
+    return merged, ignored, sorted(touched)
 
 
 def run() -> PollResult:
@@ -349,9 +506,11 @@ def run() -> PollResult:
     Returns:
         A :class:`PollResult` describing the outcome. On a resolution
         failure this function does not raise: it records no state change
-        and returns ``outcome="ls-remote-failed"`` so the cron wrapper can
-        turn that into a non-zero process exit without this module owning
-        the exit-code mechanics itself.
+        and returns ``outcome="ls-remote-failed"`` (head resolution itself
+        failed) or ``outcome="fetch-failed"`` (a later step on an already-
+        resolved changed head failed; senior-review round-2 H-new-1) so the
+        cron wrapper can turn either into a non-zero process exit without
+        this module owning the exit-code mechanics itself.
     """
     store = state.load_state()
 
@@ -385,23 +544,66 @@ def run() -> PollResult:
     # classify/notify cycle simply because `last_seen_sha` never moves
     # again until a genuinely NEW head appears (requirements.md 4.4).
 
-    state_dir = str(state.get_state_dir())
-    old_sha = store.last_seen_sha
-    author, subject, changed_paths = _fetch_commit_details(state_dir, head_sha, old_sha)
-    classified_paths = _classify_changed_paths(changed_paths)
+    # H-new-1 (senior review round 2): everything from here on is a git
+    # call (the bundle-repo clone/fetch, the commit-metadata and
+    # changed-path log calls) or pure computation (classification) — any
+    # of it can raise (CalledProcessError from a git subprocess, OSError
+    # from an unreadable/unwritable clone directory, or GitSafetyError from
+    # `git_safety.git_argv`'s own attributes-pin check). `app.json`'s poll
+    # cron is `"silent": true`, so an uncaught exception here would leave a
+    # persistently failing poll completely invisible: no `PollResult`
+    # reaches the caller, nothing is recorded, and the cron runner just
+    # sees a bare stack trace with no failure record to alert on (push.py
+    # has `record_push_failure` for its own equivalent failures; poll had
+    # none). `state.last_seen_sha` is deliberately left UNCHANGED on this
+    # path — unlike the successful case below — so the NEXT tick
+    # re-resolves and re-attempts the SAME head rather than silently
+    # skipping the commit that failed to fetch/classify.
+    try:
+        state_dir = str(state.get_state_dir())
+        old_sha = store.last_seen_sha
+        author, subject, changed_paths = _fetch_commit_details(
+            state_dir, head_sha, old_sha
+        )
+        classified_paths, ignored_paths, touched_classes = _classify_changed_paths(
+            changed_paths
+        )
+    except (subprocess.CalledProcessError, OSError, git_safety.GitSafetyError) as exc:
+        return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
     store.set_pending(
         sha=head_sha,
         author=author,
         subject=subject,
         classified_paths=classified_paths,
+        ignored_paths=ignored_paths,
+        touched_classes=touched_classes,
     )
-    notify_operator(head_sha=head_sha)
+
+    # H3 (senior review round 1, still open going into round 2): advance
+    # `last_seen_sha` to `head_sha` BEFORE notifying, not after. If
+    # `notify_operator` raises with the OLD ordering, `last_seen_sha` never
+    # moves — so the NEXT tick re-resolves the SAME head, sees it as
+    # "changed" all over again, and re-enters this whole block: a permanent
+    # re-nag loop on every subsequent tick until the operator's own
+    # notification channel is fixed (Requirement 4.4's notify-once
+    # guarantee is invariant only while the ordering is
+    # classify -> set_pending -> record_seen_sha -> notify; the pending
+    # record and the seen-SHA marker must both be durably written before
+    # the one step that can fail on something outside this app's control).
+    # With THIS ordering, a notify failure costs at most ONE missed
+    # notification for this commit — `state.pending` still holds the full
+    # record, so the operator can discover it through the app's own UI
+    # even if the push notification never arrived — rather than an
+    # unbounded loop of duplicate notifications for the same commit
+    # (Kiro-Config-Bundles#57's single-pending-slot seam has already
+    # produced repeat defects of this exact "guard ordering" shape).
     store.record_seen_sha(head_sha)
+    notify_operator(head_sha=head_sha)
 
     return PollResult(outcome="changed", head_sha=head_sha)
 
 
 if __name__ == "__main__":
     result = run()
-    raise SystemExit(0 if result.outcome != "ls-remote-failed" else 1)
+    raise SystemExit(0 if result.outcome not in _FAILURE_OUTCOMES else 1)

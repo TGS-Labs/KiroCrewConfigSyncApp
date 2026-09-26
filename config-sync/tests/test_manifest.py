@@ -81,12 +81,23 @@ class TestDefaultEnabled:
 
 
 class TestCrons:
-    def test_exactly_two_crons_declared(self) -> None:
+    def test_required_crons_are_declared_by_name(self) -> None:
+        """Testing-standards anti-pattern guard: an exact `len(crons) == 2`
+
+        assertion breaks on any legitimate addition of a third cron. Assert
+        the two REQUIRED crons — push and poll — exist by name instead of
+        pinning the total count (requirements.md 8.3 only requires these
+        two exist, not that nothing else ever can)."""
         manifest = _load_app_json()
         crons = manifest.get("crons", [])
-        assert len(crons) == 2, (
-            "app.json must declare exactly two crons — one push, one poll "
-            f"(requirements.md 8.3); found {len(crons)}"
+        names = {cron.get("name") for cron in crons}
+        assert "config-sync-push" in names, (
+            "app.json must declare the 'config-sync-push' cron "
+            f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
+        )
+        assert "config-sync-poll" in names, (
+            "app.json must declare the 'config-sync-poll' cron "
+            f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
         )
 
     def test_every_cron_is_command_or_script_based(self) -> None:
