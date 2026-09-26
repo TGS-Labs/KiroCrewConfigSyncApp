@@ -5,9 +5,16 @@ either tracked configuration root (``KIROCREW_HOME`` / ``KIRO_HOME``), so
 the app's own bookkeeping can never be swept into a commit it makes.
 
 Persists: ``last_pushed_hash``, ``last_push`` (time/branch/PR URL),
-``last_seen_sha``, ``pending`` (sha/author/subject/classified paths),
-``pending_pr`` / ``pending_pr_failure`` (the PR-handoff pending/failure
-record — see `backend/pr_handoff.py`), ``pending_pr_stale`` (a superseded
+``last_seen_sha``, ``last_poll_failure`` (a persistently failing poll
+tick's cause, mirroring ``last_push_failure``), ``base_sha`` (the head
+commit as of the operator's LAST approve/decline decision, or this
+instance's first-ever polled commit before any decision has ever been
+made — the decision-boundary `poll.py` ranges its changed-path fetch from;
+see `set_pending`/`accumulate_pending` below and Kiro-Config-Bundles#65),
+``pending`` (sha/author/subject/classified paths, accumulated since
+``base_sha``), ``pending_pr`` /
+``pending_pr_failure`` (the PR-handoff pending/failure record — see
+`backend/pr_handoff.py`), ``pending_pr_stale`` (a superseded
 confirmation/failure report ignored because a newer push had already
 overwritten ``pending_pr`` — see `confirm_pr_created`/
 `record_pr_pending_failure`), a bounded ``history``, and ``restore_dirs``.
@@ -40,6 +47,8 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "last_push": None,
     "last_push_failure": None,
     "last_seen_sha": None,
+    "last_poll_failure": None,
+    "base_sha": None,
     "pending": None,
     "pending_pr": None,
     "pending_pr_failure": None,
@@ -182,6 +191,24 @@ class StateStore:
         return cast("str | None", self._payload["last_seen_sha"])
 
     @property
+    def last_poll_failure(self) -> dict[str, Any] | None:
+        return cast("dict[str, Any] | None", self._payload["last_poll_failure"])
+
+    @property
+    def base_sha(self) -> str | None:
+        """The head commit as of the operator's LAST approve/decline
+
+        decision, or this instance's first-ever polled commit before any
+        decision has ever been made (requirements.md 4.9). This is the
+        decision-boundary `poll.py` computes its changed-path range from
+        (``base_sha..head``) — distinct from `last_seen_sha`, which
+        advances on every tick regardless of pending state, and from
+        `pending`'s own ``sha``, which always reflects the newest head
+        seen. ``None`` only ever before this instance's first poll tick.
+        """
+        return cast("str | None", self._payload["base_sha"])
+
+    @property
     def pending(self) -> dict[str, Any] | None:
         return cast("dict[str, Any] | None", self._payload["pending"])
 
@@ -261,6 +288,47 @@ class StateStore:
             "reason": reason,
             "time": _now_iso(),
         }
+        self._save()
+
+    def record_poll_failure(self, *, reason: str) -> None:
+        """Record a failed poll tick (`outcome="fetch-failed"`), mirroring
+
+        `record_push_failure`'s shape for the poll job's own equivalent
+        failure path (senior-review round-3 M2/L1). Even though `app.json`'s
+        poll cron is `"silent": false` since round 4 (so a failing tick's
+        stdout does surface to the operator), a persistently failing poll
+        (the bundle-repo clone/fetch, the commit-metadata/changed-path git
+        calls, or classification itself all raising) still needs to be
+        visible in the app's OWN state — not only in the cron runner's
+        exit-history — the same "invisible failure" gap `_FAILURE_OUTCOMES`/
+        `fetch-failed`
+        already exists to surface at the `PollResult` level, now also
+        surfaced at the persisted-state level so the app's own UI can show
+        it. Never changes `last_seen_sha` (poll's own `run()` already
+        leaves that untouched on this path so the next tick retries the
+        same head).
+        """
+        self._payload["last_poll_failure"] = {
+            "reason": reason,
+            "time": _now_iso(),
+        }
+        self._save()
+
+    def clear_poll_failure(self) -> None:
+        """Clear `last_poll_failure` after a successful poll tick
+
+        (senior-review round-4 M2). Without this, a stale failure record
+        from an earlier failing tick would keep showing in the app's own
+        UI indefinitely even after the poll has been succeeding for a
+        while — the UI has no way to tell "still failing" from "recovered
+        an hour ago" apart from this being cleared on the next success.
+        Called from `run()` on BOTH success paths: the unchanged-head
+        outcome and the changed-head outcome (right where
+        `record_seen_sha` advances), so any tick that resolves the head
+        cleanly counts as a recovery regardless of whether it also found a
+        new commit.
+        """
+        self._payload["last_poll_failure"] = None
         self._save()
 
     def record_pr_pending(
@@ -398,18 +466,150 @@ class StateStore:
         author: str,
         subject: str,
         classified_paths: dict[str, str],
+        ignored_paths: list[str] | None = None,
+        touched_classes: list[str] | None = None,
     ) -> None:
-        """Record a pending commit awaiting approval or decline."""
+        """Record a FRESH pending commit awaiting approval or decline —
+
+        i.e. there is no existing pending record to accumulate into
+        (`accumulate_pending` below is the merge counterpart for that
+        case). Requirements.md 4.9: when a new pending record starts,
+        ``base_sha`` is set to ``sha`` (the current head) — the range
+        boundary for THIS commit's own accumulation is "nothing yet", so
+        the boundary starts exactly at the commit just classified. This is
+        also how ``base_sha`` gets its very first value ever, on an
+        instance's first-ever pending commit (before any operator decision
+        has ever been made — requirements.md 4.9's other clause).
+
+        ``ignored_paths`` and ``touched_classes`` (senior-review round-2
+        M2) carry `classify.classify_paths`'s ``Result.ignored`` /
+        ``Result.touched_classes`` (already reduced to plain strings by
+        the caller) into the pending record, so a later consumer (e.g.
+        Deployment 4's apply/approval UI) can see what the commit touched
+        and what it deliberately skipped WITHOUT re-fetching and
+        re-classifying the commit itself. Both are additive/optional —
+        default to an empty list — so an existing caller that only ever
+        passed the original four keyword arguments is unaffected.
+        """
+        self._payload["base_sha"] = sha
         self._payload["pending"] = {
             "sha": sha,
             "author": author,
             "subject": subject,
             "classified_paths": dict(classified_paths),
+            "ignored_paths": list(ignored_paths or []),
+            "touched_classes": list(touched_classes or []),
         }
         self._save()
 
+    def accumulate_pending(
+        self,
+        *,
+        sha: str,
+        author: str,
+        subject: str,
+        classified_paths: dict[str, str],
+        ignored_paths: list[str] | None = None,
+        touched_classes: list[str] | None = None,
+    ) -> None:
+        """Merge a new poll tick's classified paths INTO the existing
+
+        pending record, rather than replacing it — the fix for
+        Kiro-Config-Bundles#65 (requirements.md 4.9): a poll tick that
+        finds a new head while an earlier commit is still pending must
+        never drop that earlier commit's still-unapplied changed files.
+
+        Call only when `pending` already holds a record for the SAME
+        decision boundary (i.e. `base_sha` is unchanged since that record
+        was started) — `poll.py` is responsible for choosing between this
+        and `set_pending` based on whether a pending record already
+        exists. Raises if there is nothing to accumulate into, since that
+        is a caller bug (should have called `set_pending` instead), not a
+        recoverable state.
+
+        Merge semantics, keyed by path (requirements.md 4.9: "keyed by
+        path so a path changed in both ranges reflects the latest
+        classification"):
+
+        - ``classified_paths``: unioned; a path present in both the old
+          and new mapping takes the NEW (latest) classification, since the
+          new tick's range is the more recent reclassification of that
+          path's propagation class.
+        - ``ignored_paths``: unioned, order-preserving (old paths first,
+          then any new path not already present) with duplicates
+          collapsed.
+        - ``touched_classes``: unioned, sorted, since it is a set of
+          distinct propagation classes represented across the whole
+          accumulated range, not a per-tick value.
+
+        ``pending.sha`` moves to the new ``sha`` (the newest head seen) —
+        this is what requirements.md 4.9 means by "the pending record's
+        `sha` field SHALL always reflect the newest head seen". ``author``/
+        ``subject`` also move to the new commit's, since those describe
+        the LATEST commit in the accumulated range, matching what
+        `poll.py`'s notification for this tick reports. ``base_sha`` is
+        NOT touched here — it only ever changes via `advance_base_sha`.
+        """
+        current = self._payload["pending"]
+        if current is None:
+            raise ValueError(
+                "accumulate_pending called with no existing pending record; "
+                "use set_pending to start a new one"
+            )
+
+        merged_classified: dict[str, str] = dict(current["classified_paths"])
+        merged_classified.update(classified_paths)
+
+        merged_ignored: list[str] = list(current.get("ignored_paths") or [])
+        for relpath in ignored_paths or []:
+            if relpath not in merged_ignored:
+                merged_ignored.append(relpath)
+        # A path newly classified this tick must not remain in the
+        # accumulated ignored list even if an earlier tick ignored it.
+        merged_ignored = [
+            relpath for relpath in merged_ignored if relpath not in merged_classified
+        ]
+
+        merged_touched: set[str] = set(current.get("touched_classes") or [])
+        merged_touched.update(touched_classes or [])
+
+        self._payload["pending"] = {
+            "sha": sha,
+            "author": author,
+            "subject": subject,
+            "classified_paths": merged_classified,
+            "ignored_paths": merged_ignored,
+            "touched_classes": sorted(merged_touched),
+        }
+        self._save()
+
+    def advance_base_sha(self, sha: str) -> None:
+        """Advance ``base_sha`` to ``sha`` — called ONLY when the operator
+
+        approves or declines a pending commit (requirements.md 4.9:
+        "`base_sha` SHALL NOT advance while a commit is pending; it SHALL
+        advance only when the operator approves or declines, to the SHA
+        that was just approved or declined").
+
+        TODO(Deployment 4): no caller wires this yet. `apply.py`'s
+        approve/decline routes do not exist in this codebase — this
+        method exists now so `state.py`'s additive shape is complete and
+        tested (accumulation correctly does NOT move `base_sha`), but
+        Deployment 4 owns calling it from the approve/decline handlers,
+        passing the SHA that was just approved or declined, once those
+        routes are built.
+        """
+        self._payload["base_sha"] = sha
+        self._save()
+
     def clear_pending(self) -> None:
-        """Clear the pending record without changing anything else."""
+        """Clear the pending record without changing anything else.
+
+        Does NOT touch ``base_sha`` — clearing `pending` and advancing
+        `base_sha` are deliberately separate operations (see
+        `advance_base_sha`); a caller that means "operator decided"
+        must call both.
+        """
         self._payload["pending"] = None
         self._save()
 

@@ -314,19 +314,33 @@ def run() -> PushResult:
         # Steps 5/7: clone/update the bundle repo, write the checked tree
         # into the working copy, commit (redacted message), push the named
         # branch.
+        #
+        # The `.git`-exists check and the `clone`/`fetch` it selects run
+        # under the SAME shared `git_safety.clone_lock` `backend.poll`'s
+        # `_ensure_bundle_clone` holds for this identical directory
+        # (senior-review round-2 M-new-2; round-3 H2) — `config-sync-push`
+        # and `config-sync-poll` are both scheduled every 900s and both
+        # touch this SAME `_BUNDLE_CLONE_DIRNAME` directory with no other
+        # coordination between them, so two ticks (from either job)
+        # landing close together could otherwise both observe no `.git`
+        # yet and both start a `clone` into the identical path — one
+        # losing attempt can leave the directory non-empty but without a
+        # working `.git`, a state neither job's own `.git`-exists check
+        # ever self-heals from afterward.
         clone_dir.mkdir(parents=True, exist_ok=True)
 
-        if not (clone_dir / ".git").exists():
-            subprocess.run(
-                git_safety.git_argv(
-                    clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
-                ),
-                check=True,
-            )
-        else:
-            subprocess.run(
-                git_safety.git_argv(clone_dir, "fetch", "origin"), check=True
-            )
+        with git_safety.clone_lock(clone_dir):
+            if not (clone_dir / ".git").exists():
+                subprocess.run(
+                    git_safety.git_argv(
+                        clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
+                    ),
+                    check=True,
+                )
+            else:
+                subprocess.run(
+                    git_safety.git_argv(clone_dir, "fetch", "origin"), check=True
+                )
 
         subprocess.run(
             git_safety.git_argv(clone_dir, "checkout", "-B", branch), check=True
@@ -347,7 +361,7 @@ def run() -> PushResult:
             git_safety.git_argv(clone_dir, "push", "-u", "origin", branch),
             check=True,
         )
-    except (subprocess.CalledProcessError, OSError) as exc:
+    except (subprocess.CalledProcessError, OSError, TimeoutError) as exc:
         store.record_push_failure(reason=str(exc))
         raise
 

@@ -136,9 +136,19 @@ the common path this component is built for.
 ### `backend/poll.py` — the poll job (cron `command` target, 15 min)
 
 `git ls-remote <bundle-repo> <default-branch>` → head SHA. Unchanged → exit.
-Changed → fetch the commit's changed-path list, classify each path against the
-allowlist, write a `pending` record to state, and notify once. Re-notification is
-keyed on the SHA, so a pending commit does not re-nag every 15 minutes.
+Changed → fetch the changed-path list for the range `base_sha..head` (never
+`last_seen_sha..head` — see Data Flow: Pull and apply below), classify each
+path against the allowlist, and either start or ACCUMULATE INTO the `pending`
+record in state (merge, not overwrite, when a commit is already pending), then
+notify once. Re-notification is keyed on the head SHA, so a pending commit does
+not re-nag every 15 minutes. NOTE: as shipped in Deployment 3, an accumulating
+tick's notification carries the same head_sha/author/subject/touched_classes
+shape as a fresh one and does not itself distinguish "this replaces an earlier
+notification for a still-pending commit" from "this is a brand-new pending
+commit" — the operator can tell the two apart only by checking the app's own
+pending-record state (`base_sha` vs `pending.sha`). Making the notification
+text itself say "accumulated N commits since <base_sha>" is not built and is
+tracked as an open enhancement, not a Deployment 3 requirement.
 
 Modelled on the polling shape of
 `kiro_crew/apps/builtins/ops_mission_control/backend/providers/github_issues.py`;
@@ -207,7 +217,11 @@ Every drop, pause, and instance change is listed by name in the apply result.
 One JSON document under the app's own state directory (never inside either
 tracked root, so the app's state is not itself swept into a commit):
 `last_pushed_hash`, `last_push` (time/branch/PR URL/outcome), `last_seen_sha`,
-`pending` (sha/author/subject/classified paths), `history` (bounded), and
+`base_sha` (the head as of the operator's last approve/decline, or the
+instance's first-ever polled commit before any decision — the range boundary
+`poll.py` classifies from; distinct from `last_seen_sha`, which advances every
+tick regardless of pending state), `pending` (sha/author/subject/classified
+paths, accumulated across ticks since `base_sha`), `history` (bounded), and
 `restore_dirs`.
 
 ### `backend/routes.py` and the UI
@@ -258,15 +272,48 @@ cron tick (command, 0 tokens)
 cron tick (command, 0 tokens, 15 min)
   └─ git ls-remote → head
       ├─ == last_seen_sha ──► exit 0
-      └─ != ──► classify changed paths ──► state.pending ──► notify once
+      └─ != ──► changed paths over range base_sha..head
+                  ├─ no existing pending ──► classify ──► state.pending
+                  │                                        (base_sha = head)
+                  └─ existing pending (base_sha unchanged) ──► classify
+                                          ──► ACCUMULATE into state.pending
+                                              (pending.sha = head,
+                                               base_sha still unchanged)
+                     └─► notify once (keyed on head sha)
                                                               │
-                                              user clicks Approve (UI → route)
+                                        user clicks Approve or Decline (UI → route)
+                                                              ▼
+                                        base_sha := the approved/declined sha
+                                                              │
+                                              (Approve only, continues:)
                                                               ▼
        backup(files) ─► filter(allowlist) ─► sanitize(crons/instances)
          ─► atomic write ─► invalidate(skills cache) ─► propagation report
               ├─ partial failure ──► report applied / not-applied, NOT success
               └─ success ──► per-file: live now | after invalidation | new session | next resolution
 ```
+
+**Accumulation, not replacement.** A poll tick's changed-path range is always
+computed from `base_sha` — the head commit as of the operator's LAST actual
+approve/decline decision (or the instance's first-ever polled commit, before
+any decision has been made) — never from `last_seen_sha`, which advances on
+every tick regardless of whether anything is pending. `base_sha` is a
+distinct, durable field in `state.py`, separate from both `last_seen_sha`
+(advances every tick) and `pending.sha` (always the newest head seen). While
+a commit is pending, a new head arriving on a later tick re-classifies the
+range `base_sha..new_head` and **merges** the result into the existing
+pending record (`pending.sha` moves to the new head; `pending.classified_paths`
+/ `pending.ignored_paths` / `pending.touched_classes` are the union over the
+full range, not the new tick's own commits alone) — it does not overwrite the
+record with only the newest tick's own changed paths. `base_sha` itself does
+not move while anything is pending; it only advances, to the SHA just
+decided, when the operator approves or declines. This guarantees the operator
+is always shown the full accumulated diff since their last real decision,
+never a partial view that silently drops an earlier commit's still-unapplied
+changes — the defect this closes (Kiro-Config-Bundles#65): computing the
+range from `last_seen_sha` and overwriting `pending` on every changed tick
+silently dropped an earlier pending commit's files once a later commit's
+record replaced it.
 
 ## Correctness and Security Properties
 

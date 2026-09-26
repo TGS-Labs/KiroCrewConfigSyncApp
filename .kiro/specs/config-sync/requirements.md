@@ -161,6 +161,25 @@ behaviour behind my back.
    be reverted without a second network round trip.
 8. WHEN an apply fails part-way THEN the app SHALL report which files were
    applied and which were not, and SHALL NOT report the apply as successful.
+9. WHEN a poll tick detects a new head commit WHILE an earlier commit is
+   already pending operator approval/decline THEN the app SHALL ACCUMULATE the
+   new commit's changed paths into the existing pending record rather than
+   replacing it, so that the earlier commit's changed files are never dropped
+   from what the operator is shown. The pending record's changed-path range
+   SHALL be computed from a recorded `base_sha` — the head commit that was
+   current the LAST TIME the operator actually approved or declined a pending
+   commit (or, before any decision has ever been made, the first commit this
+   instance ever polled) — and NOT from `last_seen_sha`, which advances on
+   every tick regardless of pending state. `base_sha` SHALL NOT advance while
+   a commit is pending — including at the moment a fresh pending record is
+   first created, where it is initialized to that record's own head rather
+   than "advanced" from a prior value — and SHALL advance ONLY when the
+   operator approves or declines, to the SHA that was just approved or
+   declined. The pending
+   record's `sha` field SHALL always reflect the newest head seen, so the
+   operator is always shown the full accumulated diff since their last actual
+   decision, never a partial view that silently drops an earlier unapplied
+   change.
 
 ### Requirement 5
 

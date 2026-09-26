@@ -81,12 +81,23 @@ class TestDefaultEnabled:
 
 
 class TestCrons:
-    def test_exactly_two_crons_declared(self) -> None:
+    def test_required_crons_are_declared_by_name(self) -> None:
+        """Testing-standards anti-pattern guard: an exact `len(crons) == 2`
+
+        assertion breaks on any legitimate addition of a third cron. Assert
+        the two REQUIRED crons — push and poll — exist by name instead of
+        pinning the total count (requirements.md 8.3 only requires these
+        two exist, not that nothing else ever can)."""
         manifest = _load_app_json()
         crons = manifest.get("crons", [])
-        assert len(crons) == 2, (
-            "app.json must declare exactly two crons — one push, one poll "
-            f"(requirements.md 8.3); found {len(crons)}"
+        names = {cron.get("name") for cron in crons}
+        assert "config-sync-push" in names, (
+            "app.json must declare the 'config-sync-push' cron "
+            f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
+        )
+        assert "config-sync-poll" in names, (
+            "app.json must declare the 'config-sync-poll' cron "
+            f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
         )
 
     def test_every_cron_is_command_or_script_based(self) -> None:
@@ -225,6 +236,100 @@ class TestCrons:
             "the push cron command must resolve `backend`'s package "
             f"imports regardless of the launching shell's own cwd; stderr:\n"
             f"{result.stderr}"
+        )
+
+    def test_poll_cron_command_resolves_the_backend_package_import(self) -> None:
+        """Senior-review H1: `python3 backend/poll.py` has the identical
+
+        ModuleNotFoundError defect the push cron's P1 fix (commit 5ad2bba)
+        already closed — launching poll.py as a plain script puts
+        `.../backend` on `sys.path[0]` rather than the app root, so
+        `from backend import classify, state` inside poll.py raises. The
+        fix is identical in shape: `cd` into the app's installed directory
+        (there is no cwd field in the app-manifest cron schema — verified
+        against `kiro_crew.apps.manifest.CronEntry`) before invoking
+        `python3 -m backend.poll`.
+
+        Mirrors `test_push_cron_command_resolves_the_backend_package_import`
+        exactly, including the import-only probe substitution so `poll.run()`'s
+        real git/network side effects are never triggered from a test.
+        """
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        manifest = _load_app_json()
+        crons = manifest.get("crons", [])
+        poll_cron = next(c for c in crons if "poll" in c.get("name", "").lower())
+        command = poll_cron.get("command", "")
+        assert command, "the poll cron must declare a 'command'"
+        assert "python3 -m backend.poll" in command, (
+            "the poll cron's command must invoke the module by dotted path "
+            f"(`python3 -m backend.poll`), not a script path; got: {command!r}"
+        )
+        import_probe_command = command.replace(
+            "python3 -m backend.poll", 'python3 -c "import backend.poll"'
+        )
+
+        with tempfile.TemporaryDirectory() as fake_home_str:
+            fake_home = Path(fake_home_str)
+            installed_app_dir = fake_home / ".kiro" / "crew" / "apps" / "config-sync"
+            installed_app_dir.mkdir(parents=True)
+            shutil.copytree(APP_ROOT / "backend", installed_app_dir / "backend")
+
+            env = {
+                "HOME": str(fake_home),
+                "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+            }
+            result = subprocess.run(
+                ["sh", "-c", import_probe_command],
+                cwd=str(fake_home),
+                env=env,
+                executable=shutil.which("sh") or "/bin/sh",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+
+        assert result.returncode == 0 and "ModuleNotFoundError" not in result.stderr, (
+            "the poll cron command must resolve `backend`'s package "
+            f"imports regardless of the launching shell's own cwd; stderr:\n"
+            f"{result.stderr}"
+        )
+
+    def test_poll_cron_is_not_silent_so_a_changed_head_notification_is_delivered(
+        self,
+    ) -> None:
+        """The push and poll crons are NOT required to be silent-parity —
+
+        senior-review round-4 H-A corrected the round-1 H1 "parity" premise
+        this test previously encoded. Push's common no-op tick genuinely
+        has nothing to report, so `"silent": true` is right for it. Poll's
+        `"changed"` outcome (requirements.md 4.3) DOES have something to
+        report — `notify_operator` now prints a non-empty stdout summary
+        on that outcome — and `kiro_crew/slack/gateway.py`'s command-cron
+        result handling only surfaces a non-empty result as a notification
+        when the job is NOT silent (its own empty-output branch is
+        commented "no output = no delivery", the exact contrapositive).
+        A `"silent": true` poll cron would capture that summary into
+        `last_result` for the dashboard's cron-history view but never
+        deliver it as a notification, leaving Requirement 4.3's "notifies
+        once" guarantee just as unmet as the empty no-op stub it replaces.
+        """
+        manifest = _load_app_json()
+        crons = manifest.get("crons", [])
+        poll_cron = next(c for c in crons if "poll" in c.get("name", "").lower())
+        push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
+
+        assert push_cron.get("silent") is True, (
+            "push's common no-op tick has nothing to report and should " "stay silent"
+        )
+        assert poll_cron.get("silent") is False, (
+            'the poll cron must declare "silent": false so its '
+            '"changed"-outcome stdout summary is actually delivered as a '
+            "notification (senior-review round-4 H-A)"
         )
 
 

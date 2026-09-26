@@ -75,10 +75,14 @@ the hardening — enforced here by a static grep test over the rest of
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import stat
 import tempfile
+import time
 from pathlib import Path
+from typing import Iterator
 
 #: Config-named host execution/read vectors, disabled on OUR argv (``-c``
 #: beats any repo config). Hooks and fsmonitor are disabled; external
@@ -391,3 +395,99 @@ def git_argv(cwd: Path | str, *args: str) -> list[str]:
     """
     require_pinned(cwd)
     return ["git", "-C", str(cwd), *GIT_SAFE_CONFIG, *args]
+
+
+#: How long `clone_lock` waits to acquire the shared clone-directory lock
+#: before giving up and raising — bounded so a wedged/dead lock holder
+#: cannot hang a caller forever. 60s comfortably exceeds a clone/fetch of
+#: the bundle repo on a normal connection.
+CLONE_LOCK_TIMEOUT_SECS = 60.0
+
+#: Poll interval, in seconds, between `clone_lock` acquisition attempts.
+CLONE_LOCK_POLL_INTERVAL_SECS = 0.2
+
+
+@contextlib.contextmanager
+def clone_lock(
+    clone_dir: Path,
+    *,
+    timeout_secs: float = CLONE_LOCK_TIMEOUT_SECS,
+    poll_interval_secs: float = CLONE_LOCK_POLL_INTERVAL_SECS,
+) -> Iterator[None]:
+    """Hold an exclusive, timeout-bounded advisory lock serializing access
+
+    to ``clone_dir`` ACROSS PROCESSES (senior-review round-2 M-new-2;
+    round-3 H2).
+
+    ``backend.push`` and ``backend.poll`` are both scheduled on the same
+    cadence (`app.json`'s ``every: 900``) and both touch the SAME
+    ``bundle-repo`` clone directory under ``state.get_state_dir()`` — push
+    clones/fetches/checks-out/commits/pushes it, poll only fetches/reads
+    it. Two ticks (from either job, in any combination) landing at the
+    same wall-clock moment could both see no ``.git`` directory yet and
+    both start a `clone` into the identical path concurrently — one of
+    git's own clone attempts can then fail (target directory not empty /
+    lock contention on ``.git/index.lock`` or the object store), leaving a
+    directory that exists, is non-empty, but has no working ``.git`` — a
+    state neither job's own ``.git``-exists check can ever self-heal from,
+    because every later tick's ``clone`` attempt fails the same way against
+    that already-non-empty directory forever.
+
+    Both `backend.poll`'s `_ensure_bundle_clone` and `backend.push`'s own
+    clone-or-fetch step hold THIS SAME lock (imported from here rather than
+    each defining its own) for the identical directory, so the two jobs
+    actually serialize against each other and against themselves across
+    processes — a single per-module lock would not close the cross-module
+    race this exists to prevent.
+
+    The lockfile lives NEXT TO ``clone_dir`` (``<clone_dir>.lock``, a
+    sibling, not a child) so it survives even if ``clone_dir`` itself ends
+    up in the wedged non-empty-no-``.git`` state described above, and so
+    `backend.allowlist`'s ``*.lock`` exclusion (this file is never inside
+    either tracked configuration root regardless — the app's own state
+    directory is structurally excluded — but the naming makes the "never a
+    tracked artifact" property doubly obvious) applies to it by
+    construction.
+
+    Args:
+        clone_dir: the shared clone directory both jobs serialize access
+            to. The lock itself is a sibling file, not inside this
+            directory.
+        timeout_secs: how long to wait before raising `TimeoutError`.
+            Overridable per call (tests use a short timeout to exercise
+            the timeout path without a slow test).
+        poll_interval_secs: how long to sleep between acquisition attempts.
+
+    Raises:
+        TimeoutError: if the lock cannot be acquired within
+            ``timeout_secs`` — bounded so a wedged/dead lock holder cannot
+            hang a caller forever; callers wrap this in their own
+            try/except so it becomes a reported failure outcome rather
+            than an uncaught hang.
+    """
+    import fcntl
+
+    clone_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = clone_dir.parent / f"{clone_dir.name}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout_secs
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out waiting for the bundle-repo clone lock "
+                        f"at {lock_path}"
+                    ) from exc
+                time.sleep(poll_interval_secs)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
