@@ -180,6 +180,14 @@ behaviour behind my back.
    operator is always shown the full accumulated diff since their last actual
    decision, never a partial view that silently drops an earlier unapplied
    change.
+10. WHEN an approved commit's file contains the redaction placeholder
+    `"<redacted>"` as a `headers` or `env` value THEN the app SHALL write the
+    live file's existing value at the same key path in its place, so that an
+    apply never replaces a real credential with the placeholder. WHEN no live
+    value exists at that key path (for example a newly added server) THEN the
+    app SHALL write the placeholder and SHALL list that key path, by server or
+    job name and key, in the apply result as needing a credential. Every other
+    value in the file SHALL be applied from the commit unchanged.
 
 ### Requirement 5
 

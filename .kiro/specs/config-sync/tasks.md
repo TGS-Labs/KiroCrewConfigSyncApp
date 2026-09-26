@@ -250,9 +250,11 @@ deployment has merged, per the folder-scoped PR-first workflow.
         file it will overwrite or delete, filters the commit to the allowlist
         while reporting non-allowlisted paths as ignored, writes each file
         atomically, and on partial failure reports applied vs not-applied lists
-        rather than success.
+        rather than success. Every `"<redacted>"` headers/env value in a pulled
+        file is replaced by the live value at the same key path; a key with no
+        live value keeps the placeholder and is listed as needing a credential.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.4, 4.5, 4.7, 4.8_
+    _Requirements: 4.4, 4.5, 4.7, 4.8, 4.10_
 
   - [ ] 5.2 `backend/sanitize.py` bounds the Requirement 6 exception: a pulled
         cron job whose `command` fails the `cron_add`-time shell vet — or whose
@@ -385,6 +387,10 @@ files). No wave exceeds 5, and no wave spans a deployment boundary.
   added after Deployment 3's initial merge attempt (Kiro-Config-Bundles#65 —
   a multi-commit-while-pending data-loss defect 4 review rounds missed because
   no criterion covered the case) and is cited by task 4.3's fix.
+  Requirement 4.10 was added during Deployment 4 when task 5.1's tests found
+  the spec covered redaction only on push: applying a pulled file would have
+  replaced every live `headers`/`env` credential with `"<redacted>"`. Ratified
+  by the operator (keep live values at the same key path) and cited by 5.1.
 - Phase 1 spans Tasks 1-2 and Phase 4 spans Tasks 5-6 because no top-level task
   may carry more than 5 sub-tasks; the four deployment boundaries are unchanged.
 - Adding `skills/complete-pr-handoff/SKILL.md` (sub-task 3.4) narrows design.md's

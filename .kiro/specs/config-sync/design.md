@@ -162,6 +162,12 @@ no inbound webhook endpoint is assumed to exist.
 3. Filter the commit's files to the allowlist; report non-allowlisted paths as
    ignored.
 4. Sanitize `crons.json` / `instances.json` (below).
+4a. Restore redacted values (Requirement 4.10): push writes `"<redacted>"` for
+    every `headers`/`env` value, so a pulled file carries placeholders, not
+    credentials. For each placeholder, write the live file's value at the same
+    key path; where the live file has no value there, keep the placeholder and
+    list the key path in the result as needing a credential. Without this step
+    every apply would replace every live token with the placeholder.
 5. Write files atomically (temp + rename) per file.
 6. Invalidate caches and build the per-class propagation report.
 7. On partial failure: report applied vs not-applied; never report success.
