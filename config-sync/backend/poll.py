@@ -6,18 +6,32 @@ Runs as a plain module invocation (``python3 -m backend.poll``), never a
 single ``git ls-remote`` — never a full clone (design.md: "`git ls-remote
 <bundle-repo> <default-branch>` -> head SHA. Unchanged -> exit.").
 
-This task (4.1) implements only the ls-remote/signal contract itself:
+Outcomes:
 
 1. Unchanged head (``ls-remote`` result == ``state.last_seen_sha``): exit 0,
    no notification, no git call beyond the single ``ls-remote``.
-2. Changed head: the difference is signalled in the returned result (outcome
-   + the new head SHA) so a later wave's classify/pending-record logic
-   (tasks 4.2/4.3) has something concrete to consume. This module does not
-   itself classify changed paths, write a `pending` record, or notify on the
-   changed-head path — the `notify_operator` seam exists for a later wave to
-   use, and today's paths never call it (per test_poll.py's scope note).
-3. ``ls-remote`` failure (non-zero exit or raised exception): exit non-zero,
-   ``state.last_seen_sha`` left unchanged, no notification.
+2. Changed head, not yet pending for this SHA (task 4.3): fetch the new
+   commit's metadata and changed paths via a single second, hardened git
+   call (``git show --no-patch --name-only --format=%an%x09%s <sha>``).
+   Each changed path is classified via `classify.classify_paths` against
+   every tracked root (`backend/collect.py`'s root A/B — the bundle tree
+   interleaves both with no per-root prefix), the merged classified paths
+   are recorded via `state.set_pending`, the operator is notified exactly
+   once, and `state.last_seen_sha` advances to the new head
+   (requirements.md 4.3).
+3. ``ls-remote`` failure (non-zero exit or raised exception), or an
+   unresolvable head (empty SHA): exit non-zero, ``state.last_seen_sha``
+   left unchanged, no notification.
+
+A commit that is already pending (recorded on a prior tick, not yet
+approved/declined) never triggers a second classify/notify cycle: once
+`state.last_seen_sha` advances to a pending commit's SHA, a later tick
+reporting that same head is caught by the unchanged-head case above and
+never re-enters the changed-head path (requirements.md 4.4).
+
+Nothing in this module ever applies a change to either tracked
+configuration root — that is Deployment 4's approved-only route
+(requirements.md 4.6); this job only classifies, records, and notifies.
 
 Modelled on `backend/push.py`'s module shape: a frozen result dataclass, a
 zero-argument ``run()`` entrypoint, and a patchable ``notify_operator`` seam
@@ -28,8 +42,9 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
-from backend import state
+from backend import classify, state
 from backend.safety import git_safety
 
 #: Name/URL of the bundle repo every poll tick checks, matching
@@ -37,6 +52,14 @@ from backend.safety import git_safety
 #: `TARGET_REPO`/`TARGET_BASE` (`TGS-Labs/Kiro-Config-Bundles`, `main`).
 BUNDLE_REPO_URL = "https://github.com/TGS-Labs/Kiro-Config-Bundles.git"
 BUNDLE_DEFAULT_BRANCH = "main"
+
+#: Root ids `classify.classify_paths` is tried against, matching
+#: `backend/collect.py`'s `_roots()` — the bundle repo's tree interleaves
+#: both roots' relpaths with no per-root prefix (`collect.collect()` merges
+#: both into one flat mapping), so a changed-head commit's paths cannot be
+#: pre-sorted by root; each path is classified against every root's
+#: allowlist and the classified/ignored results are merged.
+_ROOT_IDS: Tuple[str, ...] = ("A", "B")
 
 
 @dataclass(frozen=True)
@@ -102,6 +125,76 @@ def _resolve_remote_head(state_dir_owner: str) -> str:
     return head_sha
 
 
+def _fetch_commit_details(state_dir_owner: str, sha: str) -> Tuple[str, str, List[str]]:
+    """Return ``(author, subject, changed_paths)`` for ``sha`` via a single
+
+    hardened ``git show --no-patch --name-only --format=%an%x09%s <sha>``-
+    shaped call, built through `git_safety.git_argv`. One combined call
+    (metadata line, blank separator, then changed paths) rather than two
+    separate git invocations — the standard `git show` shape for "this
+    commit's metadata plus its changed-path list" (design.md: "fetch the
+    commit's changed-path list"), and the format this app's own test
+    fixtures model (`test_poll_pending.py`'s `_show_stdout`).
+
+    Args:
+        state_dir_owner: the directory `git_argv`'s ``-C`` targets, matching
+            `_resolve_remote_head`'s convention.
+        sha: the commit to read metadata and changed paths for.
+
+    Returns:
+        A ``(author, subject, changed_paths)`` tuple. ``author``/``subject``
+        are empty strings and ``changed_paths`` is empty if the commit has
+        no readable output.
+    """
+    completed = subprocess.run(
+        git_safety.git_argv(
+            state_dir_owner,
+            "show",
+            "--no-patch",
+            "--name-only",
+            "--format=%an%x09%s",
+            sha,
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    stdout = completed.stdout or ""
+    lines = stdout.splitlines()
+    if not lines:
+        return ("", "", [])
+
+    metadata_line = lines[0]
+    if "\t" in metadata_line:
+        author, subject = metadata_line.split("\t", 1)
+    else:
+        author, subject = (metadata_line, "")
+
+    changed_paths = [line for line in lines[1:] if line]
+    return (author, subject, changed_paths)
+
+
+def _classify_changed_paths(changed_paths: List[str]) -> Dict[str, str]:
+    """Classify ``changed_paths`` against every tracked root and merge
+
+    the results into one ``{relpath: propagation_class.value}`` mapping
+    suitable for `state.set_pending`'s ``classified_paths`` argument.
+
+    The bundle repo's tree interleaves both roots' relpaths with no
+    per-root prefix (`backend/collect.py`'s `collect()`), so a changed
+    path cannot be pre-sorted by root before classifying — each path is
+    tried against every root in `_ROOT_IDS` via `classify.classify_paths`
+    (never a reimplemented matcher), and a path classified under any root
+    is kept.
+    """
+    merged: Dict[str, str] = {}
+    for root_id in _ROOT_IDS:
+        result = classify.classify_paths(root_id, changed_paths)
+        for relpath, propagation_class in result.classified.items():
+            merged[relpath] = propagation_class.value
+    return merged
+
+
 def run() -> PollResult:
     """Run one poll-job tick: resolve the bundle repo's head, compare it
 
@@ -127,6 +220,41 @@ def run() -> PollResult:
 
     if head_sha == store.last_seen_sha:
         return PollResult(outcome="unchanged", head_sha=head_sha)
+
+    if not head_sha:
+        # `_resolve_remote_head` returns "" (rather than raising) when
+        # `git ls-remote`'s stdout could not be parsed into a SHA — e.g. a
+        # `returncode != 0` result that never raised because the caller
+        # didn't enforce `check=True` (test_poll.py's
+        # `test_ls_remote_failure_from_a_nonzero_returncode_leaves_sha_
+        # unchanged`). An empty SHA is never a genuine changed head: it
+        # must not be recorded as `last_seen_sha`, classified, or notified
+        # on — treat it the same as an unresolved head.
+        return PollResult(outcome="ls-remote-failed", reason="empty head sha")
+
+    # NOTE: no separate "already pending for this exact SHA" guard is
+    # needed here. `run()` always advances `state.last_seen_sha` to
+    # `head_sha` in the SAME tick it calls `state.set_pending` below, so
+    # `last_seen_sha == pending["sha"]` holds as an invariant from that
+    # point on — a later tick reporting the same still-pending SHA is
+    # already caught by the `head_sha == store.last_seen_sha` check above
+    # and returns "unchanged" before reaching this point. A commit stays
+    # observably pending (via `state.pending`) without a second
+    # classify/notify cycle simply because `last_seen_sha` never moves
+    # again until a genuinely NEW head appears (requirements.md 4.4).
+
+    state_dir = str(state.get_state_dir())
+    author, subject, changed_paths = _fetch_commit_details(state_dir, head_sha)
+    classified_paths = _classify_changed_paths(changed_paths)
+
+    store.set_pending(
+        sha=head_sha,
+        author=author,
+        subject=subject,
+        classified_paths=classified_paths,
+    )
+    notify_operator(head_sha=head_sha)
+    store.record_seen_sha(head_sha)
 
     return PollResult(outcome="changed", head_sha=head_sha)
 
