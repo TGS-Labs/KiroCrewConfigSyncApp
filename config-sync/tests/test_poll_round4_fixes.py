@@ -378,7 +378,9 @@ def test_fetch_failed_path_catches_an_oserror(
     """
     monkeypatch.setattr(poll, "_resolve_remote_head", lambda state_dir_owner: "2" * 40)
 
-    def _raising_fetch(state_dir_owner: str, sha: str, old_sha: str | None = None):
+    def _raising_fetch(
+        state_dir_owner: str, sha: str, old_sha: str | None = None
+    ) -> None:
         raise OSError("simulated unwritable clone directory")
 
     monkeypatch.setattr(poll, "_fetch_commit_details", _raising_fetch)
@@ -402,7 +404,9 @@ def test_fetch_failed_path_catches_a_timeouterror(
     """
     monkeypatch.setattr(poll, "_resolve_remote_head", lambda state_dir_owner: "3" * 40)
 
-    def _raising_fetch(state_dir_owner: str, sha: str, old_sha: str | None = None):
+    def _raising_fetch(
+        state_dir_owner: str, sha: str, old_sha: str | None = None
+    ) -> None:
         raise TimeoutError("simulated clone-lock timeout")
 
     monkeypatch.setattr(poll, "_fetch_commit_details", _raising_fetch)
@@ -427,7 +431,9 @@ def test_fetch_failed_path_catches_a_gitsafetyerror(
     """
     monkeypatch.setattr(poll, "_resolve_remote_head", lambda state_dir_owner: "4" * 40)
 
-    def _raising_fetch(state_dir_owner: str, sha: str, old_sha: str | None = None):
+    def _raising_fetch(
+        state_dir_owner: str, sha: str, old_sha: str | None = None
+    ) -> None:
         raise git_safety.GitSafetyError("simulated attributes-pin failure")
 
     monkeypatch.setattr(poll, "_fetch_commit_details", _raising_fetch)

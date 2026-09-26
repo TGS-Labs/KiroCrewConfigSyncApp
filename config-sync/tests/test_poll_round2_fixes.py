@@ -369,6 +369,15 @@ def test_main_guard_exits_non_zero_on_fetch_failed(
     new_sha = "5" * 40
     store = state.load_state()
     store.record_seen_sha(old_sha)
+    # `poll.run()` now ranges its changed-path fetch from `state.base_sha`
+    # (requirements.md 4.9), not `last_seen_sha` — prime both to the same
+    # fake, unreachable SHA so this test's forced fetch-failure (an
+    # invalid git revision range against the real bundle repo, since this
+    # sandbox has real network access and `runpy`'s fresh re-exec below
+    # does not inherit this test's monkeypatches) still occurs under the
+    # new field.
+    store.set_pending(sha=old_sha, author="", subject="", classified_paths={})
+    store.clear_pending()
 
     monkeypatch.setattr(poll, "_resolve_remote_head", lambda state_dir_owner: new_sha)
     monkeypatch.setattr(

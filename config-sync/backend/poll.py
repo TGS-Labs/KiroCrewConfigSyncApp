@@ -12,12 +12,17 @@ Outcomes:
    no notification, no git call beyond the single ``ls-remote``.
 2. Changed head, not yet pending for this SHA (task 4.3): fetch the new
    commit's changed-path list and metadata (design.md: "fetch the commit's
-   changed-path list") via `_fetch_commit_details`. Each changed path is
-   classified via `classify.classify_paths` against every tracked root
-   (`backend/collect.py`'s root A/B — the bundle tree interleaves both
-   with no per-root prefix), the merged classified paths are recorded via
-   `state.set_pending`, the operator is notified exactly once, and
-   `state.last_seen_sha` advances to the new head (requirements.md 4.3).
+   changed-path list") via `_fetch_commit_details`, ranged from
+   `state.base_sha` — the decision boundary, not `state.last_seen_sha`
+   (requirements.md 4.9; see "Changed-path range boundary" below). Each
+   changed path is classified via `classify.classify_paths` against every
+   tracked root (`backend/collect.py`'s root A/B — the bundle tree
+   interleaves both with no per-root prefix), and the merged classified
+   paths are recorded via `state.set_pending` (no existing pending record)
+   or `state.accumulate_pending` (a commit is already pending — merges
+   rather than replaces). The operator is notified once per tick that
+   found a changed head, and `state.last_seen_sha` advances to the new
+   head (requirements.md 4.3).
 3. ``ls-remote`` failure (non-zero exit or raised exception), or an
    unresolvable head (empty SHA): exit non-zero, ``state.last_seen_sha``
    left unchanged, no notification.
@@ -32,10 +37,32 @@ Outcomes:
    propagated out of ``run()``.
 
 A commit that is already pending (recorded on a prior tick, not yet
-approved/declined) never triggers a second classify/notify cycle: once
-`state.last_seen_sha` advances to a pending commit's SHA, a later tick
-reporting that same head is caught by the unchanged-head case above and
-never re-enters the changed-head path (requirements.md 4.4).
+approved/declined) never triggers a second NOTIFICATION cycle for the
+same head — once `state.last_seen_sha` advances to a pending commit's
+SHA, a later tick reporting that same head is caught by the
+unchanged-head case above. But a LATER, genuinely new head arriving while
+a commit is still pending DOES re-enter the changed-head path, and MUST:
+accumulate its classified paths into the existing pending record via
+`state.accumulate_pending` rather than starting a fresh one, and leave
+`state.base_sha` untouched (requirements.md 4.4, 4.9).
+
+## Changed-path range boundary: `base_sha`, not `last_seen_sha` (#65)
+
+The changed-path fetch below (`_fetch_commit_details`) is always ranged
+from `state.base_sha` — the head commit as of the operator's LAST actual
+approve/decline decision (or, before any decision has ever been made,
+this instance's first-ever polled commit) — and NEVER from
+`state.last_seen_sha`, which advances on every tick regardless of whether
+anything is pending. Ranging from `last_seen_sha` was the original defect
+(#65): once a commit went pending, the next changed tick would range from
+THAT pending commit's own SHA, so `_classify_changed_paths` only ever saw
+the newest tick's own commits, and the pre-fix `state.set_pending`
+overwrote the pending record with just those — silently dropping the
+earlier pending commit's still-unapplied files the moment a second commit
+landed before the operator acted. `base_sha` is a separate, durable
+`state.py` field for exactly this reason: it is the one thing in this
+module that must NOT move on every tick, only on an operator decision (not
+yet buildable in this codebase — see `state.advance_base_sha`'s TODO).
 
 Nothing in this module ever applies a change to either tracked
 configuration root — that is Deployment 4's approved-only route
@@ -72,8 +99,11 @@ design.md forbids: the clone is created once (first tick) and updated with
 a plain ``fetch origin`` on every later tick, exactly like `push.py`'s own
 clone-or-fetch step.
 
-Changed paths are computed over the **range** `last_seen_sha..head_sha`
-(the commits new since the last-recorded head) via
+Changed paths are computed over the **range** `base_sha..head_sha` (the
+commits new since the operator's last actual decision, or since this
+instance's first-ever poll if no decision has been made yet — NOT
+`last_seen_sha`, which advances on every tick regardless of pending
+state; see "Changed-path range boundary" above) via
 ``git log --first-parent --name-only``, not a single commit's own diff —
 `--first-parent` walks main's own line of history one merge at a time,
 which correctly attributes every file a merge commit brought in (verified
@@ -358,10 +388,13 @@ def _changed_paths_for_range(
     Args:
         clone_dir: the bundle repo's local clone (must already hold
             ``new_sha`` — the caller fetches first).
-        old_sha: the previously-seen head (``state.last_seen_sha``), or
-            ``None`` on the very first poll ever run, in which case there
-            is no prior boundary to range against and a single-commit log
-            of ``new_sha`` alone is used instead.
+        old_sha: the decision boundary to range from — `state.base_sha`
+            (the operator's last approve/decline, or this instance's
+            first-ever polled commit before any decision), NOT
+            `state.last_seen_sha` — or ``None`` on the very first poll
+            ever run, in which case there is no prior boundary to range
+            against and a single-commit log of ``new_sha`` alone is used
+            instead.
         new_sha: the newly resolved head to walk up to (inclusive).
 
     Returns:
@@ -423,10 +456,9 @@ def _fetch_commit_details(
             `backend.push`'s own clone location so the two jobs share one
             on-disk clone.
         sha: the newly resolved head commit.
-        old_sha: the previously-seen head (``state.last_seen_sha``), or
-            ``None`` on the first-ever poll — forwarded to
-            `_changed_paths_for_range` to select a range vs. a
-            single-commit log.
+        old_sha: the decision boundary (`state.base_sha`), or ``None`` on
+            the first-ever poll — forwarded to `_changed_paths_for_range`
+            to select a range vs. a single-commit log.
 
     Returns:
         A ``(author, subject, changed_paths)`` tuple. ``author``/``subject``
@@ -536,15 +568,18 @@ def run() -> PollResult:
         return PollResult(outcome="ls-remote-failed", reason="empty head sha")
 
     # NOTE: no separate "already pending for this exact SHA" guard is
-    # needed here. `run()` always advances `state.last_seen_sha` to
-    # `head_sha` in the SAME tick it calls `state.set_pending` below, so
+    # needed here for the NOTIFICATION cycle. `run()` always advances
+    # `state.last_seen_sha` to `head_sha` in the SAME tick it calls
+    # `state.set_pending`/`state.accumulate_pending` below, so
     # `last_seen_sha == pending["sha"]` holds as an invariant from that
-    # point on — a later tick reporting the same still-pending SHA is
+    # point on — a later tick reporting that SAME still-pending SHA is
     # already caught by the `head_sha == store.last_seen_sha` check above
-    # and returns "unchanged" before reaching this point. A commit stays
-    # observably pending (via `state.pending`) without a second
-    # classify/notify cycle simply because `last_seen_sha` never moves
-    # again until a genuinely NEW head appears (requirements.md 4.4).
+    # and returns "unchanged" before reaching this point. But a
+    # GENUINELY NEW head arriving while a commit is still pending DOES
+    # reach this point again — that is the accumulation case handled just
+    # below (`store.pending is None` selects `set_pending` vs
+    # `accumulate_pending`), not a case this comment is claiming is
+    # excluded.
 
     # H-new-1 (senior review round 2): everything from here on is a git
     # call (the bundle-repo clone/fetch, the commit-metadata and
@@ -563,9 +598,21 @@ def run() -> PollResult:
     # skipping the commit that failed to fetch/classify.
     try:
         state_dir = str(state.get_state_dir())
-        old_sha = store.last_seen_sha
+        # requirements.md 4.9 / Kiro-Config-Bundles#65: the changed-path
+        # range is computed from `base_sha` — the decision boundary — NOT
+        # `last_seen_sha`, which advances every tick regardless of
+        # pending state. Ranging from `last_seen_sha` here is exactly the
+        # bug #65 reported: once a commit is pending, the NEXT tick's
+        # range would start from that pending commit's own SHA and only
+        # ever report the newest tick's own changed paths, silently
+        # dropping the earlier pending commit's files once `set_pending`
+        # (pre-fix) overwrote rather than merged the record. `base_sha` is
+        # `None` only before this instance's very first poll tick ever —
+        # `_fetch_commit_details`/`_changed_paths_for_range` already
+        # handle `old_sha=None` as "no prior boundary, single-commit log".
+        base_sha = store.base_sha
         author, subject, changed_paths = _fetch_commit_details(
-            state_dir, head_sha, old_sha
+            state_dir, head_sha, base_sha
         )
         classified_paths, ignored_paths, touched_classes = _classify_changed_paths(
             changed_paths
@@ -579,14 +626,24 @@ def run() -> PollResult:
         store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
-    store.set_pending(
-        sha=head_sha,
-        author=author,
-        subject=subject,
-        classified_paths=classified_paths,
-        ignored_paths=ignored_paths,
-        touched_classes=touched_classes,
-    )
+    if store.pending is None:
+        store.set_pending(
+            sha=head_sha,
+            author=author,
+            subject=subject,
+            classified_paths=classified_paths,
+            ignored_paths=ignored_paths,
+            touched_classes=touched_classes,
+        )
+    else:
+        store.accumulate_pending(
+            sha=head_sha,
+            author=author,
+            subject=subject,
+            classified_paths=classified_paths,
+            ignored_paths=ignored_paths,
+            touched_classes=touched_classes,
+        )
 
     # H3 (senior review round 1, still open going into round 2): advance
     # `last_seen_sha` to `head_sha` BEFORE notifying, not after. If

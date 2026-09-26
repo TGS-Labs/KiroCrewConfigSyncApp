@@ -487,6 +487,217 @@ class TestPending:
 
 
 # ---------------------------------------------------------------------------
+# base_sha — the decision-boundary field (requirements.md 4.9,
+# Kiro-Config-Bundles#65).
+# ---------------------------------------------------------------------------
+
+
+class TestBaseSha:
+    def test_base_sha_is_none_before_any_pending_record(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        assert store.base_sha is None
+
+    def test_set_pending_on_a_fresh_record_sets_base_sha_to_the_commit(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """requirements.md 4.9: "When there is no existing pending record,
+
+        starting a new one sets base_sha to the current head."
+        """
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="staneslevski",
+            subject="first commit",
+            classified_paths={"steering/a.md": "steering"},
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.base_sha == "1111111111111111111111111111111111111111"
+
+    def test_accumulate_pending_merges_classified_paths_keyed_by_path(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """A path present in both the existing pending record and the new
+
+        tick's classification takes the NEW classification (requirements.md
+        4.9: "keyed by path so a path changed in both ranges reflects the
+        latest classification"), while a path unique to either side is
+        preserved.
+        """
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="alice",
+            subject="commit A",
+            classified_paths={
+                "steering/a.md": "steering",
+                "config.json": "next_resolution",
+            },
+        )
+
+        store.accumulate_pending(
+            sha="2222222222222222222222222222222222222222",
+            author="bob",
+            subject="commit B",
+            classified_paths={
+                "steering/b.md": "steering",
+                "config.json": "live_now",
+            },
+        )
+
+        reloaded = state.load_state()
+        pending = reloaded.pending
+        assert pending is not None
+        assert pending["classified_paths"] == {
+            "steering/a.md": "steering",
+            "steering/b.md": "steering",
+            "config.json": "live_now",
+        }, "config.json must take commit B's (the newer) classification"
+
+    def test_accumulate_pending_does_not_advance_base_sha(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """requirements.md 4.9: "base_sha SHALL NOT advance while a commit
+
+        is pending."
+        """
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="alice",
+            subject="commit A",
+            classified_paths={"steering/a.md": "steering"},
+        )
+        store.accumulate_pending(
+            sha="2222222222222222222222222222222222222222",
+            author="bob",
+            subject="commit B",
+            classified_paths={"steering/b.md": "steering"},
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.base_sha == "1111111111111111111111111111111111111111"
+
+    def test_accumulate_pending_updates_sha_author_and_subject_to_the_newest(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """requirements.md 4.9: "The pending record's `sha` field SHALL
+
+        always reflect the newest head seen."
+        """
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="alice",
+            subject="commit A",
+            classified_paths={"steering/a.md": "steering"},
+        )
+        store.accumulate_pending(
+            sha="2222222222222222222222222222222222222222",
+            author="bob",
+            subject="commit B",
+            classified_paths={"steering/b.md": "steering"},
+        )
+
+        reloaded = state.load_state()
+        assert reloaded.pending is not None
+        assert reloaded.pending["sha"] == "2222222222222222222222222222222222222222"
+        assert reloaded.pending["author"] == "bob"
+        assert reloaded.pending["subject"] == "commit B"
+
+    def test_accumulate_pending_unions_ignored_paths_and_touched_classes(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="alice",
+            subject="commit A",
+            classified_paths={"steering/a.md": "steering"},
+            ignored_paths=["memory.db"],
+            touched_classes=["steering"],
+        )
+        store.accumulate_pending(
+            sha="2222222222222222222222222222222222222222",
+            author="bob",
+            subject="commit B",
+            classified_paths={"config.json": "next_resolution"},
+            ignored_paths=[".env"],
+            touched_classes=["next_resolution"],
+        )
+
+        reloaded = state.load_state()
+        pending = reloaded.pending
+        assert pending is not None
+        assert set(pending["ignored_paths"]) == {"memory.db", ".env"}
+        assert pending["touched_classes"] == ["next_resolution", "steering"]
+
+    def test_accumulate_pending_raises_when_nothing_is_pending(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """Calling `accumulate_pending` with no existing pending record is a
+
+        caller bug (should have called `set_pending`), not a recoverable
+        state — it must raise rather than silently fabricate a record.
+        """
+        store = state.load_state()
+        with pytest.raises(ValueError):
+            store.accumulate_pending(
+                sha="1111111111111111111111111111111111111111",
+                author="alice",
+                subject="commit A",
+                classified_paths={"steering/a.md": "steering"},
+            )
+
+    def test_advance_base_sha_moves_it_to_the_given_sha(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """requirements.md 4.9: base_sha advances only on an operator
+
+        approve/decline, to the SHA just decided. No approve/decline route
+        exists yet (Deployment 4) — this exercises `advance_base_sha`
+        directly as the primitive Deployment 4 will call.
+        """
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="alice",
+            subject="commit A",
+            classified_paths={"steering/a.md": "steering"},
+        )
+
+        store.advance_base_sha("1111111111111111111111111111111111111111")
+
+        reloaded = state.load_state()
+        assert reloaded.base_sha == "1111111111111111111111111111111111111111"
+
+    def test_clear_pending_does_not_touch_base_sha(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        """Clearing `pending` and advancing `base_sha` are deliberately
+
+        separate operations — a decline that only clears `pending` without
+        also calling `advance_base_sha` must leave `base_sha` exactly as
+        it was.
+        """
+        store = state.load_state()
+        store.set_pending(
+            sha="1111111111111111111111111111111111111111",
+            author="alice",
+            subject="commit A",
+            classified_paths={"steering/a.md": "steering"},
+        )
+        store.clear_pending()
+
+        reloaded = state.load_state()
+        assert reloaded.pending is None
+        assert reloaded.base_sha == "1111111111111111111111111111111111111111"
+
+
+# ---------------------------------------------------------------------------
 # bounded history
 # ---------------------------------------------------------------------------
 
