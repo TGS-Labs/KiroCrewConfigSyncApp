@@ -115,6 +115,64 @@ def _push_new_commit(
 
 
 @pytest.fixture
+def bundle_repo_url_redirect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Path]:
+    """Redirect `poll.BUNDLE_REPO_URL` (the real hardcoded GitHub URL) to a
+
+    real local bare repo via git's own `url.<base>.insteadOf` config,
+    injected through `GIT_CONFIG_GLOBAL` — never a `monkeypatch.setattr`
+    on `poll.BUNDLE_REPO_URL`.
+
+    `runpy.run_module("backend.poll", run_name="__main__", alter_sys=True)`
+    re-executes `backend/poll.py`'s module body from scratch in a fresh
+    namespace, so a `monkeypatch.setattr(poll, "BUNDLE_REPO_URL", ...)` on
+    the ALREADY-IMPORTED module object never reaches the freshly
+    re-executed code — that code reads its own fresh `BUNDLE_REPO_URL`
+    module-level constant, which is the real
+    `https://github.com/TGS-Labs/Kiro-Config-Bundles.git`. The prior
+    version of the `__main__`-guard fetch-failed test relied on that real
+    URL being unreachable (or reachable-but-failing for an unrelated
+    reason) — an accidental, network-dependent failure mode, not a
+    deliberate one (senior-review round-6 test-quality gap).
+
+    A `GIT_CONFIG_GLOBAL` environment variable, by contrast, is PROCESS
+    state, not a Python attribute — it survives `runpy`'s fresh
+    re-execution exactly like this suite's existing
+    `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env-var convention
+    (`test_push_retry_pr_only.py`'s `bare_remote` fixture). Every
+    `git_safety.git_argv` call already passes `-c` flags of its own
+    (`GIT_SAFE_CONFIG`); those are per-invocation overrides and do not
+    conflict with a `url.insteadOf` rule supplied via the global config
+    file — a real git call confirms the rule applies whether the `-c`
+    flags are present or not (`git_argv` builds
+    ``["git", "-C", cwd, *GIT_SAFE_CONFIG, *args]``, so the global config
+    is still read first regardless of ``-c`` ordering).
+
+    Sets `GIT_CONFIG_GLOBAL` via `monkeypatch.setenv` (restored on
+    teardown) rather than writing to any real `~/.gitconfig` — this test
+    process must never mutate the host's real git configuration, matching
+    every other fixture in this suite.
+    """
+    redirect_file = tmp_path / "redirect.gitconfig"
+    redirect_file.write_text(
+        f'[url "{tmp_path / "bundle-remote.git"}"]\n'
+        # The literal real URL, not `poll.BUNDLE_REPO_URL` — a fixture
+        # ordered before this one (e.g. `bundle_remote`) may already have
+        # `monkeypatch.setattr(poll, "BUNDLE_REPO_URL", ...)`'d it to the
+        # LOCAL path, which would make this rule redirect the local path
+        # to itself (a no-op) and leave the real GitHub URL completely
+        # unredirected once `runpy` re-executes with a fresh `poll`
+        # module reading the real module-level constant.
+        "\tinsteadOf = https://github.com/TGS-Labs/Kiro-Config-Bundles.git\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(redirect_file))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    yield redirect_file
+
+
+@pytest.fixture
 def notify_spy(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     spy = MagicMock(name="poll.notify_operator")
     monkeypatch.setattr(poll, "notify_operator", spy)
@@ -354,34 +412,50 @@ def test_fetch_failed_sends_no_notification(
 
 def test_main_guard_exits_non_zero_on_fetch_failed(
     isolated_state_dir: Path,
+    bundle_remote: dict,
+    bundle_repo_url_redirect: Path,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """The `__main__` guard's exit-code mapping must treat `"fetch-failed"`
 
     as a failure exit, matching `"ls-remote-failed"` (H-new-1 extends H2's
     exit-code contract to the new failure outcome).
+
+    Forces a REAL, deterministic `"fetch-failed"` outcome — not the prior
+    version's accidental one (senior-review round-6): `ls-remote` and the
+    bundle-repo clone both run for real against `bundle_remote`'s local
+    bare repo via `bundle_repo_url_redirect` (a `url.insteadOf` rule that
+    survives `runpy`'s fresh re-execution, unlike a
+    `monkeypatch.setattr(poll, "BUNDLE_REPO_URL", ...)`), so the head
+    resolves as genuinely changed and the clone genuinely succeeds. The
+    failure is forced one step later and on purpose: `state.base_sha` is
+    primed (via `set_pending`/`clear_pending`, same mechanism as before)
+    to a well-formed but NONEXISTENT 40-hex SHA, so
+    `_changed_paths_for_range`'s `git log <base_sha>..<head_sha>` fails
+    with a real, deterministic `fatal: Invalid revision range` (exit 128)
+    regardless of network reachability — confirmed identical whether or
+    not the real `TGS-Labs/Kiro-Config-Bundles` GitHub repo is reachable,
+    since every git call here targets only the local redirect target.
     """
     import runpy
     import sys
 
-    old_sha = "4" * 40
-    new_sha = "5" * 40
+    bogus_base_sha = "d" * 40
     store = state.load_state()
-    store.record_seen_sha(old_sha)
-    # `poll.run()` now ranges its changed-path fetch from `state.base_sha`
-    # (requirements.md 4.9), not `last_seen_sha` — prime both to the same
-    # fake, unreachable SHA so this test's forced fetch-failure (an
-    # invalid git revision range against the real bundle repo, since this
-    # sandbox has real network access and `runpy`'s fresh re-exec below
-    # does not inherit this test's monkeypatches) still occurs under the
-    # new field.
-    store.set_pending(sha=old_sha, author="", subject="", classified_paths={})
+    store.record_seen_sha(bundle_remote["old_sha"])
+    # `poll.run()` ranges its changed-path fetch from `state.base_sha`
+    # (requirements.md 4.9), not `last_seen_sha` — prime `base_sha` to a
+    # SHA that never existed in `bundle_remote`'s repo, so the later
+    # `git log base_sha..head_sha` call deterministically fails with
+    # "Invalid revision range" once the head is resolved as changed.
+    store.set_pending(sha=bogus_base_sha, author="", subject="", classified_paths={})
     store.clear_pending()
 
-    monkeypatch.setattr(poll, "_resolve_remote_head", lambda state_dir_owner: new_sha)
-    monkeypatch.setattr(
-        poll, "BUNDLE_REPO_URL", str(tmp_path / "missing2" / "repo.git")
+    _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/fetch-failed.md",
+        content="fetch-failed regression guard\n",
+        subject="fetch-failed regression guard",
     )
 
     monkeypatch.delitem(sys.modules, "backend.poll", raising=False)
@@ -391,6 +465,32 @@ def test_main_guard_exits_non_zero_on_fetch_failed(
         assert exc_info.value.code == 1
     finally:
         sys.modules["backend.poll"] = poll
+
+    reloaded = state.load_state()
+    assert reloaded.last_seen_sha == bundle_remote["old_sha"], (
+        "a fetch-failed tick must leave last_seen_sha UNCHANGED so the "
+        "next tick re-attempts the same head rather than skipping it"
+    )
+    # Prove the REAL local redirect target was actually reached (ls-remote
+    # AND the bundle-repo clone both succeeded against it) rather than the
+    # failure coming from an unreachable/misconfigured URL — the exact
+    # distinction senior-review round-6 flagged as unverified. A clone
+    # only happens on the changed-head path, past `_resolve_remote_head`;
+    # an `"ls-remote-failed"` tick never gets this far.
+    clone_dir = isolated_state_dir / "bundle-repo"
+    assert (clone_dir / ".git").exists(), (
+        "the bundle-repo clone must exist on disk — proving ls-remote AND "
+        "the clone both succeeded against the real local redirect target, "
+        "so the forced failure came from the deliberate bogus base_sha "
+        "range (a genuine 'fetch-failed'), not an unreachable URL "
+        "(which would report 'ls-remote-failed' and never clone at all)"
+    )
+    assert reloaded.last_poll_failure is not None
+    assert "128" in reloaded.last_poll_failure["reason"], (
+        "the recorded failure reason must be the real git process's "
+        "non-zero exit (128, 'Invalid revision range') from the bogus "
+        f"base_sha range, got: {reloaded.last_poll_failure['reason']!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
