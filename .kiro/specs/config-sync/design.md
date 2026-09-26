@@ -55,12 +55,25 @@ hard-coded to a home directory:
 
 | Root | Env | Tracked |
 |---|---|---|
-| A | `KIROCREW_HOME` (default `~/.kiro/crew`) | `steering/**/*.md`, `skills/**/SKILL.md`, `skills/**/scripts/**`, `config.json`, `hooks.json`, `agent_model_state.json`, `mcp.json`, `crons.json`, `instances.json` |
+| A | `KIROCREW_HOME` (default `~/.kiro/crew`) | `steering/**/*.md`, `skills/**/SKILL.md`, `skills/**/scripts/**`, `config.json`, `hooks.json`, `agent_model_state.json`, `mcp.json`, `crons.json`, `instances.json`, `config-bundles/agent-prompts/*.md` |
 | B | `KIRO_HOME` (default `~/.kiro`) | `agents/*.json` **only** |
 
 Root B is deliberately narrow: `kiro_home()`'s own docstring states that only
 the agents directory follows `KIRO_HOME` today, so treating it as a general
 isolation lever would be wrong. Everything else resolves under root A.
+
+**Agent prompts are tracked where they live** (reference host: 16 of 25
+definitions use `file://<root A>/config-bundles/agent-prompts/<name>.md`, 8 are
+inline, 1 is under site-packages): `config-bundles/agent-prompts/*.md`, single
+segment, class `LIVE_IN_NEW_SESSION` (read when an agent session starts).
+**`config-bundles/skills/**` is NOT tracked** (Requirement 1.8): a resource is
+not a registration part, so an absent one degrades an agent without breaking
+registration, and the operator ratified prompts only — widening needs its own
+ruling. Resources pointing there are still tokenized and, if absent on the
+applying host, reported unresolved (Requirement 4.13); `sync-bundles.sh`
+delivers them. `sync-bundles.sh` also derives `agent-prompts/` (and `steering/`)
+from the bundle repo's `<bundle>/agents/*.md`, so a push carries a second copy
+of that content at a second path — accepted by the ratified decision.
 
 Each entry carries a `PropagationClass` (see below), which is what makes
 Requirement 1.6 testable: an entry with no classification fails a test.
@@ -92,6 +105,40 @@ Redaction is applied to *all* collected files, not just `mcp.json` — `config.j
 and `crons.json` can both carry a token in an `env` block, and a redactor that
 guards only the file we happened to worry about is not a gate.
 
+### `backend/portable.py` — host-independent configuration
+
+Every tracked JSON file can carry this host's absolute paths (`prompt`,
+`resources` in `agents/*.json`; any path-shaped value in `config.json`,
+`hooks.json`, `mcp.json`, `crons.json`, `instances.json`,
+`agent_model_state.json`) — pushed verbatim they are wrong elsewhere and no
+two hosts share a tree hash. One pure module owns the rule so push, apply and
+registration cannot drift: `tokenize(doc, roots)` (push, Req 2.8-2.10),
+`expand(doc, roots)` (apply, Req 4.11-4.13), `resolve_reference(value, roots)
+-> (root, relpath) | None` (registration, Req 5.12). `roots` is resolved
+exactly as `collect.py` does. Scope is every file the allowlist tracks that
+parses as JSON, not `agents/*.json` alone — `mcp.json`'s `resources` field,
+`crons.json`'s `script` path, and `instances.json`'s `remote_bin` are the same
+class of host-absolute value as an agent's `prompt`.
+
+- **Token form:** `${KIROCREW_HOME}` / `${KIRO_HOME}` replace the root path,
+  scheme kept — `file://${KIROCREW_HOME}/config-bundles/agent-prompts/x.md`,
+  `skill://${KIROCREW_HOME}/config-bundles/skills/github-pr/SKILL.md`.
+- **Matching:** strip optional `file://`/`skill://` to get `p`; match iff
+  `p == R` or `p.startswith(R + "/")`, root A before root B (default A is
+  nested in B). Start of path only; string values only, never keys.
+- **Outside both roots** (site-packages; another host's home): unchanged,
+  returned as non-portable with its key path. URLs and relative refs: neither
+  rewritten nor reported.
+- **Order relative to redaction:** `tokenize` runs on push AFTER `redact`,
+  `expand` runs on apply BEFORE the 4.10 placeholder restore — symmetric
+  (tokenize is redact's immediate successor; expand is restore's immediate
+  predecessor). A `headers`/`env` value is always `"<redacted>"` by the time
+  `tokenize` sees it, so no credential value is ever inspected for a root
+  prefix, and `expand` running before restore is observationally identical
+  to running after for those same keys (both are the literal placeholder
+  either way) — the fixed order avoids a per-key-name special case.
+- **Laws:** both directions idempotent; `expand(tokenize(x)) == x` on one host.
+
 ### `backend/safety/` — the three ported concerns
 
 Ported from `kiro_crew/apps/builtins/auto_improvement/` (read as reference; this
@@ -110,8 +157,17 @@ there is no proposal to score, no candidate to gate, no agent run to ledger.
 
 ### `backend/push.py` — the push job (cron `command` target)
 
-1. Collect (allowlist) → redact → canonical serialize.
-2. `tree_hash` = hash over sorted `(relpath, sha256(content))` pairs.
+1. Collect (allowlist) → redact → tokenize every collected JSON file
+   (`portable.tokenize`, Requirement 2.8-2.10; non-portable values recorded on
+   the push result) → canonical serialize. Redacting first means a
+   `headers`/`env` value is already the literal placeholder by the time
+   tokenize walks the tree, so it is never inspected for a root-path prefix.
+2. `tree_hash` = hash over sorted `(relpath, sha256(content))` pairs. Because
+   of step 1 the tree — and so the hash — is identical across hosts with
+   identical config (Requirement 2.11). The first tick after upgrade misses
+   `last_pushed_hash` once (every in-scope file changes to token form where
+   applicable, prompts are newly tracked) and takes the normal change path;
+   this is expected.
 3. If `tree_hash == state.last_pushed_hash`: return `no-op`. No clone, no
    network, no tokens. This is the common case and it is the whole reason the
    push is a `command` cron rather than an agent prompt.
@@ -161,16 +217,25 @@ no inbound webhook endpoint is assumed to exist.
    restore directory.
 3. Filter the commit's files to the allowlist; report non-allowlisted paths as
    ignored.
-4. Restore redacted values (Requirement 4.10): push writes `"<redacted>"` for
-   every `headers`/`env` value, so a pulled file carries placeholders, not
-   credentials. For each placeholder in a `headers` or `env` object, write the
-   live file's value at the same key path; where the live file has no value
-   there, keep the placeholder and list the key path in the result as needing
-   a credential. Only `headers`/`env` values are restored: a placeholder
-   anywhere else (for example a cron `command`) is applied as committed.
-   Without this step every apply would replace every live token with the
-   placeholder.
-4a. Sanitize `crons.json` / `instances.json` (below), AFTER restore, so the
+4. Expand every applied JSON file in the Requirement 2.8 scope
+   (`portable.expand`, Requirement 4.11-4.13): tokens become this host's root
+   paths; absolute values under neither local root are written unchanged and
+   listed as non-portable; references whose target is absent locally are
+   listed as unresolved. Neither is a refusal. Symmetric with push's
+   tokenize-after-redact: a `headers`/`env` value is the literal placeholder
+   either way, so running expand before restore is observationally identical
+   for those keys to running it after, and keeps one fixed order for every
+   file rather than a per-key-name special case.
+4a. Restore redacted values (Requirement 4.10), AFTER expand: push writes
+    `"<redacted>"` for every `headers`/`env` value, so a pulled file carries
+    placeholders, not credentials. For each placeholder in a `headers` or
+    `env` object, write the live file's value at the same key path; where the
+    live file has no value there, keep the placeholder and list the key path
+    in the result as needing a credential. Only `headers`/`env` values are
+    restored: a placeholder anywhere else (for example a cron `command`) is
+    applied as committed. Without this step every apply would replace every
+    live token with the placeholder.
+4b. Sanitize `crons.json` / `instances.json` (below), AFTER restore, so the
     vet sees exactly the content that will be written.
 5. Write files atomically (temp + rename) per file.
 6. Invalidate caches and build the per-class propagation report.
@@ -183,18 +248,44 @@ no inbound webhook endpoint is assumed to exist.
 | `steering/**` | Loaded in `build_session_context`, reached from `build_message`'s `is_new_session` branch, or a post-compaction warm reinjection. Not live mid-session. | Nothing — no restart needed | "live in a new session" |
 | `SKILL.md` body | Agent `cat`s the file at time of use | Nothing | "live now" |
 | Skill set / triggers | Discovery `_iter` cache, TTL `_ITER_CACHE_TTL_SECS = 60.0`; an out-of-band write does **not** invalidate it | Invalidate (see open decision 1) | "live after cache invalidation" or, if unreachable, "live within 60s" |
-| `~/.kiro/agents/*.json` | `list_agents()` caches on a (file-count, newest-mtime-ns) signature; `spawn_run`'s roster reads it live | Write all four parts together | "live now for `spawn_run`; dashboard picker may need its own refresh" |
+| `~/.kiro/agents/*.json` | `list_agents()` caches on a (file-count, newest-mtime-ns) signature; `spawn_run`'s roster reads it live | Write every required registration part together | "live now for `spawn_run`; dashboard picker may need its own refresh" |
+| `config-bundles/agent-prompts/*.md` | Read via the agent definition's `file://` `prompt` when a session for that agent starts | Nothing | "live in a new session" |
 | `config.json` (incl. model pin) | Cache keyed on `st_mtime_ns + st_size + st_mode` — self-invalidating | Nothing | "live on next resolution; running sessions keep their resolved model" |
 | `hooks.json`, `agent_model_state.json` | Read alongside `config.json` resolution | Nothing | "live on next resolution" |
 | `crons.json`, `instances.json` | See sanitizer | Sanitize, then write | "imported paused / not connected" |
 
-Agent registration is the one class that is *not* a single file. The full
-registration is four coordinated writes — prompt file, `~/.kiro/agents/<name>.json`,
-the `config.json` `agents{}` entry, and the `agent_model_state.json` pin. The
-applier treats those four as one transaction: all four present, or the
-registration is refused as incomplete. A partially applied registration
-misbehaves in ways that look like a model bug rather than a sync bug, which is
-why this is a refusal and not a warning.
+Agent registration is the one class that is *not* a single file. A full
+registration is the `~/.kiro/agents/<name>.json` definition, the `config.json`
+`agents{}` entry, the `agent_model_state.json` pin, and — only when the
+definition's `prompt` is a `file://` reference into a tracked path — that
+prompt file. The applier treats the required parts as one transaction: all
+present, or the registration is refused as incomplete. A partially applied
+registration misbehaves in ways that look like a model bug rather than a sync
+bug, which is why this is a refusal and not a warning.
+
+`registration.py` (Requirement 5.6, 5.11-5.13): candidates are named only by
+changed `agents/<name>.json` (a prompt-only change is an ordinary file). The
+prompt part is derived from the committed definition's top-level `prompt`,
+never the name: inline / absent / `null` / `""` → satisfied; `file://` that
+`portable.resolve_reference` maps to a tracked `(root, rel)` → REQUIRED, `rel`
+must be a regular non-symlink file in the commit tree; `file://` to an
+untracked path or neither root → not required, reported; `..`/empty segment,
+unparseable definition, or non-string `prompt` → incomplete (fail closed).
+Token and this-host absolute forms both resolve, so a legacy same-host commit
+still works. Shared parts are judged by CONTENT AS IT EXISTS IN THE COMMIT'S
+CHECKED-OUT TREE, not by whether that file's relpath is among the commit's
+changed paths (Requirement 5.14): `config.json` counts present when its copy
+in the commit tree parses as an object carrying `agents.<name>`;
+`agent_model_state.json` when its copy carries top-level `<name>` — whether or
+not either file changed in this specific commit. This closes a defect in the
+prior wording: a commit that edits only `agents/<name>.json` for an
+already-registered agent must not be refused merely because the commit leaves
+the shared files untouched — the commit's tree still carries that agent's
+entry and pin, which is what the registration actually needs. A NEW agent
+whose key is absent from the commit tree's copy of a shared file stays
+incomplete on that part regardless. An incomplete registration blocks its own
+parts; its prompt only when no complete registration in the commit also
+references it.
 
 ### `backend/sanitize.py` — the Requirement 6 exception, bounded
 
@@ -263,8 +354,9 @@ touches `crons.json` or `instances.json`.
 ```
 cron tick (command, 0 tokens)
   └─ collect(allowlist)            root A + root B → {relpath: bytes}
-      └─ redact()                  headers/env values → "<redacted>"
-          └─ tree_hash()
+      └─ portable.tokenize()       agents/*.json: <root path> → ${KIROCREW_HOME}/${KIRO_HOME}
+          └─ redact()              headers/env values → "<redacted>"
+              └─ tree_hash()       identical across hosts for identical config
               ├─ == last_pushed_hash ──► exit 0   (the common case)
               └─ != ──► scan_content_for_secrets()
                           ├─ finding ──► REFUSE, report code+count, exit non-zero
@@ -297,7 +389,10 @@ cron tick (command, 0 tokens, 15 min)
                                                               │
                                               (Approve only, continues:)
                                                               ▼
-       backup(files) ─► filter(allowlist) ─► sanitize(crons/instances)
+       backup(files) ─► filter(allowlist) ─► registration check (prompt part
+         derived from each agents/*.json `prompt`; shared parts judged by
+         commit-tree content) ─► portable.expand(every in-scope JSON file)
+         ─► restore placeholders ─► sanitize(crons/instances)
          ─► atomic write ─► invalidate(skills cache) ─► propagation report
               ├─ partial failure ──► report applied / not-applied, NOT success
               └─ success ──► per-file: live now | after invalidation | new session | next resolution
@@ -343,6 +438,14 @@ record replaced it.
 7. **Hardened git.** All git calls carry `GIT_SAFE_CONFIG` via `git_argv`.
 8. **Honest propagation.** The apply result never reports a class as live when
    its mechanism is bounded-stale or session-scoped.
+9. **Host-independent push tree.** No pushed file within the Requirement 2.8
+   scope carries this host's root paths; a path outside both roots is
+   reported, never guessed at. Testable by collecting identical config under
+   two different root paths and asserting byte-identical trees and equal
+   `tree_hash`.
+10. **Push, apply and registration agree on paths.** All three call
+    `portable.py`; the seam test pushes on one root layout, applies on another,
+    and asserts registration resolves the same prompt relpath the push emitted.
 
 ## Error Handling
 
@@ -355,7 +458,11 @@ record replaced it.
 | Clone/push/PR failure | `last_pushed_hash` NOT updated; retried next tick; reported in UI |
 | `ls-remote` failure | Poll exits non-zero; `last_seen_sha` unchanged; no notification |
 | Commit contains non-allowlisted paths | Those paths ignored and reported; the rest applies |
-| Incomplete agent registration (fewer than 4 parts) | That registration refused and reported; other files still apply |
+| Incomplete agent registration (a required part missing, unparseable definition, non-string `prompt`, or unsafe prompt path) | That registration refused and reported; other files still apply |
+| Agent registration whose shared file (`config.json`/`agent_model_state.json`) did not change in this commit but already carries the agent's key in the commit tree | Shared part counts present; registration proceeds (Requirement 5.14) |
+| Agent `prompt` references an untracked location | Prompt not required; reported; registration proceeds on its other parts |
+| Absolute path outside both roots in a Requirement 2.8-scoped file | Push: left unchanged, reported as non-portable. Apply: written unchanged, reported as non-portable |
+| Expanded reference absent on this host | Written; reported as unresolved |
 | Cron `command` fails the vet | Job dropped and reported by name |
 | Partial apply | Applied / not-applied lists reported; success NOT claimed; restore offered |
 | Skill cache invalidation unreachable | Reported as "live within 60s" rather than "live now" |
@@ -377,9 +484,11 @@ config-sync/
 │   ├── allowlist.py         ← two roots + PropagationClass (data)
 │   ├── collect.py           ├─ walk + match
 │   ├── redact.py            ├─ structure-preserving value redaction
+│   ├── portable.py          ├─ root-path ⇄ token rewrite for agents/*.json
 │   ├── push.py              ├─ the push job
 │   ├── poll.py              ├─ the poll job
 │   ├── apply.py             ├─ approved-commit applier
+│   ├── registration.py      ├─ agent-registration transaction check
 │   ├── sanitize.py          ├─ crons/instances import rules
 │   ├── propagate.py         ├─ per-class invalidation + report
 │   ├── state.py             └─ durable state
@@ -444,20 +553,25 @@ phase and one PR into `TGS-Labs/KiroCrewConfigSyncApp`.
 
 ### Deployment 4: Apply, propagation, and UI
 - Phase 4
-- Ships `apply.py`, `sanitize.py`, `propagate.py`, the routes, and the dashboard
-  page.
+- Ships `apply.py`, `sanitize.py`, `propagate.py`, `registration.py`,
+  `portable.py`, the `config-bundles/agent-prompts/*.md` allowlist entry, push
+  tokenization, the routes, and the dashboard page.
 - Depends on: Deployment 3.
 - Verified by: approving a pending commit that touches a steering file, a skill,
   and `crons.json` applies all three, reports "live in a new session" for the
   steering file, invalidates the skill cache (or reports the ≤60s window), and
   lists the imported cron job as paused; declining changes nothing; restore
-  returns the instance to its prior bytes.
+  returns the instance to its prior bytes. Additionally: the next push after
+  install carries no absolute root path in any tracked JSON file and includes
+  the tracked prompt files; applying that commit resolves every `file://`
+  prompt into a tracked path and completes the registration, including when
+  a follow-up commit changes only an agent's own definition file while its
+  already-registered shared entries stay untouched in that commit.
 
 ## Open Design Decisions
 
-Decisions 1 and 2 were ratified by the user before `tasks.md` was written and
-are resolved inputs to this plan, not open questions. Decision 3 remains
-unresolved.
+Decisions 1, 2 and 4 were ratified by the operator and are resolved inputs to
+this plan, not open questions. Decision 3 remains unresolved.
 
 1. **Skill-cache invalidation from an out-of-process backend — RESOLVED.**
    The invalidator is an instance method (`_invalidate_iter_cache()`) on the
@@ -483,3 +597,13 @@ unresolved.
    `spawn_run`'s roster. Whether a pulled agent registration needs an explicit
    picker refresh, or the page re-reads on navigation, is **unverified**; the
    design currently reports it as "may need its own refresh".
+4. **Prompt tracking and portable configuration paths — RESOLVED.** RESOLVED:
+   track `config-bundles/agent-prompts/*.md` under root A and rewrite host
+   root paths to `${KIROCREW_HOME}`/`${KIRO_HOME}` tokens, on push (after
+   redact) for every tracked JSON file, expanding on apply (before the 4.10
+   restore) — the prior `agent-prompts/<name>.md` convention matched no
+   tracked file, so no registration could ever complete, and pushed JSONs
+   embedded this host's home directory. `config-bundles/skills/**` stays
+   untracked (Requirement 1.8). A registration's shared parts are judged by
+   the commit tree's content, not by whether the shared file changed in that
+   commit (Requirement 5.14).

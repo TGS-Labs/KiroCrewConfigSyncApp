@@ -7,7 +7,8 @@ agent configuration under git version control in the existing repository
 `TGS-Labs/Kiro-Config-Bundles`, in both directions:
 
 - **Push** — detect local changes to an allowlisted set of configuration files
-  across two roots (`KIROCREW_HOME` and `KIRO_HOME`'s agents directory), redact
+  across two roots (`KIROCREW_HOME` and `KIRO_HOME`'s agents directory), rewrite
+  host-specific absolute paths in agent definitions to portable tokens, redact
   credentials, and open a pull request against the bundle repository.
 - **Pull** — poll the bundle repository's default branch, notify the user of a
   new commit, and — only after explicit approval — apply it to the running
@@ -38,7 +39,8 @@ public-facing commit by accident.
 1. The allowlist SHALL be declarative data (not control flow), enumerating for
    root A (`KIROCREW_HOME`, default `~/.kiro/crew`): `steering/**/*.md`,
    `skills/**/SKILL.md`, `skills/**/scripts/**`, `config.json`, `hooks.json`,
-   `agent_model_state.json`, `mcp.json`, `crons.json`, `instances.json`.
+   `agent_model_state.json`, `mcp.json`, `crons.json`, `instances.json`,
+   `config-bundles/agent-prompts/*.md`.
 2. The allowlist SHALL enumerate for root B (`KIRO_HOME`, default `~/.kiro`):
    `agents/*.json` only. The app SHALL NOT use `KIRO_HOME` to resolve any other
    path, because `kiro_home()`'s own contract is that only the agents directory
@@ -56,6 +58,18 @@ public-facing commit by accident.
 6. WHEN a new configuration file class is added to the allowlist THEN the
    pull-side propagation table (Requirement 5) SHALL have a matching entry, and
    a test SHALL fail if any allowlist entry has no propagation classification.
+7. The root A entry `config-bundles/agent-prompts/*.md` SHALL carry the
+   `LIVE_IN_NEW_SESSION` propagation class (an agent's prompt is read when a
+   session for that agent starts), and SHALL select only a `.md` file directly
+   inside `config-bundles/agent-prompts/` — a nested path
+   (`config-bundles/agent-prompts/x/y.md`) or a non-`.md` file there SHALL
+   NOT be selected.
+8. No allowlist entry SHALL select any other path under `config-bundles/` —
+   in particular `config-bundles/skills/**` and `config-bundles/sync-bundles.sh`
+   SHALL NOT be selected. (An agent `resources` entry is not a registration
+   part, so an absent skill degrades an agent without breaking its
+   registration; `config-bundles/skills/` is delivered by `sync-bundles.sh`,
+   and widening scope to it needs its own operator ruling.)
 
 ### Requirement 2
 
@@ -90,6 +104,50 @@ unreviewed writes to `main` and without burning tokens on idle ticks.
 7. WHEN a push fails for any reason THEN the failure SHALL be recorded with its
    cause and surfaced in the app's UI, and the job SHALL NOT retry in a tight
    loop within the same tick.
+8. AFTER redaction and BEFORE hashing, the push SHALL rewrite every JSON
+   string value (at any depth, including list elements; never an object key)
+   in every collected file that parses as a JSON object or array — root A's
+   `config.json`, `hooks.json`, `mcp.json`, `crons.json`, `instances.json`,
+   `agent_model_state.json`, and root B's `agents/*.json` — to its portable
+   token form, as follows. Let `R_A` be root A's absolute path and `R_B` root
+   B's, each resolved exactly as the collector resolves it (env var or
+   default, `~` expanded, no trailing `/`). Strip an optional leading scheme
+   prefix `file://` or `skill://` from the value, giving path part `p`. WHEN
+   `p == R` or `p` starts with `R + "/"` for `R` in (`R_A`, `R_B`), tried in
+   that order (root A first, because the default root A lies inside root B),
+   THEN the matched `R` SHALL be replaced by `${KIROCREW_HOME}` (root A) or
+   `${KIRO_HOME}` (root B) and the scheme prefix SHALL be kept — e.g.
+   `file:///home/u/.kiro/crew/steering/**/*.md` becomes
+   `file://${KIROCREW_HOME}/steering/**/*.md`. A value in which `R` appears
+   anywhere other than at the start of `p` (e.g. inside inline prompt text),
+   or is followed by a character other than `/`, SHALL NOT be rewritten.
+   Running tokenization after redaction means the `"<redacted>"` placeholder
+   already occupies every `headers`/`env` value by the time tokenization
+   walks the tree, so a credential value is never inspected for a root-path
+   prefix; a `headers`/`env` object's OTHER keys are absent by construction
+   after redaction, so tokenization has nothing left to rewrite there.
+9. WHEN a collected file's string value in scope of Requirement 2.8 is an
+   absolute path — `p` starts with `/` after the optional
+   `file://`/`skill://` prefix is stripped — that lies under neither root
+   (e.g.
+   `file:///usr/local/lib/python3.12/site-packages/kiro_crew/config/prompt.md`)
+   THEN the push SHALL leave the value unchanged and SHALL list it in the push
+   result as non-portable (file path and JSON key path); this SHALL NOT refuse
+   the push. Relative references (e.g. `file://.kiro/steering/**`) and
+   non-path values (e.g. `https://…` URLs) SHALL be left unchanged and not
+   listed.
+10. Tokenization SHALL be idempotent — applying it to already-tokenized
+    content SHALL produce byte-identical output — and SHALL touch no file
+    outside the Requirement 2.8 scope. A non-JSON file within that scope
+    SHALL pass through unchanged.
+11. WHEN two hosts with different root paths hold identical configuration
+    (identical file content once each host's own root path is substituted by
+    its token) THEN each SHALL produce a byte-identical pushed tree and the
+    same tree hash. The first push after this tokenization ships is therefore
+    expected to differ from the recorded `last_pushed_hash` (every in-scope
+    file changes from absolute to token form where applicable, and prompt
+    files are newly tracked) and SHALL run the normal change path — it is not
+    an error and SHALL NOT be special-cased.
 
 ### Requirement 3
 
@@ -188,6 +246,36 @@ behaviour behind my back.
     app SHALL write the placeholder and SHALL list that key path, by server or
     job name and key, in the apply result as needing a credential. Every other
     value in the file SHALL be applied from the commit unchanged.
+11. WHEN an approved commit's file within the Requirement 2.8 scope is
+    applied THEN, BEFORE the Requirement 4.10 placeholder restore, every
+    string value whose path part (after an optional `file://`/`skill://`
+    prefix) equals `${KIROCREW_HOME}` or `${KIRO_HOME}`, or starts with that
+    token followed by `/`, SHALL have the token replaced by this host's own
+    root A or root B absolute path (resolved as in Requirement 2.8), keeping
+    the scheme prefix. A token appearing anywhere else in a value SHALL NOT be
+    expanded. Expanding BEFORE restoring the 4.10 placeholder is required
+    because a `headers`/`env` value is always exactly `"<redacted>"` (never a
+    token) at this point — running expansion before or after restore is
+    therefore observationally identical for those keys — but expanding first
+    keeps one fixed step order for every in-scope file rather than a
+    per-key-name special case, and matches the push-side order (tokenize is
+    the LAST push step, so expand is the FIRST symmetric apply step).
+    Expansion SHALL be idempotent, and SHALL touch no file outside that scope;
+    for every value it rewrote, expanding the token form that Requirement 2.8
+    produced from it on a host SHALL yield that host's original value.
+12. WHEN an applied file's value within the Requirement 2.8 scope is an
+    absolute path under neither of this host's roots (a product-shipped path,
+    or a legacy commit pushed before Requirement 2.8 carrying another host's
+    home directory) THEN the app SHALL write the value unchanged and SHALL
+    list it (file path and JSON key path) in the apply result as non-portable;
+    this SHALL NOT refuse the file.
+13. WHEN, after expansion, an applied value within the Requirement 2.8 scope
+    is a `file://` or `skill://` reference under one of this host's roots
+    whose target does not exist on this host (glob patterns are checked for
+    at least one match) THEN the apply result SHALL list it as an unresolved
+    reference, and SHALL NOT refuse the file — an agent resource under an
+    untracked location such as `config-bundles/skills/` is delivered by that
+    location's own mechanism, not by this app.
 
 ### Requirement 5
 
@@ -218,15 +306,28 @@ not really running.
    report the bounded staleness window (at most 60 seconds) explicitly in the
    apply result rather than reporting the skill as immediately available.
 6. WHEN a pulled change adds or modifies an agent registration THEN the app
-   SHALL apply all four parts of that registration together — the prompt file,
-   the `~/.kiro/agents/<name>.json` definition, the `config.json` `agents{}`
-   entry, and the `agent_model_state.json` pin — and WHEN any one of the four is
-   missing from the commit THEN the app SHALL refuse to apply that registration
-   and report it as incomplete rather than leaving a partially registered agent.
+   SHALL apply every required part of that registration together — the
+   `~/.kiro/agents/<name>.json` definition, the `config.json` `agents{}`
+   entry, the `agent_model_state.json` pin, and the prompt file the definition
+   references only where Requirement 5.11 makes it a required part — and WHEN
+   any required part is missing THEN the app SHALL refuse to apply that
+   registration and report it as incomplete rather than leaving a partially
+   registered agent. A shared part (the `config.json` entry, the
+   `agent_model_state.json` pin) is judged by the CONTENT of that file AS IT
+   EXISTS IN THE APPROVED COMMIT'S TREE — present when that file's copy in the
+   commit carries the agent's own key — regardless of whether that file is
+   itself among the commit's changed paths; an agent's registration is
+   therefore NOT refused merely because a given apply's commit left the shared
+   files untouched, so long as the commit's tree already carries that agent's
+   entry and pin. A new agent whose key is absent from the commit's copy of a
+   shared file remains incomplete on that part.
 7. WHEN an agent registration is applied THEN the app SHALL report that
    `spawn_run`'s roster picks it up without a restart (the agents directory is
    cached on a file-count and newest-mtime signature) and that the dashboard's
-   agent picker is a separate read path that may need its own refresh.
+   agent picker is a separate read path that may need its own refresh. This
+   applies identically whether the triggering commit changed the agent's own
+   definition alone or also touched a shared file — Requirement 5.14 governs
+   how the shared parts are judged, not what is reported once judged complete.
 8. WHEN a pulled change modifies `config.json` (including a model pin) THEN the
    app SHALL report that the change self-invalidates the config cache and
    applies to the NEXT model resolution, and that sessions already running keep
@@ -234,6 +335,45 @@ not really running.
 9. The apply result SHALL distinguish, per applied file, between "live now",
    "live after cache invalidation", "live in a new session", and "live on next
    resolution" — and SHALL NOT collapse these into a single success message.
+10. WHEN a pulled change modifies a `config-bundles/agent-prompts/*.md` file
+    THEN the app SHALL report that the prompt takes effect in a NEW session of
+    that agent, and SHALL NOT claim it is live in already-running sessions.
+11. The prompt part of a registration SHALL be derived from the committed
+    `agents/<name>.json`'s top-level `prompt` value, never from the agent's
+    name: (a) a `file://` value whose path part resolves (Requirement 5.12) to
+    a root-and-relpath that the Requirement 1 allowlist tracks makes that
+    relpath a REQUIRED part; (b) an inline string (any value not starting
+    with `file://`), or an absent, `null`, or empty `prompt`, satisfies the
+    prompt part with no file; (c) a `file://` value resolving to a path the
+    allowlist does not track, or to neither root (e.g. site-packages), makes
+    the prompt NOT a required part, and the apply result SHALL report that
+    agent's prompt as referencing an untracked location. A `prompt` that is
+    present but neither a string nor `null` SHALL make the registration
+    incomplete.
+12. Prompt resolution SHALL accept both the token form
+    (`file://${KIROCREW_HOME}/<rel>`, `file://${KIRO_HOME}/<rel>`) and this
+    host's own absolute form (`file://<root A or B>/<rel>`), mapping each to
+    `(root, rel)` by the Requirement 2.8 boundary rule. A required prompt
+    part SHALL count as present when `<rel>` exists as a regular, non-symlink
+    file in the approved commit's tree. A `<rel>` with an empty or `..`
+    segment, and an `agents/<name>.json` that does not parse as a JSON
+    object, SHALL each make that registration incomplete (fail closed).
+13. A registration candidate SHALL be named only by a changed
+    `agents/<name>.json`. A changed prompt file that no changed agent
+    definition references SHALL apply as an ordinary tracked file, not be
+    treated as a registration. A required prompt file SHALL be blocked from
+    applying only when every changed agent definition referencing it belongs
+    to an incomplete registration.
+14. Shared-part evaluation (Requirement 5.6) SHALL read each shared file
+    (`config.json`, `agent_model_state.json`) from its path WITHIN the
+    approved commit's checked-out tree — never from the live host — and
+    SHALL count the part present whenever that file parses as a JSON object
+    and carries the agent's own key at the required location (`agents.<name>`
+    for `config.json`; top-level `<name>` for `agent_model_state.json`),
+    whether or not that file's relpath is itself in the commit's changed-path
+    list. A shared file that does not exist at all in the commit's tree, or
+    that does not parse as a JSON object, SHALL make that part absent for
+    every agent (fail closed).
 
 ### Requirement 6
 
