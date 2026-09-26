@@ -232,7 +232,7 @@ deployment has merged, per the folder-scoped PR-first workflow.
         configuration stays byte-unchanged while a commit is pending or declined,
         and no route or setting exists that would apply it automatically.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.3, 4.4, 4.6_
+    _Requirements: 4.3, 4.4, 4.6, 4.9_
 
   - [ ] 4.4 Checkpoint — Verify Deployment 3 detects and notifies, and is deployable
     → Agent: test-engineer
@@ -372,8 +372,11 @@ files). No wave exceeds 5, and no wave spans a deployment boundary.
   acceptance criteria and fail for the right reason, then `software-engineer`
   writes the minimal code that makes them pass. A test is never edited to force
   green; use the `debugging` skill instead.
-- Requirement coverage: all 56 acceptance criteria across Requirements 1-8 are
-  cited by at least one sub-task.
+- Requirement coverage: all 56 original acceptance criteria across
+  Requirements 1-8 are cited by at least one sub-task. Requirement 4.9 was
+  added after Deployment 3's initial merge attempt (Kiro-Config-Bundles#65 —
+  a multi-commit-while-pending data-loss defect 4 review rounds missed because
+  no criterion covered the case) and is cited by task 4.3's fix.
 - Phase 1 spans Tasks 1-2 and Phase 4 spans Tasks 5-6 because no top-level task
   may carry more than 5 sub-tasks; the four deployment boundaries are unchanged.
 - Adding `skills/complete-pr-handoff/SKILL.md` (sub-task 3.4) narrows design.md's
