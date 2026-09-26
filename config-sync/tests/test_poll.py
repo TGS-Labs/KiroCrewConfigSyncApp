@@ -610,7 +610,8 @@ def test_main_guard_exits_zero_on_a_changed_head(
 
     outcome is `"changed"` (not a failure) THEN the process must exit 0 —
     the H2 fix must not conflate "outcome is not literally 'unchanged'"
-    with failure; only `"ls-remote-failed"` is a failure exit.
+    with failure; `"ls-remote-failed"` and `"fetch-failed"` are the only
+    two failure-exit outcomes.
     """
     from backend import state
 

@@ -148,7 +148,13 @@ def test_last_seen_sha_advances_even_when_notify_operator_raises(
         subject="h3 regression guard",
     )
 
-    def _raising_notify(*, head_sha: str, reason: str = "") -> None:
+    def _raising_notify(
+        *,
+        head_sha: str,
+        author: str = "",
+        subject: str = "",
+        touched_classes: list[str] | None = None,
+    ) -> None:
         raise RuntimeError("simulated notification channel outage")
 
     monkeypatch.setattr(poll, "notify_operator", _raising_notify)
@@ -187,7 +193,13 @@ def test_second_tick_after_a_notify_failure_does_not_reclassify(
         subject="h3 second-tick guard",
     )
 
-    def _raising_notify(*, head_sha: str, reason: str = "") -> None:
+    def _raising_notify(
+        *,
+        head_sha: str,
+        author: str = "",
+        subject: str = "",
+        touched_classes: list[str] | None = None,
+    ) -> None:
         raise RuntimeError("simulated outage")
 
     monkeypatch.setattr(poll, "notify_operator", _raising_notify)
@@ -203,6 +215,65 @@ def test_second_tick_after_a_notify_failure_does_not_reclassify(
 
     assert result.outcome == "unchanged"
     spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# H1 (round 3) — notify_operator carries the full requirement 4.3 payload:
+# commit, author, subject, and touched configuration classes.
+# ---------------------------------------------------------------------------
+
+
+def test_notify_operator_receives_all_four_required_fields_on_a_changed_head(
+    isolated_state_dir: Path,
+    bundle_remote: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WHEN a poll tick resolves a genuinely changed head THEN
+
+    `notify_operator` must be called with `head_sha`, `author`, `subject`,
+    and `touched_classes` all carrying the REAL values for that commit —
+    not just `head_sha` as before round 3. Requirements.md 4.3 requires
+    the notification identify "the commit, its author, its subject, and
+    which tracked configuration classes the change touches"; task 4.4's
+    "notifies once" exit criterion is unverifiable against a call that
+    only ever carried one of those four fields.
+
+    Uses a real git remote/commit (matching this file's own no-mocked-git
+    convention) so `author`/`subject` are genuine `git show` output and
+    `touched_classes` is genuinely produced by `classify.classify_paths`
+    against a real allowlisted path, not a stubbed-in value.
+    """
+    store = state.load_state()
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    new_sha = _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/h1-payload.md",
+        content="H1 notify-payload regression guard\n",
+        subject="h1 notify payload guard",
+    )
+
+    spy = MagicMock(name="poll.notify_operator")
+    monkeypatch.setattr(poll, "notify_operator", spy)
+
+    result = poll.run()
+
+    assert result.outcome == "changed"
+    spy.assert_called_once()
+    _, kwargs = spy.call_args
+    assert kwargs["head_sha"] == new_sha
+    assert kwargs["subject"] == "h1 notify payload guard"
+    assert kwargs["author"], "author must be a real non-empty git-show value"
+    assert kwargs["touched_classes"], (
+        "touched_classes must carry at least one propagation class for a "
+        "commit that touches an allowlisted steering/ path"
+    )
+
+    reloaded = state.load_state()
+    assert reloaded.pending is not None
+    assert reloaded.pending["author"] == kwargs["author"]
+    assert reloaded.pending["subject"] == kwargs["subject"]
+    assert reloaded.pending["touched_classes"] == kwargs["touched_classes"]
 
 
 # ---------------------------------------------------------------------------

@@ -5,9 +5,11 @@ either tracked configuration root (``KIROCREW_HOME`` / ``KIRO_HOME``), so
 the app's own bookkeeping can never be swept into a commit it makes.
 
 Persists: ``last_pushed_hash``, ``last_push`` (time/branch/PR URL),
-``last_seen_sha``, ``pending`` (sha/author/subject/classified paths),
-``pending_pr`` / ``pending_pr_failure`` (the PR-handoff pending/failure
-record — see `backend/pr_handoff.py`), ``pending_pr_stale`` (a superseded
+``last_seen_sha``, ``last_poll_failure`` (a persistently failing poll
+tick's cause, mirroring ``last_push_failure``), ``pending``
+(sha/author/subject/classified paths), ``pending_pr`` /
+``pending_pr_failure`` (the PR-handoff pending/failure record — see
+`backend/pr_handoff.py`), ``pending_pr_stale`` (a superseded
 confirmation/failure report ignored because a newer push had already
 overwritten ``pending_pr`` — see `confirm_pr_created`/
 `record_pr_pending_failure`), a bounded ``history``, and ``restore_dirs``.
@@ -40,6 +42,7 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "last_push": None,
     "last_push_failure": None,
     "last_seen_sha": None,
+    "last_poll_failure": None,
     "pending": None,
     "pending_pr": None,
     "pending_pr_failure": None,
@@ -182,6 +185,10 @@ class StateStore:
         return cast("str | None", self._payload["last_seen_sha"])
 
     @property
+    def last_poll_failure(self) -> dict[str, Any] | None:
+        return cast("dict[str, Any] | None", self._payload["last_poll_failure"])
+
+    @property
     def pending(self) -> dict[str, Any] | None:
         return cast("dict[str, Any] | None", self._payload["pending"])
 
@@ -258,6 +265,28 @@ class StateStore:
     def record_push_failure(self, *, reason: str) -> None:
         """Record a failed push. Never changes `last_pushed_hash`."""
         self._payload["last_push_failure"] = {
+            "reason": reason,
+            "time": _now_iso(),
+        }
+        self._save()
+
+    def record_poll_failure(self, *, reason: str) -> None:
+        """Record a failed poll tick (`outcome="fetch-failed"`), mirroring
+
+        `record_push_failure`'s shape for the poll job's own equivalent
+        failure path (senior-review round-3 M2/L1). `app.json`'s poll cron
+        is `"silent": true`, so without this a persistently failing poll
+        (the bundle-repo clone/fetch, the commit-metadata/changed-path git
+        calls, or classification itself all raising) is visible only in
+        the cron runner's own exit-history, never in the app's own state —
+        the same "invisible failure" gap `_FAILURE_OUTCOMES`/`fetch-failed`
+        already exists to surface at the `PollResult` level, now also
+        surfaced at the persisted-state level so the app's own UI can show
+        it. Never changes `last_seen_sha` (poll's own `run()` already
+        leaves that untouched on this path so the next tick retries the
+        same head).
+        """
+        self._payload["last_poll_failure"] = {
             "reason": reason,
             "time": _now_iso(),
         }

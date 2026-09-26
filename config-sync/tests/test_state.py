@@ -295,6 +295,52 @@ class TestFailedPushLeavesHashUnchanged:
 
 
 # ---------------------------------------------------------------------------
+# record_poll_failure — senior-review round-3 M2/L1: a persistently
+# failing poll tick must be visible in the app's own state, mirroring
+# record_push_failure's shape for push's equivalent failure.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordPollFailure:
+    def test_last_poll_failure_defaults_to_none(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        assert store.last_poll_failure is None
+
+    def test_record_poll_failure_surfaces_the_cause(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_poll_failure(reason="git clone failed: unreachable remote")
+
+        last_failure = store.last_poll_failure
+        assert last_failure is not None
+        assert last_failure["reason"] == "git clone failed: unreachable remote"
+        assert "time" in last_failure
+
+    def test_record_poll_failure_does_not_change_last_seen_sha(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_seen_sha("stable-sha")
+
+        store.record_poll_failure(reason="fetch failed")
+
+        assert store.last_seen_sha == "stable-sha"
+
+    def test_poll_failure_is_reflected_on_disk_not_only_in_memory(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_poll_failure(reason="classification raised")
+
+        reloaded = state.load_state()
+        assert reloaded.last_poll_failure is not None
+        assert reloaded.last_poll_failure["reason"] == "classification raised"
+
+
+# ---------------------------------------------------------------------------
 # last_seen_sha (poll direction)
 # ---------------------------------------------------------------------------
 

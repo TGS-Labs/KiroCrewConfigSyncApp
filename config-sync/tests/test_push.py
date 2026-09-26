@@ -33,6 +33,7 @@ this is the correct TDD starting state, not a test defect.
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, Iterator
 from unittest.mock import MagicMock
@@ -1122,6 +1123,93 @@ class TestChangePathSuccessDoesNotConfirmPrItself:
         branch_pushed_spy.assert_called_once()
         assert branch_pushed_spy.call_args.kwargs["tree_hash"] == current_hash
         push_success_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Senior-review round-3 H2 — push.py's clone-or-fetch call site now holds
+# the SAME shared `git_safety.clone_lock` that `poll.py`'s
+# `_ensure_bundle_clone` holds for the identical directory, so the two
+# jobs actually serialize against each other (round-2's M-new-2 fix only
+# wrapped poll's own call site with a poll-local lock, leaving push's
+# identical unlocked clone-or-fetch on the same directory able to race
+# against poll's).
+# ---------------------------------------------------------------------------
+
+
+class TestPushCloneSiteSharesPollsLock:
+    """push.run()'s clone-or-fetch step must block while `poll.py`'s
+
+    `_ensure_bundle_clone` (or anything else) holds the lock for the SAME
+    clone directory — proving the two call sites share one real,
+    cross-process lock rather than each holding its own independent one.
+    """
+
+    def test_push_run_blocks_on_the_lock_poll_holds_for_the_same_directory(
+        self,
+        isolated_roots: dict,
+        change_path_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root_a = isolated_roots["root_a"]
+        _write(root_a, "config.json", b'{"key": "value"}')
+
+        _seed_changed_hash(monkeypatch)
+
+        from backend import pr_handoff, poll, state
+
+        monkeypatch.setattr(
+            pr_handoff,
+            "build_pull_request_payload",
+            MagicMock(
+                return_value={
+                    "repo": "TGS-Labs/Kiro-Config-Bundles",
+                    "base": "main",
+                    "head": "irrelevant",
+                    "title": "chore: sync",
+                    "body": "Automated config sync.",
+                }
+            ),
+        )
+        monkeypatch.setattr(pr_handoff, "notify_operator", MagicMock())
+
+        clone_dir = state.get_state_dir() / "bundle-repo"
+
+        release_event = threading.Event()
+        acquired_event = threading.Event()
+
+        def _hold_lock_via_poll() -> None:
+            # `poll.py`'s own lock entry point — proving push.run() is
+            # blocked by the SAME lock object poll.py uses, not merely an
+            # equivalent one.
+            with poll._clone_lock(clone_dir):
+                acquired_event.set()
+                release_event.wait(timeout=5)
+
+        holder = threading.Thread(target=_hold_lock_via_poll, daemon=True)
+        holder.start()
+        assert acquired_event.wait(timeout=5), "poll's lock holder never acquired it"
+
+        push_done = threading.Event()
+
+        def _run_push() -> None:
+            push.run()
+            push_done.set()
+
+        pusher = threading.Thread(target=_run_push, daemon=True)
+        pusher.start()
+
+        assert not push_done.wait(timeout=0.5), (
+            "push.run() completed its clone-or-fetch step while poll's "
+            "lock was still held — push.py's clone site is not actually "
+            "serialized against poll.py's (H2 regression)"
+        )
+
+        release_event.set()
+        holder.join(timeout=5)
+        assert push_done.wait(
+            timeout=5
+        ), "push.run() never completed after poll's lock was released"
+        pusher.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------

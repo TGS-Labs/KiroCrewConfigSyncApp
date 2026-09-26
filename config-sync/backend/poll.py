@@ -116,13 +116,10 @@ docstring note directing a follow-up for `push.py`.
 from __future__ import annotations
 
 import contextlib
-import errno
-import os
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, List, Tuple
 
 from backend import classify, state
 from backend.safety import git_safety
@@ -182,18 +179,35 @@ class PollResult:
 #: decide the process exit code (design.md's error table: "Poll exits
 #: non-zero"). Kept as one named set rather than a per-call-site string
 #: comparison so a THIRD failure outcome added later cannot be missed at
-#: only one of the two exit-code call-sites.
+#: the single exit-code call-site (the ``__main__`` guard below).
 _FAILURE_OUTCOMES = frozenset({"ls-remote-failed", "fetch-failed"})
 
 
-def notify_operator(*, head_sha: str, reason: str = "") -> None:
+def notify_operator(
+    *,
+    head_sha: str,
+    author: str = "",
+    subject: str = "",
+    touched_classes: List[str] | None = None,
+) -> None:
     """Notify the operator that the bundle repo's head has changed.
 
-    The real notification channel is out of scope for this task — this is
-    the seam tests patch. A production implementation wires this to the
-    app's actual notification path; until then this is a deliberate no-op,
-    matching `backend/pr_handoff.py`'s `notify_operator` convention so the
-    poll job's own unchanged/failure paths can assert it was never called.
+    Requirements.md 4.3: the notification must identify "the commit, its
+    author, its subject, and which tracked configuration classes the
+    change touches" — this signature carries all four so that requirement
+    is satisfiable once a real channel is wired in. ``run()`` already has
+    every value in hand at its call site (``author``/``subject`` from
+    `_fetch_commit_details`, ``touched_classes`` from
+    `_classify_changed_paths`) and passes all four.
+
+    DELIVERY ITSELF IS STILL DEFERRED: matching `backend/pr_handoff.py`'s
+    `notify_operator` (Deployment 2's identical seam for the PR-handoff
+    path), the real notification channel/mechanism is out of scope for
+    this deployment — both are deliberate no-ops the app wires to an
+    actual channel (dashboard notification / `send_message`, per
+    design.md's "Pull and apply" flow) in a later task. This is the seam
+    tests patch; the poll job's own unchanged/failure paths assert it was
+    never called on those outcomes.
     """
 
 
@@ -233,64 +247,27 @@ def _resolve_remote_head(state_dir_owner: str) -> str:
     return head_sha
 
 
-@contextlib.contextmanager
-def _clone_lock(clone_dir: Path) -> Iterator[None]:
-    """Hold an exclusive, timeout-bounded advisory lock serializing access
+def _clone_lock(clone_dir: Path) -> contextlib.AbstractContextManager[None]:
+    """Hold the shared bundle-repo clone-directory lock (senior-review
 
-    to ``clone_dir`` across processes (senior-review round-2 M-new-2).
+    round-2 M-new-2; round-3 H2).
 
-    ``config-sync-push`` and ``config-sync-poll`` are both scheduled every
-    900s and both touch the SAME `_BUNDLE_CLONE_DIRNAME` directory with no
-    coordination between them; two ticks landing close together could both
-    see no ``.git`` yet and both start a `clone` into the identical path,
-    and a losing concurrent `clone` can leave the directory non-empty but
-    without a working ``.git`` — a state nothing here self-heals from,
-    since every later tick's own `.git`-exists check then takes the
-    (broken) `fetch` branch instead of ever re-cloning.
-
-    The lockfile lives NEXT TO ``clone_dir`` (``<clone_dir>.lock``, a
-    sibling, not a child) so it survives even if ``clone_dir`` itself ends
-    up in that wedged non-empty-no-``.git`` state, and so
-    `backend.allowlist`'s `*.lock` exclusion (this file is never inside
-    either tracked configuration root regardless — the app's own state
-    directory is structurally excluded — but the naming makes the "never a
-    tracked artifact" property doubly obvious) applies to it by
-    construction.
-
-    Raises:
-        TimeoutError: if the lock cannot be acquired within
-            `_CLONE_LOCK_TIMEOUT_SECS` — bounded so a wedged/dead lock
-            holder cannot hang a poll tick forever; the caller's own
-            try/except around the whole changed-head path (H-new-1) turns
-            this into a reported ``"fetch-failed"`` outcome rather than an
-            uncaught hang.
+    Delegates to `git_safety.clone_lock` — the lock is now defined ONCE in
+    a module both `poll.py` and `push.py` already import, so the two jobs
+    actually serialize against each other (round-2's fix only wrapped
+    poll's own call site with a poll-local lock, leaving push's identical
+    unlocked clone-or-fetch on the SAME directory able to race against
+    poll's — round-3 H2). This wrapper is kept, rather than calling
+    `git_safety.clone_lock` directly at poll's call site, so
+    `_CLONE_LOCK_TIMEOUT_SECS`/`_CLONE_LOCK_POLL_INTERVAL_SECS` stay
+    patchable as poll.py module attributes (existing tests monkeypatch
+    them here to exercise the timeout path without a slow test).
     """
-    import fcntl
-
-    clone_dir.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = clone_dir.parent / f"{clone_dir.name}.lock"
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        deadline = time.monotonic() + _CLONE_LOCK_TIMEOUT_SECS
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"timed out waiting for the bundle-repo clone lock "
-                        f"at {lock_path}"
-                    ) from exc
-                time.sleep(_CLONE_LOCK_POLL_INTERVAL_SECS)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    return git_safety.clone_lock(
+        clone_dir,
+        timeout_secs=_CLONE_LOCK_TIMEOUT_SECS,
+        poll_interval_secs=_CLONE_LOCK_POLL_INTERVAL_SECS,
+    )
 
 
 def _ensure_bundle_clone(clone_dir: Path) -> None:
@@ -398,6 +375,7 @@ def _changed_paths_for_range(
         git_safety.git_argv(clone_dir, *args),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     stdout = completed.stdout or ""
@@ -568,7 +546,13 @@ def run() -> PollResult:
         classified_paths, ignored_paths, touched_classes = _classify_changed_paths(
             changed_paths
         )
-    except (subprocess.CalledProcessError, OSError, git_safety.GitSafetyError) as exc:
+    except (
+        subprocess.CalledProcessError,
+        OSError,
+        TimeoutError,
+        git_safety.GitSafetyError,
+    ) as exc:
+        store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
     store.set_pending(
@@ -599,7 +583,12 @@ def run() -> PollResult:
     # (Kiro-Config-Bundles#57's single-pending-slot seam has already
     # produced repeat defects of this exact "guard ordering" shape).
     store.record_seen_sha(head_sha)
-    notify_operator(head_sha=head_sha)
+    notify_operator(
+        head_sha=head_sha,
+        author=author,
+        subject=subject,
+        touched_classes=touched_classes,
+    )
 
     return PollResult(outcome="changed", head_sha=head_sha)
 
