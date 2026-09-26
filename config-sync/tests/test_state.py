@@ -341,6 +341,56 @@ class TestRecordPollFailure:
 
 
 # ---------------------------------------------------------------------------
+# clear_poll_failure — senior-review round-4 M2: last_poll_failure must not
+# stay stale forever after the poll recovers; a successful tick clears it.
+# ---------------------------------------------------------------------------
+
+
+class TestClearPollFailure:
+    def test_clear_poll_failure_resets_to_none(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_poll_failure(reason="git clone failed: unreachable remote")
+        assert store.last_poll_failure is not None
+
+        store.clear_poll_failure()
+
+        assert store.last_poll_failure is None
+
+    def test_clear_poll_failure_persists_across_reload(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_poll_failure(reason="fetch failed")
+        store.clear_poll_failure()
+
+        reloaded = state.load_state()
+        assert reloaded.last_poll_failure is None
+
+    def test_clear_poll_failure_is_a_no_op_when_already_clear(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        assert store.last_poll_failure is None
+
+        store.clear_poll_failure()
+
+        assert store.last_poll_failure is None
+
+    def test_clear_poll_failure_does_not_change_last_seen_sha(
+        self, isolated_roots: dict[str, Path]
+    ) -> None:
+        store = state.load_state()
+        store.record_seen_sha("stable-sha")
+        store.record_poll_failure(reason="fetch failed")
+
+        store.clear_poll_failure()
+
+        assert store.last_seen_sha == "stable-sha"
+
+
+# ---------------------------------------------------------------------------
 # last_seen_sha (poll direction)
 # ---------------------------------------------------------------------------
 

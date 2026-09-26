@@ -299,14 +299,24 @@ class TestCrons:
             f"{result.stderr}"
         )
 
-    def test_poll_cron_is_silent_for_parity_with_the_push_cron(self) -> None:
-        """Both crons are quiet, zero-token `command` targets on the same
+    def test_poll_cron_is_not_silent_so_a_changed_head_notification_is_delivered(
+        self,
+    ) -> None:
+        """The push and poll crons are NOT required to be silent-parity —
 
-        15-minute cadence (design.md); the push cron already declares
-        `"silent": true` (commit 5ad2bba) and the poll cron must match for
-        parity — an unchanged head is the common tick outcome for poll too,
-        and should not surface cron-runner chatter any more than push's
-        common no-op tick does.
+        senior-review round-4 H-A corrected the round-1 H1 "parity" premise
+        this test previously encoded. Push's common no-op tick genuinely
+        has nothing to report, so `"silent": true` is right for it. Poll's
+        `"changed"` outcome (requirements.md 4.3) DOES have something to
+        report — `notify_operator` now prints a non-empty stdout summary
+        on that outcome — and `kiro_crew/slack/gateway.py`'s command-cron
+        result handling only surfaces a non-empty result as a notification
+        when the job is NOT silent (its own empty-output branch is
+        commented "no output = no delivery", the exact contrapositive).
+        A `"silent": true` poll cron would capture that summary into
+        `last_result` for the dashboard's cron-history view but never
+        deliver it as a notification, leaving Requirement 4.3's "notifies
+        once" guarantee just as unmet as the empty no-op stub it replaces.
         """
         manifest = _load_app_json()
         crons = manifest.get("crons", [])
@@ -314,12 +324,12 @@ class TestCrons:
         push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
 
         assert push_cron.get("silent") is True, (
-            "expected the push cron to already declare silent:true "
-            "(precondition for this parity test)"
+            "push's common no-op tick has nothing to report and should " "stay silent"
         )
-        assert poll_cron.get("silent") is True, (
-            'the poll cron must declare "silent": true for parity with '
-            "the push cron (senior-review H1)"
+        assert poll_cron.get("silent") is False, (
+            'the poll cron must declare "silent": false so its '
+            '"changed"-outcome stdout summary is actually delivered as a '
+            "notification (senior-review round-4 H-A)"
         )
 
 

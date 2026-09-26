@@ -107,10 +107,10 @@ that already-non-empty directory forever.
 file lock, stdlib `fcntl`) on a dedicated lockfile living NEXT TO the clone
 directory (not inside it, so the lock survives even a wedged/partial clone)
 before either job touches the shared clone. Both `poll.py`'s
-`_ensure_bundle_clone` and `push.py`'s inline clone-or-fetch step must hold
-this same lock for the same directory to actually serialize against each
-other; this fix updates `poll.py`'s call-site only — see the module-level
-docstring note directing a follow-up for `push.py`.
+`_ensure_bundle_clone` and `push.py`'s inline clone-or-fetch step hold this
+SAME lock (defined once in `git_safety.clone_lock`) for the same directory,
+so the two jobs actually serialize against each other (round-3 H2 closed
+the gap where only `poll.py`'s call site held it).
 """
 
 from __future__ import annotations
@@ -194,21 +194,41 @@ def notify_operator(
 
     Requirements.md 4.3: the notification must identify "the commit, its
     author, its subject, and which tracked configuration classes the
-    change touches" — this signature carries all four so that requirement
-    is satisfiable once a real channel is wired in. ``run()`` already has
-    every value in hand at its call site (``author``/``subject`` from
-    `_fetch_commit_details`, ``touched_classes`` from
-    `_classify_changed_paths`) and passes all four.
+    change touches" — this prints a one-line summary carrying all four to
+    stdout.
 
-    DELIVERY ITSELF IS STILL DEFERRED: matching `backend/pr_handoff.py`'s
-    `notify_operator` (Deployment 2's identical seam for the PR-handoff
-    path), the real notification channel/mechanism is out of scope for
-    this deployment — both are deliberate no-ops the app wires to an
-    actual channel (dashboard notification / `send_message`, per
-    design.md's "Pull and apply" flow) in a later task. This is the seam
-    tests patch; the poll job's own unchanged/failure paths assert it was
-    never called on those outcomes.
+    This job runs as a `command` cron target (never `message`/an agent
+    turn — requirements.md 4.1), so there is no agent session to hand a
+    notification to. The delivery mechanism for a `command` cron job is
+    its OWN stdout: KiroCrew's cron runner (`kiro_crew/slack/gateway.py`'s
+    `_cron_callback`) captures the subprocess's stdout, and on a
+    successful run with non-empty output records it as the job's result
+    and surfaces it via the dashboard/Slack notification path UNLESS the
+    job is `"silent": true` in `app.json` — the runner's own empty-output
+    branch is commented "no output = no delivery", the exact contrapositive
+    of what this function relies on. `app.json`'s `config-sync-poll` cron
+    entry is therefore flipped to `"silent": false` alongside this fix: a
+    silent job's stdout is captured into `last_result` for the dashboard's
+    cron-history view but never pushed as a notification, which would
+    leave `run()`'s "changed" outcome just as invisible to the operator as
+    the empty no-op stub this replaces.
+
+    On the `"unchanged"` and every failure outcome (`"ls-remote-failed"`,
+    `"fetch-failed"`) `run()` never calls this function at all — printing
+    nothing on those ticks is what keeps a quiet/failing poll silent
+    per-tick while still surfacing the one outcome that matters
+    (requirements.md 4.2's "no notification on unchanged" carries over
+    unchanged: silence is enforced by never calling this, not by this
+    function suppressing its own output).
     """
+    touched = ", ".join(touched_classes or []) or "(none)"
+    print(
+        f"config-sync: bundle repo head changed to {head_sha}\n"
+        f"  author:  {author}\n"
+        f"  subject: {subject}\n"
+        f"  touched: {touched}",
+        flush=True,
+    )
 
 
 def _resolve_remote_head(state_dir_owner: str) -> str:
@@ -420,6 +440,7 @@ def _fetch_commit_details(
         git_safety.git_argv(clone_dir, "show", "-s", "--format=%an%x09%s", sha),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     metadata_stdout = metadata_completed.stdout or ""
@@ -495,9 +516,11 @@ def run() -> PollResult:
     try:
         head_sha = _resolve_remote_head(str(state.get_state_dir()))
     except (subprocess.CalledProcessError, OSError) as exc:
+        store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="ls-remote-failed", reason=str(exc))
 
     if head_sha == store.last_seen_sha:
+        store.clear_poll_failure()
         return PollResult(outcome="unchanged", head_sha=head_sha)
 
     if not head_sha:
@@ -509,6 +532,7 @@ def run() -> PollResult:
         # unchanged`). An empty SHA is never a genuine changed head: it
         # must not be recorded as `last_seen_sha`, classified, or notified
         # on — treat it the same as an unresolved head.
+        store.record_poll_failure(reason="empty head sha")
         return PollResult(outcome="ls-remote-failed", reason="empty head sha")
 
     # NOTE: no separate "already pending for this exact SHA" guard is
@@ -583,6 +607,7 @@ def run() -> PollResult:
     # (Kiro-Config-Bundles#57's single-pending-slot seam has already
     # produced repeat defects of this exact "guard ordering" shape).
     store.record_seen_sha(head_sha)
+    store.clear_poll_failure()
     notify_operator(
         head_sha=head_sha,
         author=author,

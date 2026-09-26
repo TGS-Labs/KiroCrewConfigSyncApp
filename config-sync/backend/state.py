@@ -292,6 +292,23 @@ class StateStore:
         }
         self._save()
 
+    def clear_poll_failure(self) -> None:
+        """Clear `last_poll_failure` after a successful poll tick
+
+        (senior-review round-4 M2). Without this, a stale failure record
+        from an earlier failing tick would keep showing in the app's own
+        UI indefinitely even after the poll has been succeeding for a
+        while — the UI has no way to tell "still failing" from "recovered
+        an hour ago" apart from this being cleared on the next success.
+        Called from `run()` on BOTH success paths: the unchanged-head
+        outcome and the changed-head outcome (right where
+        `record_seen_sha` advances), so any tick that resolves the head
+        cleanly counts as a recovery regardless of whether it also found a
+        new commit.
+        """
+        self._payload["last_poll_failure"] = None
+        self._save()
+
     def record_pr_pending(
         self, *, branch: str, tree_hash: str, payload: dict[str, Any]
     ) -> None:

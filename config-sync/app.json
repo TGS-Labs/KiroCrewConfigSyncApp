@@ -37,7 +37,7 @@
       "every": 900,
       "command": "cd \"${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/config-sync\" && python3 -m backend.poll",
       "enabled": false,
-      "silent": true
+      "silent": false
     }
   ]
 }
