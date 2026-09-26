@@ -1290,9 +1290,15 @@ class TestApproveNewAgentWithPromptNeverPreviouslyLiveCompletes:
         )
         written = json.loads(live_agent_z.read_text(encoding="utf-8"))
         assert written["name"] == "z"
+        # requirements.md 4.11 / design.md apply step 4: expand runs on
+        # every applied in-scope JSON file, so the token form the commit
+        # carries is rewritten to THIS host's own KIROCREW_HOME absolute
+        # path on disk -- the token itself must not survive.
+        root_a = isolated_env["root_a"]
         assert written["prompt"] == (
-            "file://${KIROCREW_HOME}/config-bundles/agent-prompts/z.md"
+            f"file://{root_a}/config-bundles/agent-prompts/z.md"
         )
+        assert "${KIROCREW_HOME}" not in written["prompt"]
 
         assert live_prompt_z.is_file(), (
             "config-bundles/agent-prompts/z.md was never written to the "

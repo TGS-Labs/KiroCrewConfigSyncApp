@@ -48,9 +48,9 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from backend import allowlist, propagate, redact, registration, sanitize
+from backend import allowlist, portable, propagate, redact, registration, sanitize
 from backend import state as state_module
 from backend.propagate import AppliedFile, ChangeKind
 from backend.sanitize import VetCallable
@@ -95,6 +95,22 @@ class ApplyResult:
         needs_credential: Key paths (by server/job name and key) where a
             placeholder was written because no live value existed to
             restore (requirements.md 4.10).
+        non_portable_paths: ``"<relpath>:<dotted.json.key.path>"`` entries
+            for every applied-file string value, within the Requirement
+            2.8 scope, that is an absolute path under NEITHER of this
+            host's roots (requirements.md 4.12) — a legacy other-host
+            path, or a product-shipped path. Written unchanged; never a
+            refusal.
+        unresolved_references: ``"<relpath>:<dotted.json.key.path>"``
+            entries for every ``file://``/``skill://`` reference, after
+            expansion, that resolves to one of this host's own roots but
+            whose target does not exist on this host — glob patterns
+            checked for at least one match (requirements.md 4.13). Never
+            a refusal.
+        untracked_prompt_agents: Agent names carried verbatim from
+            ``registration.Result.untracked_prompt_agents`` (tasks.md
+            7.5) — an agent whose ``prompt`` resolves to an untracked
+            relpath, or to neither root.
         propagation: The per-applied-file propagation report.
         apply_id: The restore-directory id for this apply, or ``None``
             when the gate refused before any backup was made.
@@ -110,6 +126,9 @@ class ApplyResult:
     changed_instance_names: List[str] = field(default_factory=list)
     incomplete_registrations: Dict[str, List[str]] = field(default_factory=dict)
     needs_credential: List[str] = field(default_factory=list)
+    non_portable_paths: List[str] = field(default_factory=list)
+    unresolved_references: List[str] = field(default_factory=list)
+    untracked_prompt_agents: List[str] = field(default_factory=list)
     propagation: propagate.Report = field(
         default_factory=lambda: propagate.Report(entries={})
     )
@@ -132,6 +151,91 @@ def _root_path(root: str) -> Path:
     """
     env_name, default = _ROOT_ENV_DEFAULTS[root]
     return Path(os.environ.get(env_name, default)).expanduser()
+
+
+def _roots_mapping() -> Dict[str, Path]:
+    """Root-id -> resolved `Path` mapping, in `portable.py`'s convention.
+
+    Built from this module's own `_root_path` resolution (the same
+    KIROCREW_HOME/KIRO_HOME env-var lookup `push._roots_mapping` uses on
+    the other side of the seam), so `portable.expand`/`resolve_reference`
+    match against exactly the roots files are written under here.
+    """
+    return {root: _root_path(root) for root in _ROOT_ENV_DEFAULTS}
+
+
+_GLOB_CHARS: Tuple[str, ...] = ("*", "?", "[")
+
+
+def _reference_exists_locally(absolute_path_part: str) -> bool:
+    """Requirements.md 4.13's existence check for one expanded reference.
+
+    A glob pattern (containing ``*``, ``?`` or ``[``) is checked for AT
+    LEAST ONE match via `Path.glob` on its parent directory; a literal
+    path is checked with a plain `exists()`. Any path whose parent cannot
+    be resolved (e.g. a relative or malformed value slipping through)
+    counts as not existing, never raises.
+    """
+    path = Path(absolute_path_part)
+    if not any(char in path.name for char in _GLOB_CHARS):
+        try:
+            return path.exists()
+        except OSError:
+            return False
+    try:
+        return any(path.parent.glob(path.name))
+    except OSError:
+        return False
+
+
+def _walk_json_for_portability(
+    node: Any,
+    roots: Mapping[str, Path],
+    relpath: str,
+    key_path: List[str],
+    non_portable: List[str],
+    unresolved: List[str],
+) -> None:
+    """Walk an EXPANDED JSON document, recording (requirements.md 4.12,
+
+    4.13) every applied string value that is either an absolute path
+    under neither of this host's roots (non-portable — written unchanged
+    already, by the time this runs) or a `file://`/`skill://` reference
+    under one of this host's roots whose target is absent locally
+    (unresolved). Dict keys are never inspected as values. Read-only:
+    this never rewrites `node`, it only appends report entries.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            _walk_json_for_portability(
+                value, roots, relpath, key_path + [str(key)], non_portable, unresolved
+            )
+        return
+    if isinstance(node, list):
+        for index, item in enumerate(node):
+            _walk_json_for_portability(
+                item,
+                roots,
+                relpath,
+                key_path + [str(index)],
+                non_portable,
+                unresolved,
+            )
+        return
+    if not isinstance(node, str):
+        return
+
+    scheme, path_part = portable._split_scheme(node)
+    if not path_part.startswith("/"):
+        return
+
+    dotted = ".".join(key_path)
+    resolved = portable.resolve_reference(node, roots)
+    if resolved is None:
+        non_portable.append(f"{relpath}:{dotted}")
+        return
+    if scheme and not _reference_exists_locally(path_part):
+        unresolved.append(f"{relpath}:{dotted}")
 
 
 def _is_safe_relpath(relpath: str) -> bool:
@@ -457,9 +561,12 @@ def apply_commit(
     not_applied: List[str] = []
     ignored_paths: List[str] = []
     needs_credential: List[str] = []
+    non_portable_paths: List[str] = []
+    unresolved_references: List[str] = []
     applied_files: List[AppliedFile] = []
     backup_made = False
     created_by_root: Dict[str, List[str]] = {"A": [], "B": []}
+    apply_roots = _roots_mapping()
 
     all_pairs = _split_by_root(changed_paths)
 
@@ -566,11 +673,24 @@ def apply_commit(
                 # verbatim", which would bypass that boundary entirely.
                 not_applied.append(relpath)
                 continue
+            # Step 4 (design.md): expand tokens to this host's roots
+            # BEFORE step 4a's placeholder restore and step 4b's
+            # sanitize, so the vet sees the real, host-resolved command
+            # (requirements.md 4.11; tasks.md 7.4's ordering test).
+            expanded_doc = portable.expand(commit_doc, apply_roots)
+            _walk_json_for_portability(
+                expanded_doc,
+                apply_roots,
+                relpath,
+                [],
+                non_portable_paths,
+                unresolved_references,
+            )
             live_doc = (
                 _load_json_or_none(live_target.read_bytes()) if existed_live else None
             )
             restored_doc = _restore_redacted_values(
-                commit_doc, live_doc, relpath, needs_credential
+                expanded_doc, live_doc, relpath, needs_credential
             )
             if relpath == _CRONS_RELPATH:
                 cron_result = sanitize.sanitize_crons(restored_doc, vet=cron_vet)
@@ -587,13 +707,25 @@ def apply_commit(
         else:
             commit_doc = _load_json_or_none(raw_content)
             if commit_doc is not None:
+                # Step 4, mirrored for every other in-scope JSON file
+                # (requirements.md 4.11-4.13): expand before restore,
+                # same as the crons/instances branch above.
+                expanded_doc = portable.expand(commit_doc, apply_roots)
+                _walk_json_for_portability(
+                    expanded_doc,
+                    apply_roots,
+                    relpath,
+                    [],
+                    non_portable_paths,
+                    unresolved_references,
+                )
                 live_doc = (
                     _load_json_or_none(live_target.read_bytes())
                     if existed_live
                     else None
                 )
                 restored_doc = _restore_redacted_values(
-                    commit_doc, live_doc, relpath, needs_credential
+                    expanded_doc, live_doc, relpath, needs_credential
                 )
                 content_to_write = (
                     json.dumps(restored_doc, indent=2, ensure_ascii=False) + "\n"
@@ -682,6 +814,9 @@ def apply_commit(
         changed_instance_names=changed_instance_names,
         incomplete_registrations=dict(reg_result.incomplete_agents),
         needs_credential=needs_credential,
+        non_portable_paths=non_portable_paths,
+        unresolved_references=unresolved_references,
+        untracked_prompt_agents=list(reg_result.untracked_prompt_agents),
         propagation=report,
         apply_id=apply_id if (backup_made or applied or not_applied) else apply_id,
         reason=reason,
