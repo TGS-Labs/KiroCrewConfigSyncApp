@@ -224,6 +224,44 @@ def _backup_file(live_path: Path, restore_dir: Path, root: str, relpath: str) ->
     dest.write_bytes(live_path.read_bytes())
 
 
+_CREATED_MANIFEST_NAME = ".created-manifest.json"
+
+
+def _write_created_manifest(
+    restore_dir: Path, root: str, created_relpaths: List[str]
+) -> None:
+    """Write the per-root created-file manifest at
+
+    ``restore_dir/<root>/.created-manifest.json`` — a JSON list of every
+    relpath this apply created (no prior live bytes, so ``_backup_file``
+    never wrote a real backup for it). Written even when the list is
+    empty, so a later reader (``routes.restore``) can distinguish "no
+    manifest — an older apply, or a bug" from "manifest present, nothing
+    was created". Uses the same atomic temp-file + ``os.replace`` pattern
+    as ``_atomic_write_bytes``/``state._atomic_write_json`` rather than a
+    bare ``write_text``, so a crash mid-write never leaves a truncated
+    manifest for restore to (mis)parse later.
+    """
+    manifest_path = restore_dir / root / _CREATED_MANIFEST_NAME
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(sorted(created_relpaths)).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{_CREATED_MANIFEST_NAME}.",
+        suffix=".tmp",
+        dir=str(manifest_path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, manifest_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _atomic_write_bytes(target: Path, content: bytes) -> None:
     """Write ``content`` to ``target`` via temp file + ``os.replace``,
 
@@ -421,6 +459,7 @@ def apply_commit(
     needs_credential: List[str] = []
     applied_files: List[AppliedFile] = []
     backup_made = False
+    created_by_root: Dict[str, List[str]] = {"A": [], "B": []}
 
     all_pairs = _split_by_root(changed_paths)
 
@@ -435,8 +474,9 @@ def apply_commit(
     # --- Registration handling: refuse incomplete, block their own parts -
     root_a_eligible = {relpath for root, relpath in eligible if root == "A"}
     root_b_eligible = {relpath for root, relpath in eligible if root == "B"}
+    registration_roots = {"A": _root_path("A"), "B": _root_path("B")}
     reg_result = registration.check_registrations(
-        commit_root, sorted(root_a_eligible | root_b_eligible)
+        commit_root, sorted(root_a_eligible | root_b_eligible), registration_roots
     )
     blocked = set(reg_result.blocked_paths)
     if blocked:
@@ -581,11 +621,40 @@ def apply_commit(
                     frontmatter_changed=frontmatter_changed,
                 )
             )
+            if not existed_live:
+                created_by_root[root].append(relpath)
         except OSError:
             not_applied.append(relpath)
 
     reason = ""
-    if backup_made:
+
+    # Write the per-root created-file manifest for every root that had at
+    # least one eligible write/delete attempt in this apply — even when
+    # nothing was actually created — so `routes.restore` can always tell
+    # "no manifest: an older apply, or a bug" apart from "manifest
+    # present, nothing was created" (requirements.md 4.7). Written AFTER
+    # every file's own write/delete attempt (so it reflects the final
+    # `created_by_root`), but BEFORE `record_restore_dir`, mirroring that
+    # call's own "must not be silently swallowed" treatment below: a
+    # manifest write failure here is folded into the same guard.
+    manifest_error: Optional[str] = None
+    touched_roots = {root for root, _relpath in eligible}
+    for root in sorted(touched_roots):
+        try:
+            _write_created_manifest(restore_dir, root, created_by_root[root])
+        except OSError as exc:
+            manifest_error = f"created-file manifest was not recorded: {exc}"
+            break
+
+    if manifest_error is not None:
+        # Same rationale as the `record_restore_dir` failure below: a
+        # restore that cannot tell created files apart from modified ones
+        # cannot safely return the instance to its exact pre-apply state,
+        # so this apply must not be reported as an unqualified success.
+        reason = manifest_error
+        not_applied.extend(p for p in applied if p not in not_applied)
+        applied = []
+    elif backup_made:
         try:
             store.record_restore_dir(apply_id=apply_id, restore_dir=str(restore_dir))
         except OSError as exc:

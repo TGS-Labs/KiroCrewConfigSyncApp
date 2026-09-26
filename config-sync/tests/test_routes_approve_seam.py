@@ -93,6 +93,7 @@ squash-merge org-wide, matching `poll.py`'s own documented shape.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -1033,3 +1034,278 @@ class TestApproveReportsNonAppliedOutcome:
         reloaded_pending = reloaded.pending
         assert reloaded_pending is not None
         assert dict(reloaded_pending) == pending_before
+
+
+# ---------------------------------------------------------------------------
+# 11. tasks.md 7.5 seam: a pending commit that changes ONLY
+#     agents/y.json (inline prompt), whose commit tree's config.json and
+#     agent_model_state.json already carry y's key -> approve writes
+#     agents/y.json's committed bytes to the live root B (KIRO_HOME).
+#
+# This is the seam test between routes.approve/apply_commit and
+# registration.check_registrations' amended (5.14) tree-content rule: a
+# root-B-only change, with both shared parts satisfied purely from the
+# commit tree's content rather than from changed_paths membership, must
+# actually complete and land on disk -- not merely be reported complete
+# in isolation the way tests/test_registration.py's unit tests already
+# prove. Root A ("root A only" in the module docstring above) is left
+# untouched by this test; every other test in this file is unmodified.
+# ---------------------------------------------------------------------------
+
+
+def _seed_agent_y_only_history(origin: Path, tmp_path: Path) -> dict[str, str]:
+    """Real history whose head commit changes ONLY ``agents/y.json`` --
+
+    the commit tree ALSO carries ``config.json``/``agent_model_state.json``
+    with ``y``'s key already present (added in the SAME commit here for
+    fixture simplicity; 5.14's rule is that the shared files' CONTENT is
+    what is read, regardless of whether they are themselves part of
+    ``changed_paths`` -- this fixture's ``pending`` record below names
+    only ``agents/y.json`` in ``classified_paths``, so the shared files'
+    presence in this same commit's tree is exercised as tree content, not
+    as a second changed path the seam depends on).
+    """
+    work = tmp_path / "agent-y-seed-work"
+    work.mkdir()
+    _git("init", "-q", "-b", "main", cwd=work)
+    _git("remote", "add", "origin", str(origin), cwd=work)
+
+    (work / "agents").mkdir()
+    (work / "agents" / "y.json").write_text(
+        json.dumps(
+            {
+                "name": "y",
+                "description": "Agent y.",
+                "prompt": "You are agent y, an inline-prompt test agent.",
+                "tools": ["read"],
+                "allowedTools": ["read"],
+                "resources": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (work / "config.json").write_text(
+        json.dumps({"agents": {"y": {"source": "local", "model": "claude-sonnet-5"}}}),
+        encoding="utf-8",
+    )
+    (work / "agent_model_state.json").write_text(
+        json.dumps({"y": {"model_managed": False, "model": "claude-sonnet-5"}}),
+        encoding="utf-8",
+    )
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "register agent y", cwd=work)
+    head_sha = _head_sha(work)
+    _git("push", "-q", "-u", "origin", "main", cwd=work)
+
+    return {"head": head_sha}
+
+
+class TestApproveAgentJsonOnlyChangeWithSharedKeysAlreadyInTree:
+    """tasks.md 7.5 / requirements.md 5.14 seam: agents/y.json is the
+
+    ONLY path named in the pending record's classified_paths, yet the
+    commit tree's config.json and agent_model_state.json already carry
+    y's key -- approve must still complete the registration (inline
+    prompt -> no required file part per 5.11(b)) and write
+    agents/y.json's committed bytes to the live KIRO_HOME root.
+    """
+
+    def test_approve_agent_json_only_change_completes_and_writes_to_kiro_home(
+        self,
+        routes_module: Any,
+        store: state.StateStore,
+        origin: Path,
+        tmp_path: Path,
+        isolated_env: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _bundle_repo_url_env(monkeypatch, origin)
+        shas = _seed_agent_y_only_history(origin, tmp_path)
+        head_sha = shas["head"]
+
+        # ONLY agents/y.json is named as a changed/classified path --
+        # config.json and agent_model_state.json are deliberately absent
+        # from classified_paths even though both exist, with y's key,
+        # in the commit tree itself (5.14's tree-content rule is what
+        # this seam test exercises).
+        store.set_pending(
+            sha=head_sha,
+            author="Author <a@example.com>",
+            subject="register agent y",
+            classified_paths={"agents/y.json": "live_on_next_resolution"},
+        )
+
+        result = routes_module.approve(store, head_sha)
+
+        live_agent_y = isolated_env["root_b"] / "agents" / "y.json"
+        assert live_agent_y.is_file(), (
+            "agents/y.json was never written to the live KIRO_HOME root -- "
+            "an agent-JSON-only commit whose shared files already carry "
+            "y's key in the commit tree must still complete registration "
+            "and land on disk (requirements.md 5.14)"
+        )
+
+        written = json.loads(live_agent_y.read_text(encoding="utf-8"))
+        assert written == {
+            "name": "y",
+            "description": "Agent y.",
+            "prompt": "You are agent y, an inline-prompt test agent.",
+            "tools": ["read"],
+            "allowedTools": ["read"],
+            "resources": [],
+        }
+
+        assert result.get("status") == "ok"
+
+        reloaded = state.load_state()
+        assert reloaded.base_sha == head_sha
+        assert reloaded.pending is None
+
+
+# ---------------------------------------------------------------------------
+# 12. requirements.md 5.12 seam: a pending commit that ships a BRAND-NEW
+#     agent z together with its prompt file (a ``file://`` reference,
+#     never previously live on either root) -- approve must write both
+#     agents/z.json (root B / KIRO_HOME) and the prompt file (root A /
+#     KIROCREW_HOME) to their live roots. This is the main real-world
+#     registration.check_registrations case 5.12 exists to unblock: a
+#     new agent's prompt is present in the APPROVED COMMIT'S TREE but has
+#     never been live before, so the registration must complete -- a
+#     live-root-only check would refuse it as incomplete forever, since
+#     nothing can ever be live before its own first apply.
+# ---------------------------------------------------------------------------
+
+
+def _seed_agent_z_with_prompt_history(origin: Path, tmp_path: Path) -> dict[str, str]:
+    """Real history whose head commit adds a brand-new agent ``z``:
+
+    ``agents/z.json`` (a ``file://`` prompt reference), the referenced
+    ``config-bundles/agent-prompts/z.md`` prompt file itself, and both
+    shared files carrying ``z``'s entry/pin -- all landing in the SAME
+    commit, exactly the "ships a new agent together with its prompt
+    file" case requirements.md 5.12 names. Nothing here has ever been
+    live on either root before this commit is approved.
+    """
+    work = tmp_path / "agent-z-seed-work"
+    work.mkdir()
+    _git("init", "-q", "-b", "main", cwd=work)
+    _git("remote", "add", "origin", str(origin), cwd=work)
+
+    (work / "agents").mkdir()
+    (work / "agents" / "z.json").write_text(
+        json.dumps(
+            {
+                "name": "z",
+                "description": "Agent z.",
+                "prompt": "file://${KIROCREW_HOME}/config-bundles/agent-prompts/z.md",
+                "tools": ["read"],
+                "allowedTools": ["read"],
+                "resources": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (work / "config-bundles" / "agent-prompts").mkdir(parents=True)
+    (work / "config-bundles" / "agent-prompts" / "z.md").write_text(
+        "# z\n\nYou are agent z, a brand-new agent.\n", encoding="utf-8"
+    )
+    (work / "config.json").write_text(
+        json.dumps({"agents": {"z": {"source": "local", "model": "claude-sonnet-5"}}}),
+        encoding="utf-8",
+    )
+    (work / "agent_model_state.json").write_text(
+        json.dumps({"z": {"model_managed": False, "model": "claude-sonnet-5"}}),
+        encoding="utf-8",
+    )
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "register agent z with its prompt", cwd=work)
+    head_sha = _head_sha(work)
+    _git("push", "-q", "-u", "origin", "main", cwd=work)
+
+    return {"head": head_sha}
+
+
+class TestApproveNewAgentWithPromptNeverPreviouslyLiveCompletes:
+    """requirements.md 5.12's main real-world case: a commit that ships a
+
+    NEW agent (``z``) together with its own prompt file, both changed in
+    the same commit and neither ever having existed on any live root
+    before. The prompt part must count as present because it exists in
+    the approved commit's tree -- approve must write agents/z.json to
+    the live KIRO_HOME root AND the prompt file to the live KIROCREW_HOME
+    root, completing the registration rather than refusing it as
+    incomplete for a prompt that (correctly, for a brand-new agent) was
+    never live.
+    """
+
+    def test_approve_writes_new_agent_definition_and_its_prompt_to_live_roots(
+        self,
+        routes_module: Any,
+        store: state.StateStore,
+        origin: Path,
+        tmp_path: Path,
+        isolated_env: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _bundle_repo_url_env(monkeypatch, origin)
+        shas = _seed_agent_z_with_prompt_history(origin, tmp_path)
+        head_sha = shas["head"]
+
+        # Every changed path from the commit is named, matching how a
+        # real poll/classify pass would report a multi-file commit --
+        # unlike the agent-y seam test above (which deliberately omits
+        # the shared files from classified_paths to exercise 5.14's
+        # tree-content rule), this seam test's own point is the PROMPT
+        # FILE's tree-presence, so it is named here explicitly.
+        store.set_pending(
+            sha=head_sha,
+            author="Author <a@example.com>",
+            subject="register agent z with its prompt",
+            classified_paths={
+                "agents/z.json": "live_on_next_resolution",
+                "config-bundles/agent-prompts/z.md": "live_in_new_session",
+                "config.json": "live_after_cache_invalidation",
+                "agent_model_state.json": "live_after_cache_invalidation",
+            },
+        )
+
+        # Neither the agent definition nor the prompt file has ever been
+        # written to any live root before this approval.
+        live_agent_z = isolated_env["root_b"] / "agents" / "z.json"
+        live_prompt_z = (
+            isolated_env["root_a"] / "config-bundles" / "agent-prompts" / "z.md"
+        )
+        assert not live_agent_z.exists()
+        assert not live_prompt_z.exists()
+
+        result = routes_module.approve(store, head_sha)
+
+        assert live_agent_z.is_file(), (
+            "agents/z.json was never written to the live KIRO_HOME root -- "
+            "a brand-new agent shipped together with its prompt file must "
+            "still complete registration and land on disk (requirements.md "
+            "5.12)"
+        )
+        written = json.loads(live_agent_z.read_text(encoding="utf-8"))
+        assert written["name"] == "z"
+        assert written["prompt"] == (
+            "file://${KIROCREW_HOME}/config-bundles/agent-prompts/z.md"
+        )
+
+        assert live_prompt_z.is_file(), (
+            "config-bundles/agent-prompts/z.md was never written to the "
+            "live KIROCREW_HOME root -- approve() must apply the prompt "
+            "file alongside the agent definition it was shipped with"
+        )
+        assert (
+            live_prompt_z.read_text(encoding="utf-8")
+            == "# z\n\nYou are agent z, a brand-new agent.\n"
+        )
+
+        assert result.get("status") == "ok"
+
+        reloaded = state.load_state()
+        assert reloaded.base_sha == head_sha
+        assert reloaded.pending is None

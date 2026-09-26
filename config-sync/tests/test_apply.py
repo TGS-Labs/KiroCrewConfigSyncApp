@@ -2044,47 +2044,37 @@ def test_apply_successful_root_b_agent_definition_lands_at_kiro_home(
 ) -> None:
     """A COMPLETE registration (all four parts present in the commit) must
 
-    actually write its root-B part — `agents/<name>.json` — under
-    `KIRO_HOME`. No existing test in this file exercises the SUCCESS path
+    actually write its root-B part -- `agents/<name>.json` -- under
+    `KIRO_HOME`. No existing test in this file exercised the SUCCESS path
     for a registration at all; every prior registration test only covers
     the refusal branch (`test_apply_incomplete_registration_refused_but_
     unrelated_files_still_apply` omits `agent_model_state.json` on
-    purpose), so a defect in the success write-through — wrong root,
-    wrong relpath, or the write simply never reached — would pass the
+    purpose), so a defect in the success write-through -- wrong root,
+    wrong relpath, or the write simply never reached -- would pass the
     whole suite today.
 
-    SPEC GAP surfaced by writing this test: `backend/allowlist.py`'s root
-    A entries (requirements.md 1.1: `steering/**/*.md`,
-    `skills/**/SKILL.md`, `skills/**/scripts/**`, and a fixed JSON list)
-    have NO entry for `agent-prompts/**` at all, even though
-    design.md's registration section and `registration.py`'s own
-    docstring both describe "the prompt file (agent-prompts/<name>.md)"
-    as one of a registration's four required parts. Because the
-    prompt-file path is not tracked by any root-A allowlist entry, it is
-    filtered into `ignored_paths` at the allowlist gate BEFORE
-    `check_registrations` ever sees it as a changed path — so under the
-    allowlist as it stands today, `registration.py`'s "prompt file"
-    part can never be satisfied, and `complete_agents` can never be
-    non-empty. This test therefore does not — and, given the current
-    allowlist, cannot — reach the four-parts-complete success path;
-    it instead pins the actual current behaviour (a registration is
-    reported incomplete via the missing prompt-file part alone, even
-    when every OTHER part is genuinely present) and states the gap
-    explicitly rather than inventing an allowlist entry the spec does
-    not name (per this project's stated policy of reporting a spec gap
-    rather than inventing behaviour). Fixing this is an allowlist change
-    (adding an `agent-prompts/**/*.md`-shaped root-A entry), not an
-    apply.py error-handling defect — out of scope for this task's error-
-    path-test mandate, and reported separately in this task's summary.
+    SUPERSEDED-BY-7.5 NOTE (this test was rewritten, not left as-is): the
+    prior version built the prompt part at the bare relpath
+    `agent-prompts/<name>.md` and asserted the registration was
+    permanently incomplete because that path has no root-A allowlist
+    entry -- true of the old rule, where "a same-named sibling file
+    under `agent-prompts/`" was treated as the prompt part regardless of
+    what the agent's own JSON said. Requirements.md 5.11(b) retires
+    that: an inline `prompt` string (or an absent/`null`/empty one)
+    satisfies the prompt part with NO required file at all, so a
+    registration can reach COMPLETE without depending on the
+    `agent-prompts/**` allowlist gap. This rewrite uses an inline
+    `prompt` for exactly that reason, and is what finally closes the "no
+    success-path test exists" gap the prior version could only name, not
+    close.
     """
     commit_root = tmp_path / "commit-root"
-    (commit_root / "agent-prompts").mkdir(parents=True)
-    (commit_root / "agent-prompts" / "new-agent.md").write_text(
-        "# new-agent\n", encoding="utf-8"
-    )
-    (commit_root / "agents").mkdir()
+    (commit_root / "agents").mkdir(parents=True)
     (commit_root / "agents" / "new-agent.json").write_text(
-        json.dumps({"name": "new-agent"}), encoding="utf-8"
+        json.dumps(
+            {"name": "new-agent", "prompt": "You are new-agent, a helpful agent."}
+        ),
+        encoding="utf-8",
     )
     (commit_root / "config.json").write_text(
         json.dumps({"agents": {"new-agent": {"model": "claude-sonnet-5"}}}),
@@ -2101,32 +2091,27 @@ def test_apply_successful_root_b_agent_definition_lands_at_kiro_home(
         approved_sha=sha,
         commit_root=commit_root,
         changed_paths={
-            "A": [
-                "agent-prompts/new-agent.md",
-                "config.json",
-                "agent_model_state.json",
-            ],
+            "A": ["config.json", "agent_model_state.json"],
             "B": ["agents/new-agent.json"],
         },
         store=state_store,
     )
 
-    # Pinning current (gap-affected) behaviour: the prompt-file path is
-    # not allowlisted under root A at all, so it is ignored rather than
-    # ever reaching registration.check_registrations — the registration
-    # is reported incomplete on that basis alone.
-    assert "agent-prompts/new-agent.md" in result.ignored_paths
-    assert "new-agent" in result.incomplete_registrations
-    assert "prompt file (agent-prompts/<name>.md)" in " ".join(
-        result.incomplete_registrations["new-agent"]
-    )
-    # Even so, the root-B agent definition itself is a genuinely tracked,
-    # independent part — it must still be BLOCKED (not applied) as part
-    # of the same incomplete registration, never silently written through
-    # on its own once one part is missing.
+    # requirements.md 5.11(b): an inline prompt string satisfies the
+    # prompt part with no required file, so the three remaining parts
+    # (agent definition, config.json entry, model-state pin) being
+    # present makes this registration COMPLETE.
+    assert "new-agent" not in result.incomplete_registrations
     root_b = Path(os.environ["KIRO_HOME"])
-    assert not (root_b / "agents" / "new-agent.json").exists()
-    assert "agents/new-agent.json" not in result.applied
+    written = root_b / "agents" / "new-agent.json"
+    assert written.is_file(), (
+        "a complete registration's root-B agent definition was never "
+        "written through to KIRO_HOME"
+    )
+    assert json.loads(written.read_text(encoding="utf-8")) == json.loads(
+        (commit_root / "agents" / "new-agent.json").read_text(encoding="utf-8")
+    )
+    assert "agents/new-agent.json" in result.applied
 
 
 @pytest.mark.parametrize(
@@ -2399,6 +2384,123 @@ def test_apply_malformed_crons_json_is_never_written_through_unvetted(
     assert "crons.json" not in result.applied
     assert result.reason != "" or "crons.json" in result.not_applied
     assert vet_calls == [], "the vet must never be bypassed by a parse failure"
+
+
+def test_apply_records_a_created_file_manifest_per_root_restore_dir(
+    bundle_repo: Path, target_root: Path, state_store: state.StateStore, tmp_path: Path
+) -> None:
+    """Requirements.md 4.7 gap: a file the apply CREATED (no prior live
+
+    bytes) is a documented no-op for ``_backup_file`` — there is no
+    record anywhere today of which relpaths under a given ``apply_id``
+    were newly created rather than overwritten, so a subsequent restore
+    cannot know which live files it must remove versus put-back.
+
+    INTERFACE PINNED for the software-engineer: ``apply_commit`` must
+    write a manifest file at
+    ``restore_dir/<root>/.created-manifest.json`` (a JSON list of
+    relpaths, one manifest per root, sitting inside that root's own
+    backup subdirectory the same way `_backup_file`'s
+    ``restore_dir / root / relpath`` layout already does — never a
+    single manifest shared across both roots) listing every relpath in
+    this apply that had NO prior live bytes (``live_existed_before`` is
+    False for a write, or the live path did not exist for a delete
+    that turned out to be a no-op). The dotfile name can never collide
+    with a real allowlisted relpath, since every real backup entry is a
+    plain (non-dot) relpath component.
+
+    MUTATION NOTE: the real narrowing dimension is "the manifest names
+    means EXACTLY the created relpaths, never the modified ones". A
+    mutation that records every applied relpath (created AND modified)
+    into the manifest would still pass a `len > 0` check but fails the
+    per-member assertion below that ``config.json`` (created, no prior
+    live bytes) is IN the manifest while ``steering/a.md`` (modified,
+    had prior live bytes and a real backup) is NOT.
+
+    EXPECTED TO FAIL against current `apply.py`: no such manifest file
+    is ever written today — this pins the gap, per this task's
+    instruction to state gaps rather than invent behaviour.
+    """
+    root_a = Path(os.environ["KIROCREW_HOME"])
+    (root_a / "steering").mkdir()
+    (root_a / "steering" / "a.md").write_text("# A live-before\n", encoding="utf-8")
+    assert not (root_a / "config.json").exists()
+
+    commit_root = tmp_path / "commit-root"
+    commit_root.mkdir()
+    (commit_root / "steering").mkdir()
+    (commit_root / "steering" / "a.md").write_text("# A changed\n", encoding="utf-8")
+    (commit_root / "config.json").write_text(
+        json.dumps({"agents": {"new": True}}), encoding="utf-8"
+    )
+
+    sha = _head_sha(bundle_repo)
+    _seed_pending(state_store, sha)
+
+    result = apply.apply_commit(
+        approved_sha=sha,
+        commit_root=commit_root,
+        changed_paths={"A": ["steering/a.md", "config.json"], "B": []},
+        store=state_store,
+    )
+
+    assert result.outcome == "applied", result
+    assert result.apply_id is not None
+    restore_dir = Path(state_store.restore_dirs[result.apply_id])
+    manifest_path = restore_dir / "A" / ".created-manifest.json"
+    assert manifest_path.is_file(), (
+        "apply_commit must write a per-root created-file manifest at "
+        "restore_dir/<root>/.created-manifest.json"
+    )
+    created = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert created == ["config.json"]
+    assert "steering/a.md" not in created
+
+
+def test_apply_records_empty_created_manifest_when_nothing_was_created(
+    bundle_repo: Path, target_root: Path, state_store: state.StateStore, tmp_path: Path
+) -> None:
+    """The negative case for the same guard: an apply that only MODIFIES
+
+    files that already existed live must still write a (present, empty)
+    manifest — never omit the file — so a restore route can distinguish
+    "no manifest written" (an older apply, or a bug) from "manifest
+    written, nothing was created". Asserting presence-with-empty-content
+    rather than mere non-crash is the per-member check
+    testing-standards.md requires for a collection-scoped guard: a
+    manifest that is simply absent must not be silently treated the same
+    as one that is present and empty by whatever reads it later.
+
+    EXPECTED TO FAIL against current `apply.py` for the same reason as
+    the sibling test above: no manifest is written at all today.
+    """
+    root_a = Path(os.environ["KIROCREW_HOME"])
+    (root_a / "config.json").write_text(
+        json.dumps({"agents": {"old": True}}), encoding="utf-8"
+    )
+
+    commit_root = tmp_path / "commit-root"
+    commit_root.mkdir()
+    (commit_root / "config.json").write_text(
+        json.dumps({"agents": {"new": True}}), encoding="utf-8"
+    )
+
+    sha = _head_sha(bundle_repo)
+    _seed_pending(state_store, sha)
+
+    result = apply.apply_commit(
+        approved_sha=sha,
+        commit_root=commit_root,
+        changed_paths={"A": ["config.json"], "B": []},
+        store=state_store,
+    )
+
+    assert result.outcome == "applied", result
+    assert result.apply_id is not None
+    restore_dir = Path(state_store.restore_dirs[result.apply_id])
+    manifest_path = restore_dir / "A" / ".created-manifest.json"
+    assert manifest_path.is_file()
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == []
 
 
 def test_apply_malformed_instances_json_is_never_written_through_unvetted(

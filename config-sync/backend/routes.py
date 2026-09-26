@@ -47,6 +47,7 @@ names, and outcome strings — never raw file content.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -55,7 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from backend import allowlist, collect, push, redact
 from backend import state as state_module
-from backend.apply import apply_commit
+from backend.apply import _is_safe_relpath, _resolve_target, _root_path, apply_commit
 from backend.poll import _BUNDLE_CLONE_DIRNAME, _clone_lock, _ensure_bundle_clone
 from backend.push import run as push_run
 from backend.safety import git_safety
@@ -430,3 +431,155 @@ def decline(store: "state_module.StateStore", sha: str) -> Dict[str, Any]:
         return resolve_error
 
     return {"status": "ok", "sha": sha}
+
+
+_CREATED_MANIFEST_NAME = ".created-manifest.json"
+
+
+def _is_safe_apply_id(apply_id: str) -> bool:
+    """Reject an ``apply_id`` that could escape the app's own restores
+
+    directory — the same shape of check ``apply._is_safe_relpath`` runs
+    for a commit relpath, applied here to the path SEGMENT a caller
+    supplies as ``apply_id`` (never itself a ``/``-separated relpath, so
+    a single-segment check is the correct scope: an ``apply_id`` is a
+    dict key ``store.restore_dirs`` looks up, not a filesystem path this
+    function builds by joining segments).
+    """
+    normalized = apply_id.replace("\\", "/")
+    if not normalized or normalized in (".", ".."):
+        return False
+    return "/" not in normalized and ".." not in normalized.split("/")
+
+
+def _restore_manifest_relpaths(restore_dir: Path, root: str) -> List[str]:
+    """Read ``restore_dir/<root>/.created-manifest.json``, returning its
+
+    relpath list or an empty list when the manifest is absent or fails to
+    parse (an apply that predates this manifest, or one where
+    ``apply_commit`` never reached a given root at all, must not make
+    restore fail outright — it simply has nothing to remove for that
+    root).
+    """
+    manifest_path = restore_dir / root / _CREATED_MANIFEST_NAME
+    if not manifest_path.is_file():
+        return []
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [entry for entry in raw if isinstance(entry, str)]
+
+
+def _restore_backed_up_relpaths(restore_dir: Path, root: str) -> List[str]:
+    """Enumerate every real backed-up relpath under
+
+    ``restore_dir/<root>/`` — every regular file EXCEPT the created-file
+    manifest itself, which sits in the same directory but is metadata,
+    never a tracked relpath to restore.
+    """
+    root_dir = restore_dir / root
+    if not root_dir.is_dir():
+        return []
+    relpaths: List[str] = []
+    for path in root_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        relpath = path.relative_to(root_dir).as_posix()
+        if relpath == _CREATED_MANIFEST_NAME:
+            continue
+        relpaths.append(relpath)
+    return sorted(relpaths)
+
+
+def restore(store: "state_module.StateStore", apply_id: str) -> Dict[str, Any]:
+    """POST restore/{id} — return the instance to the exact bytes recorded
+
+    before ``apply_id``'s apply, using only the local restore directory
+    (design.md: "no second network round trip") — never a git or network
+    call.
+
+    Two kinds of relpath are handled, matching what ``apply_commit``
+    actually records for a given ``apply_id`` (tasks.md 6.2):
+
+    - Every relpath backed up under ``restore_dir/<root>/<relpath>``
+      (``apply.py::_backup_file``) is copied straight back over the live
+      file, reported under ``"restored"``.
+    - Every relpath named in ``restore_dir/<root>/.created-manifest.json``
+      (a file this apply created, with no prior live bytes to back up —
+      ``apply.py::_write_created_manifest``) is REMOVED from the live
+      root, reported separately under ``"removed"`` — requirements.md 4.7
+      means restore returns the EXACT pre-apply state, and the pre-apply
+      state for a created file is "did not exist".
+
+    Every relpath from either source is re-resolved through
+    ``apply._resolve_target`` before any filesystem write/removal — the
+    manifest and the backup tree are both DATA read off disk, not trusted
+    instructions, so a tampered manifest entry (a ``..`` segment, an
+    absolute path) is refused exactly like a hostile ``changed_paths``
+    entry would be refused in ``apply_commit`` itself, rather than being
+    joined onto the live root unchecked.
+
+    Idempotent: restoring the same ``apply_id`` twice is safe — the
+    second call re-copies the same backup bytes (a no-op rewrite) and
+    finds the created files already absent (a no-op removal), rather than
+    raising.
+    """
+    disabled = _require_enabled()
+    if disabled is not None:
+        return disabled
+
+    if not _is_safe_apply_id(apply_id):
+        return {"status": "error", "reason": f"invalid apply id: {apply_id!r}"}
+
+    restore_dir_raw = store.restore_dirs.get(apply_id)
+    if restore_dir_raw is None:
+        return {
+            "status": "error",
+            "reason": f"no restore directory recorded for apply id {apply_id!r}",
+        }
+    restore_dir = Path(restore_dir_raw)
+
+    restored: Dict[str, List[str]] = {root: [] for root in _ROOT_IDS}
+    removed: Dict[str, List[str]] = {root: [] for root in _ROOT_IDS}
+
+    for root in _ROOT_IDS:
+        root_path = _root_path(root)
+
+        for relpath in _restore_backed_up_relpaths(restore_dir, root):
+            live_target = _resolve_target(root_path, relpath)
+            if live_target is None:
+                continue
+            backup_path = restore_dir / root / relpath
+            if not backup_path.is_file():
+                continue
+            live_target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{live_target.name}.",
+                suffix=".tmp",
+                dir=str(live_target.parent),
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                tmp_path.write_bytes(backup_path.read_bytes())
+                tmp_path.replace(live_target)
+            except OSError:
+                tmp_path.unlink(missing_ok=True)
+                continue
+            restored[root].append(relpath)
+
+        for relpath in _restore_manifest_relpaths(restore_dir, root):
+            if not _is_safe_relpath(relpath):
+                continue
+            live_target = _resolve_target(root_path, relpath)
+            if live_target is None:
+                continue
+            try:
+                live_target.unlink(missing_ok=True)
+            except OSError:
+                continue
+            removed[root].append(relpath)
+
+    return {"status": "ok", "restored": restored, "removed": removed}
