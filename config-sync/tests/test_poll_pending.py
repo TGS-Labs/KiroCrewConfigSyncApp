@@ -23,30 +23,21 @@ and requirements.md:
   the instance's own configuration is untouched by this wiring, and no
   apply-triggering call exists anywhere in the changed-head code path.
 
-This module fetches a new commit's changed paths via a second git
-invocation (design.md: "fetch the commit's changed-path list") — the
-poll job's SINGLE-ls-remote invariant from task 4.1 (`no_further_git_calls`
-in test_poll.py) applies only to the UNCHANGED-head path; the changed-head
-path is explicitly allowed a second, THIRD git call for path/metadata
-discovery. That second call must still route through
-`git_safety.git_argv`, matching every other host-side git call in this app.
+## Real git, not mocks (senior review C1/C2/H4 fix)
 
-The exact plumbing (a single combined `git show --name-only --format=...`
-vs. a separate `diff-tree` and metadata read) is an implementation detail
-this test suite deliberately does not pin down — what's pinned is the
-observable contract: `classify.classify_paths` is called with the new
-head's changed paths, `state.set_pending` receives sha/author/subject/
-classified_paths derived from that commit, and the notify seam fires
-exactly once per newly-pending SHA.
-
-All tests below are expected to fail for one of two RIGHT reasons until
-software-engineer implements this wiring:
-- a collection-time error if the wiring hooks this suite patches
-  (`_fetch_commit_metadata`/`_fetch_changed_paths`/`classify_paths` call
-  site) do not exist yet, or
-- an assertion failure because `poll.run()`'s changed-head path today
-  (task 4.1) only returns `PollResult(outcome="changed", head_sha=...)`
-  without classifying, recording a pending state, or notifying at all.
+The previous version of this file mocked `subprocess.run` with a
+hand-written `git show`-shaped string standing in for the changed-path
+fetch. That mock encoded an invalid git invocation (C1: `--no-patch` +
+`--name-only` together, which real git rejects with exit 128) and could
+never have caught it, because the mock always "succeeds" regardless of
+what real git would do — the exact testing-methodology gap
+Kiro-Config-Bundles#57 tracks as a recurring pattern. This file now runs a
+real local bare repo as the bundle-repo stand-in (matching
+`tests/test_push_retry_pr_only.py`'s established real-git convention) and
+lets `poll.run()`'s own git calls (`ls-remote`, clone/fetch, `show -s`,
+`log --first-parent`) execute for real against it. Only the notify seam
+and (where noted) `classify.classify_paths`'s spy wrapper are test
+collaborators; no git call `poll.run()` itself makes is mocked.
 """
 
 from __future__ import annotations
@@ -61,9 +52,7 @@ import pytest
 from backend import classify, poll, state
 
 # ---------------------------------------------------------------------------
-# Fixtures — matching test_poll.py's isolated-state-dir / git_argv_spy /
-# notify_spy conventions exactly, so this suite composes with task 4.1's
-# fixtures rather than reinventing them.
+# Fixtures
 # ---------------------------------------------------------------------------
 
 
@@ -77,21 +66,84 @@ def isolated_state_dir(
 
 
 @pytest.fixture
-def git_argv_spy(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Spy on (wrap, don't replace) `git_safety.git_argv`, matching
+def git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Author/committer identity via environment only, matching
 
-    test_poll.py's fixture exactly, so the changed-path fetch call is
-    provably built through the hardened argv builder too.
+    `test_push_retry_pr_only.py`'s `bare_remote` fixture — this test
+    process must never mutate the host's real git configuration.
     """
-    from backend.safety import git_safety
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Alice")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "alice@example.com")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Alice")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "alice@example.com")
 
-    spy = MagicMock(name="git_safety.git_argv", wraps=git_safety.git_argv)
-    monkeypatch.setattr(git_safety, "git_argv", spy)
-    if hasattr(poll, "git_argv"):
-        monkeypatch.setattr(poll, "git_argv", spy)
-    if hasattr(poll, "git_safety"):
-        monkeypatch.setattr(poll.git_safety, "git_argv", spy)
-    return spy
+
+def _run_git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    """A plain, unhardened real `git` call for TEST SETUP only — never
+
+    `poll.py`'s own `git_safety.git_argv` — matching
+    `test_push_retry_pr_only.py`'s convention exactly.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def bundle_remote(
+    tmp_path: Path,
+    isolated_state_dir: Path,
+    git_identity: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[dict]:
+    """A real local bare repo standing in for the GitHub bundle repo, with
+
+    one commit already pushed to `main` — the state the "old" head
+    (`state.last_seen_sha`) will be pinned to before each test advances
+    the remote further. `poll.BUNDLE_REPO_URL` is monkeypatched to this
+    path so `poll.run()`'s own clone/fetch calls run for real against it,
+    no network required.
+    """
+    remote_dir = tmp_path / "bundle-remote.git"
+    remote_dir.mkdir()
+    _run_git("init", "-q", "--bare", "-b", "main", cwd=remote_dir)
+
+    seed_dir = tmp_path / "bundle-remote-seed"
+    seed_dir.mkdir()
+    _run_git("init", "-q", "-b", "main", cwd=seed_dir)
+    (seed_dir / "steering").mkdir()
+    (seed_dir / "steering" / "seed.md").write_text("seed\n", encoding="utf-8")
+    _run_git("add", ".", cwd=seed_dir)
+    _run_git("commit", "-q", "-m", "seed", cwd=seed_dir)
+    _run_git("remote", "add", "origin", str(remote_dir), cwd=seed_dir)
+    _run_git("push", "-q", "origin", "main", cwd=seed_dir)
+    old_sha = _run_git("rev-parse", "HEAD", cwd=seed_dir).stdout.strip()
+
+    monkeypatch.setattr(poll, "BUNDLE_REPO_URL", str(remote_dir))
+
+    yield {"seed_dir": seed_dir, "remote_dir": remote_dir, "old_sha": old_sha}
+
+
+def _push_new_commit(
+    seed_dir: Path, *, relpath: str, content: str, subject: str
+) -> str:
+    """Add/commit/push one new file on `main` in the seed clone, returning
+
+    the new head SHA — the real-git equivalent of "a new commit landed
+    upstream" for the poll job to discover on its next tick.
+    """
+    target = seed_dir / relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    _run_git("add", relpath, cwd=seed_dir)
+    _run_git("commit", "-q", "-m", subject, cwd=seed_dir)
+    _run_git("push", "-q", "origin", "main", cwd=seed_dir)
+    result: str = _run_git("rev-parse", "HEAD", cwd=seed_dir).stdout.strip()
+    return result
 
 
 @pytest.fixture
@@ -129,34 +181,6 @@ def classify_paths_spy(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return spy
 
 
-def _run_subprocess_sequence(*outcomes: MagicMock) -> MagicMock:
-    """Build a `subprocess.run` replacement that returns each of
-
-    ``outcomes`` in order across successive calls — the ls-remote call
-    first, then the changed-path/metadata fetch call(s) that follow it on
-    the changed-head path.
-    """
-    return MagicMock(name="subprocess.run", side_effect=list(outcomes))
-
-
-def _completed(*, stdout: str = "", returncode: int = 0) -> MagicMock:
-    completed = MagicMock(name="CompletedProcess")
-    completed.stdout = stdout
-    completed.returncode = returncode
-    return completed
-
-
-# A realistic `git show --name-only --format=...`-shaped payload: one
-# metadata line (author + subject, tab-delimited so parsing is trivial and
-# unambiguous even if the subject contains spaces), a blank separator line,
-# then the changed paths. Tests do not assert poll.py parses THIS exact
-# format — only that whatever it fetches ends up correctly classified and
-# recorded. This fixture models one plausible, simple contract.
-def _show_stdout(*, author: str, subject: str, paths: list[str]) -> str:
-    lines = [f"{author}\t{subject}", ""] + paths
-    return "\n".join(lines) + "\n"
-
-
 # ---------------------------------------------------------------------------
 # Requirement 4.3 — new head detected: fetch changed paths, classify,
 # set_pending, notify exactly once.
@@ -165,10 +189,9 @@ def _show_stdout(*, author: str, subject: str, paths: list[str]) -> str:
 
 def test_changed_head_classifies_paths_via_classify_paths(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
     classify_paths_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """WHEN poll detects a new head THEN it fetches that commit's changed
 
@@ -176,23 +199,15 @@ def test_changed_head_classifies_paths_via_classify_paths(
     reimplemented/ad-hoc matcher (requirements.md 4.3, design.md: "classify
     each path against the allowlist").
     """
-    old_sha = "a" * 40
-    new_sha = "b" * 40
-    changed_paths = ["steering/foo.md", "some/untracked/file.txt"]
-
-    ls_remote_result = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_result = _completed(
-        stdout=_show_stdout(
-            author="alice", subject="update steering", paths=changed_paths
-        )
-    )
-    run_mock = _run_subprocess_sequence(ls_remote_result, show_result)
-    monkeypatch.setattr(subprocess, "run", run_mock)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock)
-
     store = state.load_state()
-    store.record_seen_sha(old_sha)
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/foo.md",
+        content="new steering content\n",
+        subject="update steering",
+    )
 
     poll.run()
 
@@ -205,9 +220,8 @@ def test_changed_head_classifies_paths_via_classify_paths(
 
 def test_changed_head_records_pending_via_state_set_pending(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """WHEN poll detects a new head THEN `state.set_pending` is called with
 
@@ -215,23 +229,15 @@ def test_changed_head_records_pending_via_state_set_pending(
     (requirements.md 4.3, design.md "write a `pending` record (sha,
     author, subject, classified paths)").
     """
-    old_sha = "c" * 40
-    new_sha = "d" * 40
-    changed_paths = ["steering/bar.md"]
-
-    ls_remote_result = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_result = _completed(
-        stdout=_show_stdout(
-            author="bob", subject="add steering doc", paths=changed_paths
-        )
-    )
-    run_mock = _run_subprocess_sequence(ls_remote_result, show_result)
-    monkeypatch.setattr(subprocess, "run", run_mock)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock)
-
     store = state.load_state()
-    store.record_seen_sha(old_sha)
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    new_sha = _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/bar.md",
+        content="another steering doc\n",
+        subject="add steering doc",
+    )
 
     poll.run()
 
@@ -242,37 +248,29 @@ def test_changed_head_records_pending_via_state_set_pending(
         "on a changed-head tick"
     )
     assert pending["sha"] == new_sha
-    assert pending["author"] == "bob"
+    assert pending["author"] == "Alice"
     assert pending["subject"] == "add steering doc"
     assert "steering/bar.md" in pending["classified_paths"]
 
 
 def test_changed_head_notifies_exactly_once(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """WHEN poll detects a new head THEN the notify seam is called exactly
 
     ONCE for that tick (requirements.md 4.3).
     """
-    old_sha = "e" * 40
-    new_sha = "f" * 40
-
-    ls_remote_result = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_result = _completed(
-        stdout=_show_stdout(
-            author="carol", subject="rotate mcp config", paths=["config.json"]
-        )
-    )
-    run_mock = _run_subprocess_sequence(ls_remote_result, show_result)
-    monkeypatch.setattr(subprocess, "run", run_mock)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock)
-
     store = state.load_state()
-    store.record_seen_sha(old_sha)
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="config.json",
+        content='{"rotated": true}\n',
+        subject="rotate mcp config",
+    )
 
     poll.run()
 
@@ -284,9 +282,8 @@ def test_changed_head_notifies_exactly_once(
 
 def test_changed_head_records_the_new_head_as_seen(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A changed-head tick that records a pending commit must also advance
 
@@ -296,20 +293,15 @@ def test_changed_head_records_the_new_head_as_seen(
     (requirements.md 4.4's premise: a SECOND tick with the SAME head must
     be recognizable as "already seen, already pending").
     """
-    old_sha = "1" * 40
-    new_sha = "2" * 40
-
-    ls_remote_result = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_result = _completed(
-        stdout=_show_stdout(author="dave", subject="tweak crons", paths=["crons.json"])
-    )
-    run_mock = _run_subprocess_sequence(ls_remote_result, show_result)
-    monkeypatch.setattr(subprocess, "run", run_mock)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock)
-
     store = state.load_state()
-    store.record_seen_sha(old_sha)
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    new_sha = _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="crons.json",
+        content="{}\n",
+        subject="tweak crons",
+    )
 
     poll.run()
 
@@ -325,9 +317,8 @@ def test_changed_head_records_the_new_head_as_seen(
 
 def test_second_tick_with_same_pending_head_does_not_renotify(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """WHEN a commit is already pending (recorded, not yet acted on) AND a
 
@@ -336,37 +327,23 @@ def test_second_tick_with_same_pending_head_does_not_renotify(
     repeat sighting of the same pending SHA is a no-op notification-wise
     (requirements.md 4.4: "does not re-nag on every 15-minute tick").
     """
-    old_sha = "3" * 40
-    new_sha = "4" * 40
-    changed_paths = ["steering/baz.md"]
+    store = state.load_state()
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/baz.md",
+        content="first sighting\n",
+        subject="first sighting",
+    )
 
     # Tick 1: head changes, gets recorded as pending + notified once.
-    ls_remote_1 = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_1 = _completed(
-        stdout=_show_stdout(
-            author="erin", subject="first sighting", paths=changed_paths
-        )
-    )
-    run_mock_1 = _run_subprocess_sequence(ls_remote_1, show_1)
-    monkeypatch.setattr(subprocess, "run", run_mock_1)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock_1)
-
-    store = state.load_state()
-    store.record_seen_sha(old_sha)
-
     poll.run()
     assert notify_spy.call_count == 1, "tick 1 should notify once"
 
-    # Tick 2: ls-remote reports the SAME head again (nothing new landed
-    # upstream since tick 1) — last_seen_sha was already advanced to
-    # new_sha by tick 1, so this is the "already seen" case.
-    ls_remote_2 = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    run_mock_2 = _run_subprocess_sequence(ls_remote_2)
-    monkeypatch.setattr(subprocess, "run", run_mock_2)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock_2)
-
+    # Tick 2: nothing new landed upstream since tick 1 — ls-remote reports
+    # the same head again. last_seen_sha was already advanced to it by
+    # tick 1, so this is the "already seen" case.
     poll.run()
 
     assert notify_spy.call_count == 1, (
@@ -378,43 +355,28 @@ def test_second_tick_with_same_pending_head_does_not_renotify(
 
 def test_second_tick_with_same_pending_head_leaves_pending_record_intact(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A repeat sighting of the same already-pending SHA must not overwrite
 
     or clear the existing pending record (still keyed on the same SHA)
     while the operator has neither approved nor declined it.
     """
-    old_sha = "5" * 40
-    new_sha = "6" * 40
-    changed_paths = ["steering/qux.md"]
-
-    ls_remote_1 = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_1 = _completed(
-        stdout=_show_stdout(
-            author="frank", subject="original pending commit", paths=changed_paths
-        )
-    )
-    run_mock_1 = _run_subprocess_sequence(ls_remote_1, show_1)
-    monkeypatch.setattr(subprocess, "run", run_mock_1)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock_1)
-
     store = state.load_state()
-    store.record_seen_sha(old_sha)
-    poll.run()
+    store.record_seen_sha(bundle_remote["old_sha"])
 
+    _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/qux.md",
+        content="original pending commit\n",
+        subject="original pending commit",
+    )
+
+    poll.run()
     pending_after_tick_1 = state.load_state().pending
     assert pending_after_tick_1 is not None
-    assert pending_after_tick_1["sha"] == new_sha
-
-    ls_remote_2 = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    run_mock_2 = _run_subprocess_sequence(ls_remote_2)
-    monkeypatch.setattr(subprocess, "run", run_mock_2)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock_2)
+    new_sha = pending_after_tick_1["sha"]
 
     poll.run()
 
@@ -440,9 +402,8 @@ def test_second_tick_with_same_pending_head_leaves_pending_record_intact(
 
 def test_pending_tick_never_imports_or_calls_apply(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """WHILE a commit is pending (not yet approved/declined) THE poll
 
@@ -469,7 +430,7 @@ def test_pending_tick_never_imports_or_calls_apply(
 
 def test_pending_tick_does_not_write_to_either_tracked_root(
     isolated_state_dir: Path,
-    git_argv_spy: MagicMock,
+    bundle_remote: dict,
     notify_spy: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -495,21 +456,15 @@ def test_pending_tick_does_not_write_to_either_tracked_root(
     monkeypatch.setenv("KIROCREW_HOME", str(kirocrew_home))
     monkeypatch.setenv("KIRO_HOME", str(kiro_home))
 
-    old_sha = "7" * 40
-    new_sha = "8" * 40
-    ls_remote_result = _completed(stdout=f"{new_sha}\trefs/heads/main\n")
-    show_result = _completed(
-        stdout=_show_stdout(
-            author="grace", subject="pending, not applied", paths=["steering/x.md"]
-        )
-    )
-    run_mock = _run_subprocess_sequence(ls_remote_result, show_result)
-    monkeypatch.setattr(subprocess, "run", run_mock)
-    if hasattr(poll, "subprocess"):
-        monkeypatch.setattr(poll.subprocess, "run", run_mock)
-
     store = state.load_state()
-    store.record_seen_sha(old_sha)
+    store.record_seen_sha(bundle_remote["old_sha"])
+
+    _push_new_commit(
+        bundle_remote["seed_dir"],
+        relpath="steering/x.md",
+        content="pending, not applied\n",
+        subject="pending, not applied",
+    )
 
     poll.run()
 
@@ -520,4 +475,61 @@ def test_pending_tick_does_not_write_to_either_tracked_root(
     assert sentinel_b.read_bytes() == b"original content B", (
         "poll.run() must not write into the KIRO_HOME tracked root while "
         "a commit is only pending"
+    )
+
+
+# ---------------------------------------------------------------------------
+# H4 regression guard — a MERGE commit (the common case on
+# Kiro-Config-Bundles, which disallows squash-merge org-wide) must still
+# be classified/recorded correctly, not silently dropped to an empty
+# changed-path list.
+# ---------------------------------------------------------------------------
+
+
+def test_changed_head_that_is_a_merge_commit_still_reports_changed_paths(
+    isolated_state_dir: Path,
+    bundle_remote: dict,
+    notify_spy: MagicMock,
+) -> None:
+    """WHEN the new head is a MERGE commit (parents=[previous-main,
+
+    feature-branch-tip]) THEN the pending record's classified paths still
+    include the file the merge brought in — proving H4's fix against a
+    real merge in the SAME remote a poll tick actually reads, not just
+    the standalone fixture in test_poll_fetch_commit_details.py.
+    """
+    seed_dir = bundle_remote["seed_dir"]
+    old_sha = bundle_remote["old_sha"]
+
+    _run_git("checkout", "-qb", "feature", cwd=seed_dir)
+    (seed_dir / "steering" / "merged_in.md").parent.mkdir(parents=True, exist_ok=True)
+    (seed_dir / "steering" / "merged_in.md").write_text(
+        "brought in by the merge\n", encoding="utf-8"
+    )
+    _run_git("add", "steering/merged_in.md", cwd=seed_dir)
+    _run_git("commit", "-q", "-m", "feature change", cwd=seed_dir)
+    _run_git("checkout", "-q", "main", cwd=seed_dir)
+    _run_git(
+        "merge",
+        "--no-ff",
+        "-q",
+        "-m",
+        "merge feature into main",
+        "feature",
+        cwd=seed_dir,
+    )
+    merge_sha = _run_git("rev-parse", "HEAD", cwd=seed_dir).stdout.strip()
+    _run_git("push", "-q", "origin", "main", cwd=seed_dir)
+
+    store = state.load_state()
+    store.record_seen_sha(old_sha)
+
+    poll.run()
+
+    pending = state.load_state().pending
+    assert pending is not None
+    assert pending["sha"] == merge_sha
+    assert "steering/merged_in.md" in pending["classified_paths"], (
+        f"a merge commit's incoming file must appear in the classified "
+        f"paths; got {pending['classified_paths']!r}"
     )

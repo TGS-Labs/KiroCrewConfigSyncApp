@@ -11,14 +11,13 @@ Outcomes:
 1. Unchanged head (``ls-remote`` result == ``state.last_seen_sha``): exit 0,
    no notification, no git call beyond the single ``ls-remote``.
 2. Changed head, not yet pending for this SHA (task 4.3): fetch the new
-   commit's metadata and changed paths via a single second, hardened git
-   call (``git show --no-patch --name-only --format=%an%x09%s <sha>``).
-   Each changed path is classified via `classify.classify_paths` against
-   every tracked root (`backend/collect.py`'s root A/B — the bundle tree
-   interleaves both with no per-root prefix), the merged classified paths
-   are recorded via `state.set_pending`, the operator is notified exactly
-   once, and `state.last_seen_sha` advances to the new head
-   (requirements.md 4.3).
+   commit's changed-path list and metadata (design.md: "fetch the commit's
+   changed-path list") via `_fetch_commit_details`. Each changed path is
+   classified via `classify.classify_paths` against every tracked root
+   (`backend/collect.py`'s root A/B — the bundle tree interleaves both
+   with no per-root prefix), the merged classified paths are recorded via
+   `state.set_pending`, the operator is notified exactly once, and
+   `state.last_seen_sha` advances to the new head (requirements.md 4.3).
 3. ``ls-remote`` failure (non-zero exit or raised exception), or an
    unresolvable head (empty SHA): exit non-zero, ``state.last_seen_sha``
    left unchanged, no notification.
@@ -36,12 +35,56 @@ configuration root — that is Deployment 4's approved-only route
 Modelled on `backend/push.py`'s module shape: a frozen result dataclass, a
 zero-argument ``run()`` entrypoint, and a patchable ``notify_operator`` seam
 matching `backend/pr_handoff.py`'s convention.
+
+## Changed-path fetch mechanism (senior review C1/C2/H4 fix)
+
+`_fetch_commit_details` does **not** run a bare, object-less ``git show`` in
+the app's state directory. Two real-git facts rule that shape out:
+
+- ``git show --no-patch --name-only --format=...`` is an invalid flag
+  combination — git rejects ``--name-only``/``--name-status``/``--check``
+  combined with ``--no-patch``/``-s`` with exit 128 (confirmed against real
+  git). ``--no-patch`` and ``--name-only`` both suppress/select the same
+  diff output and cannot be combined.
+- Even with valid flags, a single-commit ``git show`` on a **merge**
+  commit returns an EMPTY changed-path list by default (confirmed against
+  a real merge commit) — git only shows a merge's diff with ``-m``/``-c``,
+  and Kiro-Config-Bundles disallows squash-merge org-wide, so every real
+  head advance on that repo IS a merge commit.
+- The app's state directory is not a git repository at all, so no local
+  git call there can read any object regardless of flags — `git ls-remote`
+  transfers no objects.
+
+The fix reuses `backend.push`'s own bundle-repo clone
+(`state.get_state_dir() / _BUNDLE_CLONE_DIRNAME`, the same directory
+`push.py` clones/fetches to push a branch) as poll's object source — one
+clone per host, not a second one, and never the full-clone-on-every-tick
+design.md forbids: the clone is created once (first tick) and updated with
+a plain ``fetch origin`` on every later tick, exactly like `push.py`'s own
+clone-or-fetch step.
+
+Changed paths are computed over the **range** `last_seen_sha..head_sha`
+(the commits new since the last-recorded head) via
+``git log --first-parent --name-only``, not a single commit's own diff —
+`--first-parent` walks main's own line of history one merge at a time,
+which correctly attributes every file a merge commit brought in (verified
+against a real merge commit: the merge's own tree-diff is empty, but
+`--first-parent --name-only` over the range containing it lists the
+merged-in paths) and matches how the bundle repo's history actually looks
+(PRs merge into `main`; no squash, no rebase-off-trunk divergent merges).
+On the very first tick (`last_seen_sha is None`, nothing to range from),
+`-1 head_sha` — a single-commit log — is used instead, since there is no
+prior boundary to range against. Author/subject for the record come from a
+separate, valid single-commit call: ``git show -s --format=%an%x09%s
+<head_sha>`` (``-s`` alone, no ``--name-only``, so the flag conflict above
+does not apply).
 """
 
 from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from backend import classify, state
@@ -52,6 +95,14 @@ from backend.safety import git_safety
 #: `TARGET_REPO`/`TARGET_BASE` (`TGS-Labs/Kiro-Config-Bundles`, `main`).
 BUNDLE_REPO_URL = "https://github.com/TGS-Labs/Kiro-Config-Bundles.git"
 BUNDLE_DEFAULT_BRANCH = "main"
+
+#: Directory name, under the app's own state directory
+#: (`state.get_state_dir()`), that holds the bundle repo's working clone —
+#: the SAME directory name `backend.push` clones/fetches to, so poll and
+#: push share one on-disk clone per host rather than each maintaining its
+#: own (design.md forbids a full clone; sharing one clone means poll's
+#: object-fetch needs never trigger a second one).
+_BUNDLE_CLONE_DIRNAME = "bundle-repo"
 
 #: Root ids `classify.classify_paths` is tried against, matching
 #: `backend/collect.py`'s `_roots()` — the bundle repo's tree interleaves
@@ -125,52 +176,143 @@ def _resolve_remote_head(state_dir_owner: str) -> str:
     return head_sha
 
 
-def _fetch_commit_details(state_dir_owner: str, sha: str) -> Tuple[str, str, List[str]]:
-    """Return ``(author, subject, changed_paths)`` for ``sha`` via a single
+def _ensure_bundle_clone(clone_dir: Path) -> None:
+    """Make sure ``clone_dir`` holds a git clone of the bundle repo, cloning
 
-    hardened ``git show --no-patch --name-only --format=%an%x09%s <sha>``-
-    shaped call, built through `git_safety.git_argv`. One combined call
-    (metadata line, blank separator, then changed paths) rather than two
-    separate git invocations — the standard `git show` shape for "this
-    commit's metadata plus its changed-path list" (design.md: "fetch the
-    commit's changed-path list"), and the format this app's own test
-    fixtures model (`test_poll_pending.py`'s `_show_stdout`).
+    it once if absent and otherwise fetching the latest objects — the same
+    clone-or-fetch shape `backend.push`'s own bundle-repo step uses, and
+    (by design) the SAME directory, so poll and push share one on-disk
+    clone rather than each maintaining a separate one. This is the only
+    place poll.py creates or updates that clone; `_fetch_commit_details`
+    below only ever fetches/reads inside it once it exists.
+
+    Never a full clone on every tick: after the first call the ``.git``
+    directory already exists and this degrades to a plain ``fetch``.
+    """
+    clone_dir.mkdir(parents=True, exist_ok=True)
+    if not (clone_dir / ".git").exists():
+        subprocess.run(
+            git_safety.git_argv(
+                clone_dir.parent, "clone", BUNDLE_REPO_URL, str(clone_dir)
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        subprocess.run(
+            git_safety.git_argv(clone_dir, "fetch", "origin"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _changed_paths_for_range(
+    clone_dir: Path, old_sha: str | None, new_sha: str
+) -> List[str]:
+    """Return the de-duplicated changed-path list for the commits new since
+
+    ``old_sha`` (exclusive) up to and including ``new_sha``, via
+    ``git log --first-parent --name-only``.
+
+    A single commit's own ``git show``/``git diff-tree`` reports an EMPTY
+    path list for a merge commit unless invoked with ``-m``/``-c``
+    (confirmed against a real merge commit) — and Kiro-Config-Bundles
+    disallows squash-merge org-wide, so every real head advance on that
+    repo is itself a merge commit. Walking the ``--first-parent`` RANGE
+    instead correctly attributes every file a merge (or a run of several
+    merges since the last poll) brought in, and matches how the bundle
+    repo's own history looks: PRs merge into `main` one at a time, so
+    `--first-parent` never diverges from that single line.
 
     Args:
-        state_dir_owner: the directory `git_argv`'s ``-C`` targets, matching
-            `_resolve_remote_head`'s convention.
-        sha: the commit to read metadata and changed paths for.
+        clone_dir: the bundle repo's local clone (must already hold
+            ``new_sha`` — the caller fetches first).
+        old_sha: the previously-seen head (``state.last_seen_sha``), or
+            ``None`` on the very first poll ever run, in which case there
+            is no prior boundary to range against and a single-commit log
+            of ``new_sha`` alone is used instead.
+        new_sha: the newly resolved head to walk up to (inclusive).
 
     Returns:
-        A ``(author, subject, changed_paths)`` tuple. ``author``/``subject``
-        are empty strings and ``changed_paths`` is empty if the commit has
-        no readable output.
+        The changed paths across that range, in the order git reports
+        them, with duplicates (a path touched by more than one commit in
+        the range) collapsed to their first occurrence.
     """
-    completed = subprocess.run(
-        git_safety.git_argv(
-            state_dir_owner,
-            "show",
-            "--no-patch",
+    if old_sha:
+        args = [
+            "log",
+            "--first-parent",
             "--name-only",
-            "--format=%an%x09%s",
-            sha,
-        ),
+            "--format=",
+            f"{old_sha}..{new_sha}",
+        ]
+    else:
+        args = ["log", "--first-parent", "--name-only", "--format=", "-1", new_sha]
+
+    completed = subprocess.run(
+        git_safety.git_argv(clone_dir, *args),
         capture_output=True,
         text=True,
         check=True,
     )
     stdout = completed.stdout or ""
-    lines = stdout.splitlines()
-    if not lines:
-        return ("", "", [])
+    seen: Dict[str, None] = {}
+    for line in stdout.splitlines():
+        if line and line not in seen:
+            seen[line] = None
+    return list(seen)
 
-    metadata_line = lines[0]
-    if "\t" in metadata_line:
-        author, subject = metadata_line.split("\t", 1)
+
+def _fetch_commit_details(
+    state_dir_owner: str, sha: str, old_sha: str | None = None
+) -> Tuple[str, str, List[str]]:
+    """Return ``(author, subject, changed_paths)`` for the range up to
+
+    ``sha``, using two valid, hardened git calls against a real object
+    source — never the invalid ``--no-patch``/``--name-only`` combination
+    (git rejects that with exit 128) and never a bare call in a directory
+    with no fetched objects.
+
+    Args:
+        state_dir_owner: the app's own state directory
+            (`state.get_state_dir()`) — the bundle repo's clone is kept at
+            ``state_dir_owner / _BUNDLE_CLONE_DIRNAME``, matching
+            `backend.push`'s own clone location so the two jobs share one
+            on-disk clone.
+        sha: the newly resolved head commit.
+        old_sha: the previously-seen head (``state.last_seen_sha``), or
+            ``None`` on the first-ever poll — forwarded to
+            `_changed_paths_for_range` to select a range vs. a
+            single-commit log.
+
+    Returns:
+        A ``(author, subject, changed_paths)`` tuple. ``author``/``subject``
+        are empty strings if ``sha``'s metadata could not be read (e.g. an
+        empty ``git show`` result on a repo test-double).
+    """
+    clone_dir = Path(state_dir_owner) / _BUNDLE_CLONE_DIRNAME
+    _ensure_bundle_clone(clone_dir)
+
+    metadata_completed = subprocess.run(
+        git_safety.git_argv(clone_dir, "show", "-s", "--format=%an%x09%s", sha),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    metadata_stdout = metadata_completed.stdout or ""
+    metadata_lines = metadata_stdout.splitlines()
+    if not metadata_lines:
+        author, subject = ("", "")
     else:
-        author, subject = (metadata_line, "")
+        metadata_line = metadata_lines[0]
+        if "\t" in metadata_line:
+            author, subject = metadata_line.split("\t", 1)
+        else:
+            author, subject = (metadata_line, "")
 
-    changed_paths = [line for line in lines[1:] if line]
+    changed_paths = _changed_paths_for_range(clone_dir, old_sha, sha)
     return (author, subject, changed_paths)
 
 
@@ -244,7 +386,8 @@ def run() -> PollResult:
     # again until a genuinely NEW head appears (requirements.md 4.4).
 
     state_dir = str(state.get_state_dir())
-    author, subject, changed_paths = _fetch_commit_details(state_dir, head_sha)
+    old_sha = store.last_seen_sha
+    author, subject, changed_paths = _fetch_commit_details(state_dir, head_sha, old_sha)
     classified_paths = _classify_changed_paths(changed_paths)
 
     store.set_pending(
@@ -260,4 +403,5 @@ def run() -> PollResult:
 
 
 if __name__ == "__main__":
-    run()
+    result = run()
+    raise SystemExit(0 if result.outcome != "ls-remote-failed" else 1)

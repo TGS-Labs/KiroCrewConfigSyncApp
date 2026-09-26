@@ -38,7 +38,7 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 from unittest.mock import MagicMock
 
 import pytest
@@ -224,10 +224,15 @@ def test_main_guard_invokes_run_when_executed_as_a_module(
     """WHEN `backend/poll.py` is executed as `__main__` (the
 
     `python3 -m backend.poll` cron entrypoint, requirements.md 4.1) THEN
-    its `if __name__ == "__main__": run()` guard must actually call
-    `run()` — exercised for real via `runpy.run_module`, not skipped, on
-    an unchanged-head tick so the run completes cleanly with no real
+    its `if __name__ == "__main__":` guard must actually call `run()` —
+    exercised for real via `runpy.run_module`, not skipped, on an
+    unchanged-head tick so the run completes cleanly with no real
     network/git access.
+
+    The guard now converts `run()`'s outcome into a process exit code
+    (senior-review H2: a cron `command` target must exit non-zero on
+    failure, requirements.md's error table) — an unchanged-head tick is
+    success, so this must raise `SystemExit(0)`, not return silently.
     """
     sha = "7" * 40
     run_mock = _run_subprocess_mock(stdout=f"{sha}\trefs/heads/main\n")
@@ -246,7 +251,9 @@ def test_main_guard_invokes_run_when_executed_as_a_module(
     # patched.
     monkeypatch.delitem(sys.modules, "backend.poll", raising=False)
     try:
-        runpy.run_module("backend.poll", run_name="__main__", alter_sys=True)
+        with pytest.raises(SystemExit) as exc_info:
+            runpy.run_module("backend.poll", run_name="__main__", alter_sys=True)
+        assert exc_info.value.code == 0
     finally:
         sys.modules["backend.poll"] = poll
 
@@ -547,3 +554,94 @@ def test_ls_remote_failure_sends_no_notification(
         pass
 
     notify_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# `__main__` guard on the ls-remote-failed path — senior-review H2: the cron
+# `command` entrypoint must exit non-zero on failure, matching design.md's
+# error table ("`ls-remote` failure | Poll exits non-zero"). The prior
+# implementation's `if __name__ == "__main__": run()` always exited 0
+# regardless of `run()`'s outcome — a cron scheduler watching the exit code
+# could never distinguish a failed tick from a successful one.
+# ---------------------------------------------------------------------------
+
+
+def test_main_guard_exits_non_zero_when_ls_remote_fails(
+    isolated_state_dir: Path,
+    git_argv_spy: MagicMock,
+    notify_spy: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WHEN `backend/poll.py` is executed as `__main__` and the tick's
+
+    outcome is `"ls-remote-failed"` THEN the process must exit non-zero —
+    exercised for real via `runpy.run_module`, matching
+    `test_main_guard_invokes_run_when_executed_as_a_module`'s convention,
+    but on the failure path this time (senior-review H2).
+    """
+
+    def _raising_run(*args: object, **kwargs: object) -> None:
+        raise subprocess.CalledProcessError(returncode=128, cmd=["git", "ls-remote"])
+
+    monkeypatch.setattr(subprocess, "run", _raising_run)
+    if hasattr(poll, "subprocess"):
+        monkeypatch.setattr(poll.subprocess, "run", _raising_run)
+
+    monkeypatch.delitem(sys.modules, "backend.poll", raising=False)
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            runpy.run_module("backend.poll", run_name="__main__", alter_sys=True)
+        assert exc_info.value.code == 1, (
+            f"expected exit code 1 on an ls-remote-failed tick per "
+            f"design.md's error table ('Poll exits non-zero'); got "
+            f"{exc_info.value.code!r}"
+        )
+    finally:
+        sys.modules["backend.poll"] = poll
+
+
+def test_main_guard_exits_zero_on_a_changed_head(
+    isolated_state_dir: Path,
+    git_argv_spy: MagicMock,
+    notify_spy: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WHEN `backend/poll.py` is executed as `__main__` and the tick's
+
+    outcome is `"changed"` (not a failure) THEN the process must exit 0 —
+    the H2 fix must not conflate "outcome is not literally 'unchanged'"
+    with failure; only `"ls-remote-failed"` is a failure exit.
+    """
+    from backend import state
+
+    old_sha = "9" * 40
+    new_sha = "a" * 40
+    ls_remote_result = _run_subprocess_mock(stdout=f"{new_sha}\trefs/heads/main\n")
+
+    def _sequenced_run(argv: list[str], **kwargs: Any) -> MagicMock:
+        args = list(argv)
+        if "ls-remote" in args:
+            result: MagicMock = ls_remote_result(argv, **kwargs)
+            return result
+        completed = MagicMock(name="CompletedProcess")
+        completed.stdout = ""
+        completed.returncode = 0
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", _sequenced_run)
+    if hasattr(poll, "subprocess"):
+        monkeypatch.setattr(poll.subprocess, "run", _sequenced_run)
+
+    store = state.load_state()
+    store.record_seen_sha(old_sha)
+
+    monkeypatch.delitem(sys.modules, "backend.poll", raising=False)
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            runpy.run_module("backend.poll", run_name="__main__", alter_sys=True)
+        assert exc_info.value.code == 0, (
+            f"a changed-head tick is a successful tick and must exit 0, "
+            f"got {exc_info.value.code!r}"
+        )
+    finally:
+        sys.modules["backend.poll"] = poll

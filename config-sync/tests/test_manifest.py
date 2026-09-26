@@ -227,6 +227,90 @@ class TestCrons:
             f"{result.stderr}"
         )
 
+    def test_poll_cron_command_resolves_the_backend_package_import(self) -> None:
+        """Senior-review H1: `python3 backend/poll.py` has the identical
+
+        ModuleNotFoundError defect the push cron's P1 fix (commit 5ad2bba)
+        already closed — launching poll.py as a plain script puts
+        `.../backend` on `sys.path[0]` rather than the app root, so
+        `from backend import classify, state` inside poll.py raises. The
+        fix is identical in shape: `cd` into the app's installed directory
+        (there is no cwd field in the app-manifest cron schema — verified
+        against `kiro_crew.apps.manifest.CronEntry`) before invoking
+        `python3 -m backend.poll`.
+
+        Mirrors `test_push_cron_command_resolves_the_backend_package_import`
+        exactly, including the import-only probe substitution so `poll.run()`'s
+        real git/network side effects are never triggered from a test.
+        """
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        manifest = _load_app_json()
+        crons = manifest.get("crons", [])
+        poll_cron = next(c for c in crons if "poll" in c.get("name", "").lower())
+        command = poll_cron.get("command", "")
+        assert command, "the poll cron must declare a 'command'"
+        assert "python3 -m backend.poll" in command, (
+            "the poll cron's command must invoke the module by dotted path "
+            f"(`python3 -m backend.poll`), not a script path; got: {command!r}"
+        )
+        import_probe_command = command.replace(
+            "python3 -m backend.poll", 'python3 -c "import backend.poll"'
+        )
+
+        with tempfile.TemporaryDirectory() as fake_home_str:
+            fake_home = Path(fake_home_str)
+            installed_app_dir = fake_home / ".kiro" / "crew" / "apps" / "config-sync"
+            installed_app_dir.mkdir(parents=True)
+            shutil.copytree(APP_ROOT / "backend", installed_app_dir / "backend")
+
+            env = {
+                "HOME": str(fake_home),
+                "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+            }
+            result = subprocess.run(
+                ["sh", "-c", import_probe_command],
+                cwd=str(fake_home),
+                env=env,
+                executable=shutil.which("sh") or "/bin/sh",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+
+        assert result.returncode == 0 and "ModuleNotFoundError" not in result.stderr, (
+            "the poll cron command must resolve `backend`'s package "
+            f"imports regardless of the launching shell's own cwd; stderr:\n"
+            f"{result.stderr}"
+        )
+
+    def test_poll_cron_is_silent_for_parity_with_the_push_cron(self) -> None:
+        """Both crons are quiet, zero-token `command` targets on the same
+
+        15-minute cadence (design.md); the push cron already declares
+        `"silent": true` (commit 5ad2bba) and the poll cron must match for
+        parity — an unchanged head is the common tick outcome for poll too,
+        and should not surface cron-runner chatter any more than push's
+        common no-op tick does.
+        """
+        manifest = _load_app_json()
+        crons = manifest.get("crons", [])
+        poll_cron = next(c for c in crons if "poll" in c.get("name", "").lower())
+        push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
+
+        assert push_cron.get("silent") is True, (
+            "expected the push cron to already declare silent:true "
+            "(precondition for this parity test)"
+        )
+        assert poll_cron.get("silent") is True, (
+            'the poll cron must declare "silent": true for parity with '
+            "the push cron (senior-review H1)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # app.json: scaffold sample-agent / sample-skill entries removed
