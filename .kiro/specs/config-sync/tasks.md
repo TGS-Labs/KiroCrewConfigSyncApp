@@ -301,9 +301,17 @@ deployment has merged, per the folder-scoped PR-first workflow.
         changed-file list), push-now, approve and decline — approve being the
         only route from which an apply can begin — with every route refusing
         while the app is disabled and no response field carrying an unredacted
-        credential.
+        credential. Approve and decline call a single `resolve_pending()` in
+        `state.py` that advances `base_sha` to the decided SHA and clears the
+        pending record together (never one without the other), and each route
+        refuses if the pending record's `sha` no longer matches what the
+        operator actually saw (a poll tick accumulated a newer commit into it
+        after the approve/decline UI was rendered) — otherwise the operator's
+        decision would be applied against files they never reviewed, or a
+        declined commit's files would resurface on the next poll tick as if
+        never decided (Kiro-Config-Bundles#65).
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 7.1, 7.2, 7.4, 7.5_
+    _Requirements: 4.9, 7.1, 7.2, 7.4, 7.5_
 
   - [ ] 6.2 The restore route returns the instance to the exact bytes recorded
         before a chosen apply, using only the local restore directory with no

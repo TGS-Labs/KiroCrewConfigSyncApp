@@ -170,9 +170,12 @@ behaviour behind my back.
    current the LAST TIME the operator actually approved or declined a pending
    commit (or, before any decision has ever been made, the first commit this
    instance ever polled) — and NOT from `last_seen_sha`, which advances on
-   every tick regardless of pending state. `base_sha` SHALL NOT advance while a
-   commit is pending; it SHALL advance only when the operator approves or
-   declines, to the SHA that was just approved or declined. The pending
+   every tick regardless of pending state. `base_sha` SHALL NOT advance while
+   a commit is pending — including at the moment a fresh pending record is
+   first created, where it is initialized to that record's own head rather
+   than "advanced" from a prior value — and SHALL advance ONLY when the
+   operator approves or declines, to the SHA that was just approved or
+   declined. The pending
    record's `sha` field SHALL always reflect the newest head seen, so the
    operator is always shown the full accumulated diff since their last actual
    decision, never a partial view that silently drops an earlier unapplied

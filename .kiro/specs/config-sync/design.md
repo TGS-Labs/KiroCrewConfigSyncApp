@@ -141,8 +141,14 @@ Changed → fetch the changed-path list for the range `base_sha..head` (never
 path against the allowlist, and either start or ACCUMULATE INTO the `pending`
 record in state (merge, not overwrite, when a commit is already pending), then
 notify once. Re-notification is keyed on the head SHA, so a pending commit does
-not re-nag every 15 minutes, and an accumulating tick's notification makes
-clear the pending set grew rather than reads as an unrelated new commit.
+not re-nag every 15 minutes. NOTE: as shipped in Deployment 3, an accumulating
+tick's notification carries the same head_sha/author/subject/touched_classes
+shape as a fresh one and does not itself distinguish "this replaces an earlier
+notification for a still-pending commit" from "this is a brand-new pending
+commit" — the operator can tell the two apart only by checking the app's own
+pending-record state (`base_sha` vs `pending.sha`). Making the notification
+text itself say "accumulated N commits since <base_sha>" is not built and is
+tracked as an open enhancement, not a Deployment 3 requirement.
 
 Modelled on the polling shape of
 `kiro_crew/apps/builtins/ops_mission_control/backend/providers/github_issues.py`;
