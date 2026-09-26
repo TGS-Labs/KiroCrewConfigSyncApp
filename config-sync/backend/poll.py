@@ -586,9 +586,10 @@ def run() -> PollResult:
     # changed-path log calls) or pure computation (classification) — any
     # of it can raise (CalledProcessError from a git subprocess, OSError
     # from an unreadable/unwritable clone directory, or GitSafetyError from
-    # `git_safety.git_argv`'s own attributes-pin check). `app.json`'s poll
-    # cron is `"silent": true`, so an uncaught exception here would leave a
-    # persistently failing poll completely invisible: no `PollResult`
+    # `git_safety.git_argv`'s own attributes-pin check). Before round 4 fixed
+    # H-A, `app.json`'s poll cron was `"silent": true`, so an uncaught
+    # exception here would have left a persistently failing poll completely
+    # invisible: no `PollResult`
     # reaches the caller, nothing is recorded, and the cron runner just
     # sees a bare stack trace with no failure record to alert on (push.py
     # has `record_push_failure` for its own equivalent failures; poll had

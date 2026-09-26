@@ -294,12 +294,14 @@ class StateStore:
         """Record a failed poll tick (`outcome="fetch-failed"`), mirroring
 
         `record_push_failure`'s shape for the poll job's own equivalent
-        failure path (senior-review round-3 M2/L1). `app.json`'s poll cron
-        is `"silent": true`, so without this a persistently failing poll
+        failure path (senior-review round-3 M2/L1). Even though `app.json`'s
+        poll cron is `"silent": false` since round 4 (so a failing tick's
+        stdout does surface to the operator), a persistently failing poll
         (the bundle-repo clone/fetch, the commit-metadata/changed-path git
-        calls, or classification itself all raising) is visible only in
-        the cron runner's own exit-history, never in the app's own state —
-        the same "invisible failure" gap `_FAILURE_OUTCOMES`/`fetch-failed`
+        calls, or classification itself all raising) still needs to be
+        visible in the app's OWN state — not only in the cron runner's
+        exit-history — the same "invisible failure" gap `_FAILURE_OUTCOMES`/
+        `fetch-failed`
         already exists to surface at the `PollResult` level, now also
         surfaced at the persisted-state level so the app's own UI can show
         it. Never changes `last_seen_sha` (poll's own `run()` already
