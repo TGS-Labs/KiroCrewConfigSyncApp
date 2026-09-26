@@ -613,6 +613,45 @@ class StateStore:
         self._payload["pending"] = None
         self._save()
 
+    def resolve_pending(self, sha: str) -> None:
+        """Resolve the pending record against an operator decision — the
+
+        single call ``backend/routes.py``'s approve AND decline handlers
+        both make (tasks.md 6.1; design.md's routes section: "Approve and
+        decline call a single ``resolve_pending()`` in ``state.py`` that
+        advances ``base_sha`` to the decided SHA and clears the pending
+        record together (never one without the other)").
+
+        Advances ``base_sha`` to ``sha`` and clears ``pending`` in ONE
+        persisted write — never as two separate ``advance_base_sha()`` /
+        ``clear_pending()`` calls, which would reopen a window where a
+        crash between the two leaves ``base_sha`` advanced but ``pending``
+        still present (or vice versa).
+
+        Args:
+            sha: the SHA the caller (approve or decline) asserts the
+                operator actually decided on.
+
+        Raises:
+            ValueError: when there is no pending record at all, or when
+                ``sha`` does not match ``pending["sha"]`` — the
+                Kiro-Config-Bundles#65 staleness case: a poll tick
+                accumulated a newer commit into ``pending`` after the
+                operator's approve/decline UI was rendered against an
+                older SHA. Neither ``base_sha`` nor ``pending`` is
+                changed on refusal, so a stale decision never applies (or
+                clears) a commit the operator never actually reviewed.
+        """
+        pending = self._payload["pending"]
+        if pending is None or pending.get("sha") != sha:
+            raise ValueError(
+                f"no pending commit matching sha {sha!r} to resolve "
+                "(nothing pending, or a newer commit has since accumulated)"
+            )
+        self._payload["base_sha"] = sha
+        self._payload["pending"] = None
+        self._save()
+
     def record_restore_dir(self, *, apply_id: str, restore_dir: str) -> None:
         """Record a restore-directory mapping for a previous apply."""
         self._payload["restore_dirs"][apply_id] = restore_dir
