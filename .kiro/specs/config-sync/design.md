@@ -13,8 +13,8 @@ action; one dashboard page renders it.
 ```
                       ┌──────────────── PUSH (cron, command, zero LLM) ────────────────┐
   root A: KIROCREW_HOME│                                                               │
-  root B: KIRO_HOME    │  collector ─► redactor ─► hash ─┬─ unchanged ─► exit 0 (no-op) │
-  (allowlist.py)       │                                 │                             │
+  root B: KIRO_HOME    │  collector ─► redactor ─► tokenize ─► hash ─┬─ unchanged ─► no-op │
+  (allowlist.py)       │                                             │                   │
                        │                                 └─ changed ─► secret scan ─►  │
                        │     git_safety.git_argv() clone/commit ─► feature branch ─►    │
                        │     PR (never main) ─► record pushed hash ─► state.json        │
@@ -29,7 +29,8 @@ action; one dashboard page renders it.
                        user approves in UI ─────┘
                                                 ▼
                        ┌──────────────── APPLY (backend route, in request) ────────────┐
-                       │  backup ─► filter to allowlist ─► sanitize crons/instances ─► │
+                       │  backup ─► filter to allowlist ─► expand root tokens ─►       │
+                       │  restore redacted values ─► sanitize crons/instances ─►       │
                        │  write ─► invalidate caches ─► per-class propagation report   │
                        └──────────────────────────────────────────────────────────────┘
 ```
