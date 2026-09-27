@@ -257,30 +257,36 @@ class StateStore:
     def _locked_rmw(self, mutate: Callable[[dict[str, Any]], None]) -> None:
         """Run ``mutate(payload)`` under the cross-process file lock,
 
-        against a payload that starts from this instance's own in-memory
-        view (``self._payload``) and is then overlaid with any field a
-        concurrent writer has since persisted to disk. This is the
-        mechanism every mutation method below routes through: it is what
-        stops a concurrent poll/push/server process's already-saved
-        fields from being reverted by this call's write (senior-review
-        C1), WITHOUT discarding a field this instance itself set
-        in-memory but has not yet persisted (e.g. a caller using the
-        `last_pushed_hash` test setter to seed a scenario before
-        exercising a method that mutates a DIFFERENT field entirely —
-        that seeded value is this instance's own not-yet-saved state, not
-        staleness, and must survive).
+        against a payload freshly loaded from disk — never a merge with
+        this instance's own possibly-stale in-memory view.
 
-        Concretely: start from ``dict(self._payload)``, then for every
-        field that differs from `_fresh_defaults()` in the just-reread
-        on-disk copy, take the ON-DISK value — that is exactly the set of
-        fields a concurrent process could plausibly have changed since
-        this instance last loaded. A field neither side has touched
-        (still at its default) is unaffected either way. ``mutate``
-        receives this merged payload and mutates it in-place; the field
-        lookups it needs (e.g. `current["pending"]` for
-        `accumulate_pending`'s merge) MUST read from that same merged
-        dict — never a separate `self._payload` reference — so the merge
-        of a concurrent write is what the mutation itself sees too.
+        A per-field "adopt the disk value only if it differs from the
+        field's default" merge (the previous shape of this method) is
+        indistinguishable, from the on-disk value alone, between "no
+        concurrent process has touched this field" and "a concurrent
+        process just cleared this field back to its default" — both read
+        as "disk equals default". The second case is exactly what a
+        concurrent `resolve_pending`/`confirm_pr_created`/etc. produces,
+        and the old merge silently kept THIS instance's stale, already-
+        superseded non-default value and wrote it straight back on the
+        next unrelated mutation, resurrecting a field another process had
+        deliberately cleared (senior-review round-3, Kiro-Config-Bundles).
+
+        The only correct source of truth for "what does this mutation
+        apply on top of" is the newest on-disk payload, full stop — not a
+        merge with anything this instance loaded earlier. ``mutate``
+        receives that fresh-from-disk payload and mutates it in-place;
+        every field lookup a mutation needs (e.g. `current["pending"]` for
+        `accumulate_pending`'s merge) reads from that same freshly-loaded
+        dict, so a concurrent write is exactly what the mutation itself
+        sees.
+
+        This does mean a value set via `last_pushed_hash`'s test-only
+        setter (in-memory only, never persisted) does NOT survive a
+        `_locked_rmw` call made afterward — correctly so: an unpersisted
+        in-memory value is not a real concurrent-write case this method
+        needs to protect, and a caller wanting it to persist should call
+        a real mutation method instead of the raw setter.
 
         After a successful write, ``self._payload`` is replaced with the
         just-written payload so this instance's own subsequent reads
@@ -291,16 +297,10 @@ class StateStore:
         """
         lock_path = self._path.parent / _LOCK_FILE_NAME
         with _file_lock(lock_path):
-            on_disk = _load_payload(self._path)
-            defaults = _fresh_defaults()
-            merged = dict(self._payload)
-            for key, default_value in defaults.items():
-                disk_value = on_disk.get(key, default_value)
-                if disk_value != default_value:
-                    merged[key] = disk_value
-            mutate(merged)
+            fresh = _load_payload(self._path)
+            mutate(fresh)
             previous = self._payload
-            self._payload = merged
+            self._payload = fresh
             try:
                 self._save()
             except Exception:
@@ -760,6 +760,84 @@ class StateStore:
                     merged_ignored.append(relpath)
             # A path newly classified this tick must not remain in the
             # accumulated ignored list even if an earlier tick ignored it.
+            merged_ignored = [
+                relpath
+                for relpath in merged_ignored
+                if relpath not in merged_classified
+            ]
+
+            merged_touched: set[str] = set(current.get("touched_classes") or [])
+            merged_touched.update(touched_classes or [])
+
+            fresh["pending"] = {
+                "sha": sha,
+                "author": author,
+                "subject": subject,
+                "classified_paths": merged_classified,
+                "ignored_paths": merged_ignored,
+                "touched_classes": sorted(merged_touched),
+            }
+
+        self._locked_rmw(_mutate)
+
+    def record_poll_pending(
+        self,
+        *,
+        sha: str,
+        author: str,
+        subject: str,
+        classified_paths: dict[str, str],
+        ignored_paths: list[str] | None = None,
+        touched_classes: list[str] | None = None,
+    ) -> None:
+        """Decide between `set_pending` (no existing pending record) and
+
+        accumulating onto one (the `accumulate_pending` merge semantics),
+        in ONE lock acquisition, choosing from the FRESH on-disk `pending`
+        value rather than a value the caller read outside the lock.
+
+        This is `poll.py`'s single entry point for recording a
+        changed-head tick's classified paths — it replaces the caller-side
+        pattern of reading `store.pending` (a snapshot that can already be
+        stale by the time the lock is taken) and then calling
+        `set_pending` or `accumulate_pending` accordingly. Deciding outside
+        the lock can choose wrong: e.g. this instance's in-memory `pending`
+        still shows a record another process resolved moments ago, so the
+        caller would wrongly call `accumulate_pending` (which raises,
+        since there is nothing to accumulate onto) instead of
+        `set_pending` for what is actually an unrelated new commit.
+
+        Merge semantics when accumulating exactly match `accumulate_pending`
+        (paths keyed union with the newest classification winning,
+        ignored-paths union minus anything now classified, touched-classes
+        union) — duplicated here rather than delegated to it because the
+        decision and the write must happen against the SAME fresh payload
+        under the SAME lock acquisition; calling out to `accumulate_pending`
+        would re-enter `_locked_rmw` a second time against a payload that
+        could have changed again in between.
+        """
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            current = fresh["pending"]
+            if current is None:
+                fresh["base_sha"] = sha
+                fresh["pending"] = {
+                    "sha": sha,
+                    "author": author,
+                    "subject": subject,
+                    "classified_paths": dict(classified_paths),
+                    "ignored_paths": list(ignored_paths or []),
+                    "touched_classes": list(touched_classes or []),
+                }
+                return
+
+            merged_classified: dict[str, str] = dict(current["classified_paths"])
+            merged_classified.update(classified_paths)
+
+            merged_ignored: list[str] = list(current.get("ignored_paths") or [])
+            for relpath in ignored_paths or []:
+                if relpath not in merged_ignored:
+                    merged_ignored.append(relpath)
             merged_ignored = [
                 relpath
                 for relpath in merged_ignored

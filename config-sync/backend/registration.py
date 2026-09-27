@@ -422,16 +422,7 @@ def check_registrations(
                     _MODEL_STATE_RELPATH, agent_name
                 )
 
-    # Third pass: block a required prompt file only when EVERY agent
-    # that requires it is incomplete (requirements.md 5.13).
-    for relpath, requirers in prompt_requirers.items():
-        if relpath not in changed_set:
-            continue
-        if all(requirer in result.incomplete_agents for requirer in requirers):
-            if relpath not in result.blocked_paths:
-                result.blocked_paths.append(relpath)
-
-    # Fourth pass (C3, fail-closed interim ruling pending operator
+    # Third pass (C3, fail-closed interim ruling pending operator
     # confirmation): if config.json or agent_model_state.json is blocked
     # from applying (because some agent in the commit is incomplete),
     # then EVERY agent whose key is present in that committed shared
@@ -443,6 +434,15 @@ def check_registrations(
     # file. This prevents an agent ever being left half-registered:
     # config.json refused, but a picker/planner reading complete_agents
     # believing that agent's shared-file entry is live.
+    #
+    # Runs BEFORE the fourth pass (prompt-file blocking) so the prompt
+    # pass sees a fixed point of incomplete_agents that already
+    # includes every C3-swept-in agent -- otherwise an agent judged
+    # complete by the second pass, then swept into incomplete_agents
+    # here, would have its own required prompt file already judged
+    # "not blocked" by an earlier prompt pass and never revisited,
+    # leaving that prompt file free to apply live while the agent
+    # itself is reported incomplete (Requirement 5.15).
     for shared_relpath, keyholders in (
         (_CONFIG_RELPATH, config_keyholders.get(_CONFIG_RELPATH, [])),
         (_MODEL_STATE_RELPATH, model_state_keyholders.get(_MODEL_STATE_RELPATH, [])),
@@ -470,6 +470,18 @@ def check_registrations(
                 and keyholder_def_path not in result.blocked_paths
             ):
                 result.blocked_paths.append(keyholder_def_path)
+
+    # Fourth pass: block a required prompt file only when EVERY agent
+    # that requires it is incomplete (requirements.md 5.13). Runs AFTER
+    # the C3 cascade above so this check sees the fixed point of
+    # incomplete_agents -- including every agent C3 swept in -- rather
+    # than the second pass's pre-C3 snapshot.
+    for relpath, requirers in prompt_requirers.items():
+        if relpath not in changed_set:
+            continue
+        if all(requirer in result.incomplete_agents for requirer in requirers):
+            if relpath not in result.blocked_paths:
+                result.blocked_paths.append(relpath)
 
     # A changed path is "unrelated" only when no registration this commit
     # touches claims it: every changed agent definition path is claimed

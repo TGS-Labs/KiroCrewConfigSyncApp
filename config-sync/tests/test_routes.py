@@ -260,11 +260,13 @@ class TestApproveDeclineResolvePending:
         sha = "cccccccccccccccccccccccccccccccccccccc"
         _seed_pending(store, sha=sha)
         monkeypatch.setattr(routes_module, "apply_commit", _ApplySpy())
+        commit_root = tmp_path / "commit-tree"
+        commit_root.mkdir()
         monkeypatch.setattr(
             routes_module,
             "_materialize_pending_commit",
             lambda _store, _sha: (
-                tmp_path,
+                commit_root,
                 {"A": [], "B": []},
                 {"A": [], "B": []},
             ),

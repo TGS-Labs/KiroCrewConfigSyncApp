@@ -675,6 +675,77 @@ def _changed_mcp_commands(
     return changed
 
 
+def _dropped_hook_commands(
+    pre_sanitize_doc: Dict[str, Any], dropped_names: List[str], relpath: str
+) -> List[Dict[str, str]]:
+    """Requirements.md 6.10: every ``hooks.json`` hook the vet DROPPED,
+
+    shaped ``{"file", "name", "command"}`` exactly like
+    :func:`_changed_hook_commands`'s survivors — 6.10 lists a dropped
+    command "whether it survives the vet or is dropped under 6.9", so
+    ``changed_commands`` must carry it too, not only
+    ``dropped_cron_names``. Read from ``pre_sanitize_doc`` (the document
+    as it stood immediately before ``sanitize_hooks`` removed the
+    dropped entries), never from the already-sanitized store, since a
+    dropped hook is by definition absent from the sanitized document.
+    """
+    if not dropped_names:
+        return []
+    dropped_set = set(dropped_names)
+    entries: List[Dict[str, str]] = []
+    for hook in pre_sanitize_doc.get("hooks", []):
+        if not isinstance(hook, dict):
+            continue
+        name = _hook_display_name(hook)
+        if name not in dropped_set:
+            continue
+        command = hook.get("command")
+        entries.append(
+            {
+                "file": relpath,
+                "name": name,
+                "command": command if isinstance(command, str) else str(command),
+            }
+        )
+    return entries
+
+
+def _dropped_mcp_commands(
+    pre_sanitize_doc: Dict[str, Any], dropped_names: List[str], relpath: str
+) -> List[Dict[str, str]]:
+    """Requirements.md 6.10: every ``mcp.json`` server the vet DROPPED,
+
+    shaped ``{"file", "name", "command"}`` exactly like
+    :func:`_changed_mcp_commands`'s survivors. Read from
+    ``pre_sanitize_doc`` (the document before ``sanitize_mcp_servers``
+    removed the dropped entries) so the command string is still there
+    to report.
+    """
+    if not dropped_names:
+        return []
+    dropped_set = set(dropped_names)
+    servers = pre_sanitize_doc.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return []
+    entries: List[Dict[str, str]] = []
+    for name, server in servers.items():
+        if not isinstance(name, str) or name not in dropped_set:
+            continue
+        if not isinstance(server, dict):
+            entries.append({"file": relpath, "name": name, "command": ""})
+            continue
+        command = server.get("command")
+        args = server.get("args", [])
+        args_list = [str(item) for item in args] if isinstance(args, list) else []
+        command_str = (
+            shlex.join([command, *args_list])
+            if isinstance(command, str) and command
+            else str(command)
+        )
+        entries.append({"file": relpath, "name": name, "command": command_str})
+    return entries
+
+
 def _split_by_root(paths: Dict[str, List[str]]) -> List[tuple]:
     """Flatten a ``{"A": [...], "B": [...]}`` mapping to ``(root, relpath)``
 
@@ -890,6 +961,11 @@ def _apply_one_file(
                 changed_commands.extend(
                     _changed_hook_commands(command_final_doc, live_doc, relpath)
                 )
+                changed_commands.extend(
+                    _dropped_hook_commands(
+                        restored_doc, hook_result.dropped_names, relpath
+                    )
+                )
                 restored_doc = command_final_doc
             elif relpath == _MCP_RELPATH:
                 mcp_result = sanitize.sanitize_mcp_servers(restored_doc, vet=cron_vet)
@@ -897,6 +973,11 @@ def _apply_one_file(
                 command_final_doc = mcp_result.sanitized_store
                 changed_commands.extend(
                     _changed_mcp_commands(command_final_doc, live_doc, relpath)
+                )
+                changed_commands.extend(
+                    _dropped_mcp_commands(
+                        restored_doc, mcp_result.dropped_names, relpath
+                    )
                 )
                 restored_doc = command_final_doc
             content_to_write = (

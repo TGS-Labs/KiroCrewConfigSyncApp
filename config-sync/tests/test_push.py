@@ -35,12 +35,15 @@ from __future__ import annotations
 import subprocess
 import threading
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 from unittest.mock import MagicMock
 
 import pytest
 
 from backend import push
+
+if TYPE_CHECKING:
+    from backend import state
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,21 @@ def _write(root: Path, relpath: str, content: bytes = b"content") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
+
+
+def _seed_last_pushed_hash(store: state.StateStore, tree_hash: str) -> None:
+    """Persist `tree_hash` as `last_pushed_hash` through the store's own
+
+    public write path, rather than the in-memory-only `last_pushed_hash`
+    setter. `StateStore` is disk-authoritative (senior-review C1): every
+    `_locked_rmw` mutation reloads `state.json` fresh from disk and applies
+    only its own change, so a seed that never reached disk is silently
+    discarded by the very first mutation push.run() makes. Uses
+    `record_push_success` — the only public method that persists this
+    field — so the seed survives any subsequent mutation exactly like a
+    real prior successful push would.
+    """
+    store.record_push_success(tree_hash=tree_hash, branch="seed-branch", pr_url=None)
 
 
 @pytest.fixture
@@ -150,7 +168,7 @@ def test_matching_hash_makes_no_git_or_network_call(
     from backend import state
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", current_hash, raising=False)
+    _seed_last_pushed_hash(store, tree_hash=current_hash)
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     push.run()
@@ -178,7 +196,7 @@ def test_matching_hash_returns_a_no_op_result(
     current_hash = push.tree_hash(redacted)
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", current_hash, raising=False)
+    _seed_last_pushed_hash(store, tree_hash=current_hash)
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     result = push.run()
@@ -208,7 +226,7 @@ def test_matching_hash_on_empty_tree_is_also_a_no_op(
     current_hash = push.tree_hash(redacted)
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", current_hash, raising=False)
+    _seed_last_pushed_hash(store, tree_hash=current_hash)
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     push.run()
@@ -236,7 +254,7 @@ def test_matching_hash_leaves_last_pushed_hash_unchanged(
     current_hash = push.tree_hash(redacted)
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", current_hash, raising=False)
+    _seed_last_pushed_hash(store, tree_hash=current_hash)
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     push.run()
@@ -270,7 +288,7 @@ def test_matching_hash_never_calls_scan_content_for_secrets(
     current_hash = push.tree_hash(redacted)
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", current_hash, raising=False)
+    _seed_last_pushed_hash(store, tree_hash=current_hash)
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     push.run()
@@ -414,7 +432,7 @@ def test_run_is_callable_with_no_arguments_matching_a_command_cron_target(
     current_hash = push.tree_hash(redacted)
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", current_hash, raising=False)
+    _seed_last_pushed_hash(store, tree_hash=current_hash)
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     import inspect
@@ -492,6 +510,14 @@ def _seed_changed_hash(monkeypatch: pytest.MonkeyPatch) -> tuple:
     driving push.run() down the change-path seam rather than the no-op
     early return. Returns (store, current_hash, redacted_tree) so a test
     can assert against the exact bytes push.py must have written.
+
+    Seeds through `record_push_success` — a real persisted mutation —
+    rather than the in-memory-only `last_pushed_hash` setter, because
+    `StateStore` is now disk-authoritative (senior-review C1): every
+    `_locked_rmw` mutation reloads `state.json` fresh and applies only its
+    own change, so an unpersisted in-memory seed is silently discarded by
+    the very first mutation push.run() makes (e.g. `record_push_failure`
+    on a refusal path). Persisting the seed is what makes it survive.
     """
     from backend import collect, redact, state
 
@@ -500,7 +526,7 @@ def _seed_changed_hash(monkeypatch: pytest.MonkeyPatch) -> tuple:
     current_hash = push.tree_hash(redacted)
 
     store = state.load_state()
-    monkeypatch.setattr(store, "last_pushed_hash", "a-completely-different-hash")
+    _seed_last_pushed_hash(store, tree_hash="a-completely-different-hash")
     monkeypatch.setattr(state, "load_state", lambda: store, raising=False)
 
     return store, current_hash, redacted

@@ -570,16 +570,17 @@ def run() -> PollResult:
     # NOTE: no separate "already pending for this exact SHA" guard is
     # needed here for the NOTIFICATION cycle. `run()` always advances
     # `state.last_seen_sha` to `head_sha` in the SAME tick it calls
-    # `state.set_pending`/`state.accumulate_pending` below, so
+    # `state.record_poll_pending` below, so
     # `last_seen_sha == pending["sha"]` holds as an invariant from that
     # point on — a later tick reporting that SAME still-pending SHA is
     # already caught by the `head_sha == store.last_seen_sha` check above
     # and returns "unchanged" before reaching this point. But a
     # GENUINELY NEW head arriving while a commit is still pending DOES
-    # reach this point again — that is the accumulation case handled just
-    # below (`store.pending is None` selects `set_pending` vs
-    # `accumulate_pending`), not a case this comment is claiming is
-    # excluded.
+    # reach this point again — that is the accumulation case
+    # `state.record_poll_pending` decides internally (from the fresh
+    # on-disk `pending` value, under its own lock — never from this
+    # process's possibly-stale in-memory `store.pending`), not a case
+    # this comment is claiming is excluded.
 
     # H-new-1 (senior review round 2): everything from here on is a git
     # call (the bundle-repo clone/fetch, the commit-metadata and
@@ -627,24 +628,14 @@ def run() -> PollResult:
         store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
-    if store.pending is None:
-        store.set_pending(
-            sha=head_sha,
-            author=author,
-            subject=subject,
-            classified_paths=classified_paths,
-            ignored_paths=ignored_paths,
-            touched_classes=touched_classes,
-        )
-    else:
-        store.accumulate_pending(
-            sha=head_sha,
-            author=author,
-            subject=subject,
-            classified_paths=classified_paths,
-            ignored_paths=ignored_paths,
-            touched_classes=touched_classes,
-        )
+    store.record_poll_pending(
+        sha=head_sha,
+        author=author,
+        subject=subject,
+        classified_paths=classified_paths,
+        ignored_paths=ignored_paths,
+        touched_classes=touched_classes,
+    )
 
     # H3 (senior review round 1, still open going into round 2): advance
     # `last_seen_sha` to `head_sha` BEFORE notifying, not after. If

@@ -237,30 +237,70 @@ class CommandSanitizeResult:
     dropped_names: List[str] = field(default_factory=list)
 
 
-def _hook_shell_command(hook: Dict[str, Any]) -> str:
-    """Return a ``hooks.json`` entry's own shell command, or ``""`` when it
+class _MalformedCommand:
+    """Sentinel type: the entry carries a ``command``/``args`` shape the
 
-    carries none. A ``ScriptHook`` has no ``args`` field — its ``command``
-    is already the complete shell string to vet, unlike an ``mcp.json``
-    server entry.
+    vet cannot be run against (a non-string ``command``, a non-list
+    ``args``, or an ``args`` element that is not itself a string).
+    Distinct from ``""`` ("no command at all, never vetted, always
+    kept") — a malformed shape must fail closed exactly like a vet
+    rejection (Requirement 6.9), never be silently treated as absent or
+    coerced with ``str()``. A dedicated class (rather than a bare
+    ``object()``) so call sites can narrow the return type with
+    ``isinstance(result, _MalformedCommand)`` instead of an ``is``
+    comparison against a module-level constant that mypy cannot use to
+    narrow a ``str | object`` union down to ``str``.
     """
+
+
+_MALFORMED_COMMAND = _MalformedCommand()
+
+
+def _hook_shell_command(hook: Dict[str, Any]) -> "str | _MalformedCommand":
+    """Return a ``hooks.json`` entry's own shell command, ``""`` when it
+
+    carries none, or ``_MALFORMED_COMMAND`` when ``command`` is present
+    but not a string. A ``ScriptHook`` has no ``args`` field — its
+    ``command`` is already the complete shell string to vet, unlike an
+    ``mcp.json`` server entry.
+    """
+    if "command" not in hook:
+        return ""
     command = hook.get("command")
-    return command if isinstance(command, str) else ""
+    if command is None:
+        return ""
+    if not isinstance(command, str):
+        return _MALFORMED_COMMAND
+    return command
 
 
-def _mcp_server_shell_command(server: Dict[str, Any]) -> str:
+def _mcp_server_shell_command(server: Dict[str, Any]) -> "str | _MalformedCommand":
     """Return an ``mcp.json`` server entry's shell-joined ``command`` +
 
-    ``args``, matching how the real subprocess is actually invoked — vetting
-    ``command`` alone would miss an injection smuggled through ``args``
-    (e.g. ``args: ["$(whoami)"]``).
+    ``args``, matching how the real subprocess is actually invoked —
+    vetting ``command`` alone would miss an injection smuggled through
+    ``args`` (e.g. ``args: ["$(whoami)"]``). Returns ``""`` when the
+    server carries no command at all, or ``_MALFORMED_COMMAND`` when
+    ``command`` is present but not a string, ``args`` is present but not
+    a list, or any ``args`` element is not itself a string — each of
+    those shapes must fail closed rather than be silently treated as an
+    empty/absent command or args list.
     """
+    if "command" not in server:
+        return ""
     command = server.get("command")
-    if not isinstance(command, str) or not command:
+    if command is None:
+        return ""
+    if not isinstance(command, str):
+        return _MALFORMED_COMMAND
+    if not command:
         return ""
     args = server.get("args", [])
-    args_list = [str(item) for item in args] if isinstance(args, list) else []
-    return shlex.join([command, *args_list])
+    if not isinstance(args, list):
+        return _MALFORMED_COMMAND
+    if not all(isinstance(item, str) for item in args):
+        return _MALFORMED_COMMAND
+    return shlex.join([command, *args])
 
 
 def sanitize_hooks(
@@ -298,6 +338,9 @@ def sanitize_hooks(
             kept.append(hook)
             continue
         command = _hook_shell_command(hook)
+        if isinstance(command, _MalformedCommand):
+            dropped_names.append(_name_of(hook))
+            continue
         if command:
             try:
                 reason = active_vet(command)
@@ -351,6 +394,9 @@ def sanitize_mcp_servers(
             kept[name] = server
             continue
         command = _mcp_server_shell_command(server)
+        if isinstance(command, _MalformedCommand):
+            dropped_names.append(name if isinstance(name, str) else str(name))
+            continue
         if command:
             try:
                 reason = active_vet(command)
