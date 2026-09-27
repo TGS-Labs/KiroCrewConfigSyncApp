@@ -520,10 +520,15 @@ landed from `main` without reading logs.
 5. WHEN the app is disabled THEN every backend route SHALL refuse the request,
    so the app is inert until explicitly enabled.
 6. No UI field or API response SHALL contain an unredacted credential.
-7. Every state-mutating POST route (push-now, undo) SHALL require the request
-   header `X-Config-Sync-Request: 1`; a request without it SHALL be refused,
-   so a request from outside the dashboard's own client cannot trigger a
-   mutation.
+7. Every state-mutating POST route (push-now, undo) SHALL refuse a request
+   that a browser marks as cross-site — `Sec-Fetch-Site` other than
+   `same-origin`/`none`, or, when that header is absent, an `Origin` whose
+   host differs from the request's own loopback `Host` — and SHALL refuse a
+   non-loopback `Host`; a request from another site open in the operator's
+   browser therefore cannot trigger a mutation. (The dashboard's real
+   `@kirocrew/app-sdk` `post()` cannot attach a custom header, so the
+   original `X-Config-Sync-Request: 1` rule is superseded by this
+   fetch-metadata check.)
 
 ### Requirement 8
 

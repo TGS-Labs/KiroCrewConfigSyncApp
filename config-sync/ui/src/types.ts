@@ -1,17 +1,28 @@
 // Shared response shapes for the config-sync dashboard page.
 //
-// These mirror requirements.md Requirement 7 / design.md's "backend/routes.py
-// and the UI" section, and the field names `backend/routes.py::status()` /
-// `_apply_result_to_dict()` already use where the design and the code agree.
-// `applying` and `last_apply` are NOT yet emitted by the live `status()`
-// route (it still returns the pre-auto-apply `pending` shape) — see
-// App.test.tsx's top-of-file comment and the task report for the exact gap.
+// These mirror the REAL `backend/routes.py::status()` payload (verified
+// against `ui/src/__fixtures__/status.real.json`, captured from an actual
+// backend `status()` call by `tests/test_fixture_status_real.py`) — not the
+// pre-auto-apply shape `App.tsx` originally assumed. `status()` returns
+// `store.last_apply` verbatim (see `backend/state.py`), so `LastApply` below
+// is that raw dict's shape: `sha` (not `merged_sha`), no `pr_urls` at all,
+// `not_applied` is a `{relpath: reason}` dict (not a list, and there is no
+// separate `not_applied_reasons` map), and there is no `applying` field
+// anywhere in the real response.
 
 export interface LastPush {
   time: string
   branch: string
   pr_url: string
   merged: boolean
+}
+
+/** `store.last_push_failure` / `store.last_poll_failure` shape — an object,
+
+ * never a bare string (senior review round 3, task 4). */
+export interface FailureRecord {
+  reason: string
+  time?: string
 }
 
 export type PropagationClass =
@@ -21,9 +32,9 @@ export type PropagationClass =
   | 'live_on_next_resolution'
 
 export interface PropagationEntry {
-  propagation_class: PropagationClass
+  propagation_class?: PropagationClass
   message: string
-  requires_restart: boolean
+  requires_restart?: boolean
 }
 
 export interface ChangedCommand {
@@ -32,14 +43,18 @@ export interface ChangedCommand {
   command: string
 }
 
+/** `store.last_apply` verbatim — the real shape `status()` returns, per
+
+ * `ui/src/__fixtures__/status.real.json`. */
 export interface LastApply {
   apply_id: string
   outcome: 'applied' | 'partial' | string
   applied: string[]
-  not_applied: string[]
-  not_applied_reasons: Record<string, string>
-  pr_urls: string[]
-  merged_sha: string
+  /** `{relpath: reason}` — NOT a list. The former list-shaped `not_applied`
+   * plus a separate `not_applied_reasons` map was never what `status()`
+   * actually returns. */
+  not_applied: Record<string, string>
+  sha: string
   dropped_cron_names: string[]
   paused_cron_names: string[]
   changed_commands: ChangedCommand[]
@@ -52,10 +67,9 @@ export interface StatusResponse {
   status: 'ok' | 'error'
   reason?: string
   last_push: LastPush | null
-  last_push_failure: string | null
+  last_push_failure: FailureRecord | null
   last_seen_sha: string | null
-  last_poll_failure: string | null
+  last_poll_failure: FailureRecord | null
   drift: boolean
-  applying: boolean
   last_apply: LastApply | null
 }

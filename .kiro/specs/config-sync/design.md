@@ -392,16 +392,17 @@ no longer a decision to pend), `history` (bounded), and `restore_dirs`.
 
 Routes on the scaffolded backend (`backend/server.py`, `port: "auto"`,
 `healthCheck: "/health"`), every one wrapped in an enabled check so the app is
-inert while disabled. Every state-mutating POST additionally requires the
-header `X-Config-Sync-Request: 1` (Requirement 7.7) and is refused without it:
+inert while disabled. Every state-mutating POST additionally passes a
+same-site check (`Sec-Fetch-Site`, else `Origin` vs loopback `Host`) and a
+loopback `Host` check (Requirement 7.7) and is refused otherwise:
 
 | Route | Purpose |
 |---|---|
 | `GET /health` | Scaffold-provided liveness |
 | `GET /api/apps/config-sync/status` | Push state, drift flag, last-seen SHA, last-apply summary (outcome, not-applied paths + reasons, `changed_commands`) |
 | `GET /api/apps/config-sync/drift` | Collected-tree hash vs last pushed, with per-file changed list |
-| `POST /api/apps/config-sync/push` | Run the push now (same code path as the cron); requires `X-Config-Sync-Request: 1` |
-| `POST /api/apps/config-sync/undo/{restore_id}` | Restore a backup from a previous apply; requires `X-Config-Sync-Request: 1` |
+| `POST /api/apps/config-sync/push` | Run the push now (same code path as the cron); same-site + loopback-Host guard |
+| `POST /api/apps/config-sync/undo/{restore_id}` | Restore a backup from a previous apply; same-site + loopback-Host guard |
 
 There is deliberately **no approve or decline route**: the poll cron is the
 only caller of `apply.py`, and it calls it automatically on every new head.
@@ -423,7 +424,9 @@ only caller of `apply.py`, and it calls it automatically on every new head.
 - The Requirement 6 exception call-out rendered inline whenever
   `crons.json` or `instances.json` appear in the last-applied range.
 
-Every mutating fetch from the UI sends `X-Config-Sync-Request: 1`.
+Every mutating fetch from the UI goes through the real `@kirocrew/app-sdk`
+`post()` (JSON body, no custom headers); the browser's own fetch metadata
+satisfies the same-site guard.
 
 ## Data Flow
 

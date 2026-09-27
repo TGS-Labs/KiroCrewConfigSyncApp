@@ -25,9 +25,9 @@
  * `get`/`post` are thin wrappers over global `fetch` against the app's own
  * route table (design.md's route table). Mocking at `fetch` — not mocking
  * `api.get`/`api.post` themselves — is what lets a test assert the exact
- * request path/method/headers/body `App.tsx` sends (e.g. the
- * `X-Config-Sync-Request: 1` header requirements.md 7.7 requires on every
- * mutating POST).
+ * request path/method/body `App.tsx` sends. (Requirement 7.7's cross-site
+ * protection is enforced server-side from browser fetch metadata — the real
+ * SDK's `post()` cannot attach a custom header, see realShapedAppApi.ts.)
  *
  * Route table (design.md, "backend/routes.py and the UI"):
  *   - GET  /api/apps/config-sync/status
@@ -64,10 +64,15 @@ vi.mock('@kirocrew/app-sdk', () => {
   const API_BASE = '/api/apps/config-sync'
 
   async function request(method: 'GET' | 'POST', path: string, body?: unknown) {
+    // Matches the REAL SDK's request shape exactly (see
+    // `realShapedAppApi.ts`): post() hardcodes only Content-Type, with no
+    // caller-supplied header of any kind — there is no
+    // `X-Config-Sync-Request` injection here or in production. The H7
+    // mutation guard (backend/server.py) was redesigned around
+    // `Sec-Fetch-Site`/`Origin` fetch-metadata precisely because no header
+    // this mock — or the real SDK — could ever attach would reach the
+    // backend from `post()`.
     const headers: Record<string, string> = {}
-    if (method === 'POST') {
-      headers['X-Config-Sync-Request'] = '1'
-    }
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json'
     }
@@ -144,10 +149,8 @@ const LAST_APPLY_FULL = {
   apply_id: 'apply-2026-09-26T22-00-00',
   outcome: 'applied',
   applied: ['steering/testing-standards.md', 'crons.json'],
-  not_applied: [],
-  not_applied_reasons: {},
-  pr_urls: ['https://github.com/TGS-Labs/Kiro-Config-Bundles/pull/99'],
-  merged_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d',
+  not_applied: {},
+  sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d',
   dropped_cron_names: ['unsafe-remote-wipe'],
   paused_cron_names: ['nightly-backup'],
   changed_commands: [
@@ -181,7 +184,6 @@ function statusResponse(overrides: Record<string, unknown> = {}) {
     last_seen_sha: 'f1e2d3c4b5a69788716253748596a0b1c2d3e4f',
     last_poll_failure: null,
     drift: true,
-    applying: false,
     last_apply: null,
     ...overrides,
   }
@@ -217,12 +219,6 @@ function installFetchMock(routes: Record<string, RouteHandler>) {
 
   vi.stubGlobal('fetch', mockFetch)
   return { calls, mockFetch }
-}
-
-function headerValue(init: RequestInit | undefined, name: string): string | null {
-  if (!init?.headers) return null
-  const headers = init.headers as Record<string, string>
-  return headers[name] ?? null
 }
 
 beforeEach(() => {
@@ -363,7 +359,6 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
     installFetchMock({
       'GET /api/apps/config-sync/status': () =>
         statusResponse({
-          applying: false,
           last_seen_sha: 'f1e2d3c4b5a69788716253748596a0b1c2d3e4f',
         }),
     })
@@ -376,22 +371,10 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
     expect(screen.getByText(/up to date/i)).toBeInTheDocument()
     expect(screen.getByText(/f1e2d3c/i)).toBeInTheDocument()
   })
-
-  it('renders the sync-from-main card as "applying" while a poll apply is in progress', async () => {
-    installFetchMock({
-      'GET /api/apps/config-sync/status': () => statusResponse({ applying: true }),
-    })
-
-    render(<App />)
-
-    await waitFor(() => {
-      expect(screen.getByText(/applying/i)).toBeInTheDocument()
-    })
-  })
 })
 
-describe('ConfigSync dashboard — Push now sends the required header (Requirement 7.7)', () => {
-  it('POSTs /api/apps/config-sync/push with X-Config-Sync-Request: 1 on click', async () => {
+describe('ConfigSync dashboard — Push now issues the push POST (Requirement 7.1)', () => {
+  it('POSTs /api/apps/config-sync/push as JSON via the real post() surface on click', async () => {
     const { calls } = installFetchMock({
       'GET /api/apps/config-sync/status': () => statusResponse({ drift: true }),
       'POST /api/apps/config-sync/push': () => ({ status: 'ok', outcome: 'pushed' }),
@@ -412,7 +395,8 @@ describe('ConfigSync dashboard — Push now sends the required header (Requireme
     const pushCall = calls.find(
       (c) => c.path === '/api/apps/config-sync/push' && c.init?.method === 'POST',
     )
-    expect(headerValue(pushCall?.init, 'X-Config-Sync-Request')).toBe('1')
+    expect(pushCall?.init?.method).toBe('POST')
+    expect(pushCall?.path).toBe('/api/apps/config-sync/push')
   })
 })
 
@@ -446,8 +430,7 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
             ...LAST_APPLY_FULL,
             outcome: 'partial',
             applied: ['steering/testing-standards.md'],
-            not_applied: ['mcp.json'],
-            not_applied_reasons: {
+            not_applied: {
               'mcp.json': 'command vet rejected server "evil": rm -rf ~',
             },
           },
@@ -457,16 +440,16 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
     render(<App />)
 
     await waitFor(() => {
-      expect(screen.getByText(/mcp\.json/)).toBeInTheDocument()
+      expect(
+        screen.getByText(/command vet rejected server "evil"/i),
+      ).toBeInTheDocument()
     })
-    expect(
-      screen.getByText(/command vet rejected server "evil"/i),
-    ).toBeInTheDocument()
+    expect(screen.getAllByText(/mcp\.json/).length).toBeGreaterThan(0)
     // Must not report a partial outcome as a plain success.
     expect(screen.queryByText(/^applied$/i)).not.toBeInTheDocument()
   })
 
-  it('renders an "Undo this apply" button that POSTs restore/<id> with the required header', async () => {
+  it('renders an "Undo this apply" button that POSTs restore/<id> via the real post() surface', async () => {
     const { calls } = installFetchMock({
       'GET /api/apps/config-sync/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
@@ -496,7 +479,7 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
     expect(undoCall?.path).toBe(
       `/api/apps/config-sync/restore/${LAST_APPLY_FULL.apply_id}`,
     )
-    expect(headerValue(undoCall?.init, 'X-Config-Sync-Request')).toBe('1')
+    expect(undoCall?.init?.method).toBe('POST')
   })
 
   it('does not render a last-apply card or Undo button when nothing has ever been applied', async () => {
@@ -688,7 +671,10 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
     installFetchMock({
       'GET /api/apps/config-sync/status': () =>
         statusResponse({
-          last_push_failure: 'secret scan found 1 finding; push refused',
+          last_push_failure: {
+            reason: 'secret scan found 1 finding; push refused',
+            time: '2026-09-27T07:17:42Z',
+          },
         }),
     })
 
@@ -705,7 +691,10 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
     installFetchMock({
       'GET /api/apps/config-sync/status': () =>
         statusResponse({
-          last_poll_failure: 'could not reach bundle repository: timeout',
+          last_poll_failure: {
+            reason: 'could not reach bundle repository: timeout',
+            time: '2026-09-27T07:17:42Z',
+          },
         }),
     })
 

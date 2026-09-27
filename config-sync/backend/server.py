@@ -40,22 +40,87 @@ This trades one extra JSON parse per request for correctness; the state
 document is small and local disk I/O, not a real cost at this app's
 request volume.
 
-## Mutation-request guard (senior-review H7)
+## Mutation-request guard (senior-review H7, redesigned round 3 finding C-B)
 
-Every mutating request (``POST``) must carry ``X-Config-Sync-Request: 1``
-and a loopback ``Host`` header (``127.0.0.1``/``localhost``/``[::1]``,
-optionally with a port) — checked in ``_dispatch`` BEFORE any route runs.
-The server binds loopback-only, but that alone only stops a remote
-attacker; a plain unauthenticated HTTP server is still reachable by
-`fetch`/a form submit from ANY page open in a browser on the same
-machine. A required custom header is a real CSRF barrier because a
-simple cross-origin request (one that skips CORS preflight, including a
-form submission) cannot set one; pinning ``Host`` additionally catches
-DNS rebinding, where a page's JS can cause the browser to send a request
-to ``127.0.0.1`` while the ``Host`` header it sends still reflects
-whatever hostname resolved there. ``GET`` requests are unaffected — this
-is a mutation guard, not a blanket auth layer the design does not
-otherwise call for.
+Every mutating request (``POST``) must pass BOTH a same-site check and a
+loopback ``Host`` check — checked in ``_dispatch`` BEFORE any route
+runs. The server binds loopback-only, but that alone only stops a
+remote attacker; a plain unauthenticated HTTP server is still reachable
+by `fetch`/a form submit from ANY page open in a browser on the same
+machine.
+
+### Why this is NOT a custom-header check
+
+H7 originally required a custom header (``X-Config-Sync-Request: 1``)
+on every mutating request, reasoning that a simple cross-origin request
+cannot set one. That is true of a bare cross-origin ``fetch``/``<form>``
+— but this app is served *through the KiroCrew gateway's own app UI
+host*, and the UI can only reach its own backend via the real
+``@kirocrew/app-sdk``'s ``useAppApi()``. Reading the actual SDK
+implementation (the host bundle's ``Dse`` factory, which every
+``useAppApi().api`` is built from) shows:
+
+- ``get(path, init)`` merges ``init.headers`` into the request — a
+  custom header CAN reach ``fetch`` through ``get()``.
+- ``post(path, body)``/``put``/``patch`` take **no headers parameter at
+  all** — their headers are hardcoded to
+  ``{"Content-Type": "application/json"}`` inside the SDK itself. There
+  is no way for this app's UI code to attach a custom header to a real
+  mutating request, because the SDK's own ``post()`` does not expose
+  that capability.
+
+So a header-based guard on ``POST`` cannot be satisfied by the real SDK
+at all — it would permanently 403 every legitimate mutation from the
+shipped UI, and Requirement 7.7 (refuse a forged cross-site POST while
+still accepting the app's own proxied requests) has to be met a
+different way.
+
+### The redesigned checks
+
+1. **Same-site check via `Sec-Fetch-Site`.** Every modern browser sets
+   this fetch-metadata header on every request and — critically — it is
+   a "forbidden header name": no page JavaScript can set, override, or
+   suppress it via ``fetch()``/``XMLHttpRequest``, unlike a custom
+   header, which a same-origin script could always set anyway. A
+   cross-site page's `fetch`/`<form>` POST to this loopback server
+   always carries ``Sec-Fetch-Site: cross-site`` (or ``same-site`` for a
+   different-but-related site — also refused, since nothing legitimately
+   calls this backend from another site at all); the app's own
+   same-origin UI call carries ``same-origin`` (or, for a top-level
+   navigation-triggered request, ``none``). Refuse any value other than
+   ``same-origin``/``none``.
+2. **`Origin` fallback when `Sec-Fetch-Site` is absent.** Older browsers
+   and non-browser HTTP clients (``curl``, ``requests``, this project's
+   own test suite, the gateway's own health probe) never send
+   ``Sec-Fetch-Site`` at all. When it is missing, fall back to requiring
+   an ``Origin`` header whose host matches the request's own loopback
+   ``Host`` — a genuine cross-site browser *fetch* still always sends
+   ``Origin`` (also a forbidden header name), so a forged browser
+   request cannot spoof its way past this fallback either. A request
+   with **neither** header (e.g. a bare loopback CLI/script call with no
+   ``Origin`` at all) is treated as same-site: this mirrors H7's original
+   scope — the guard defends against a *browser* page reaching this
+   server, not against arbitrary local process access, which loopback
+   binding plus the gateway's own proxy already gate for the shipped
+   deployment path (the gateway signs every proxied request with
+   ``X-KiroCrew-Proxy``; a caller that reaches this backend directly
+   without going through the gateway already had to be on the same
+   machine).
+3. **Loopback-only `Host` header**, unchanged from the original H7
+   design: catches DNS rebinding, where a page's JS can cause the
+   browser to send a request to ``127.0.0.1`` while the ``Host`` header
+   it sends still reflects whatever hostname resolved there.
+4. **`GET` requests are unaffected** — this remains a mutation guard, not
+   a blanket auth layer the design does not otherwise call for.
+
+This still satisfies every original H7 property: a bare cross-origin
+`fetch`/`<form>` POST (no `Origin`-matching-`Host`, and
+`Sec-Fetch-Site: cross-site`) is refused; DNS rebinding is refused via
+`Host`; `GET` is untouched — while remaining satisfiable by the real
+SDK's `post()`, which sends neither a custom header nor any control over
+`Sec-Fetch-Site`/`Origin` (both are ordinary same-origin `fetch` calls
+from the app's own UI origin, so the browser sets them correctly with no
+code in this app needing to do anything).
 """
 
 from __future__ import annotations
@@ -73,14 +138,16 @@ APP_NAME = os.environ.get("KIROCREW_APP_NAME", "config-sync")
 
 _PREFIX = "/api/apps/config-sync"
 
-#: H7 — every mutating (POST) request must carry this header with this
-#: exact value. A cross-origin `fetch`/`<form>` submission — including
-#: the "simple request" shapes that skip CORS preflight entirely — has
-#: no way to set an arbitrary custom header, so requiring one is a real
-#: CSRF barrier rather than a check an attacker's request trivially
-#: satisfies.
-_REQUIRED_HEADER = "X-Config-Sync-Request"
-_REQUIRED_HEADER_VALUE = "1"
+#: H7 (redesigned, round 3 C-B) — `Sec-Fetch-Site` values that count as
+#: same-site. `same-origin` is the ordinary case for this app's own UI
+#: calling its own backend; `none` covers a top-level navigation (not a
+#: fetch at all) and a bare loopback CLI/script call, which never sets
+#: fetch metadata. Both are "forbidden header names" a page's JS cannot
+#: set, override, or suppress — unlike the custom header this guard used
+#: to require, which the real `@kirocrew/app-sdk`'s `post()` has no way
+#: to attach at all (see the module docstring's "Why this is NOT a
+#: custom-header check").
+_SAME_SITE_VALUES = ("same-origin", "none")
 
 #: H7 — loopback hostnames/addresses a mutating request's `Host` header
 #: must match (with or without a trailing `:<port>`). Pinning `Host`
@@ -157,6 +224,46 @@ def _is_loopback_host(host_header: Optional[str]) -> bool:
     return host_only in _LOOPBACK_HOSTS
 
 
+def _origin_host(origin_header: Optional[str]) -> Optional[str]:
+    """Extract the host[:port] authority from an ``Origin`` header value,
+
+    or ``None`` if it is missing/unparseable. ``Origin`` is always
+    ``scheme://host[:port]`` with no path — `urlsplit` on it yields the
+    authority in `.netloc` directly.
+    """
+    if not origin_header:
+        return None
+    netloc = urlsplit(origin_header).netloc
+    return netloc or None
+
+
+def _is_same_site(headers: "Any") -> bool:
+    """H7 (redesigned) — whether a mutating request's fetch-metadata
+
+    headers indicate it originated same-site, per the module docstring's
+    "The redesigned checks" section. Checked BEFORE `Host`, since a
+    request that fails this can never be same-site regardless of what
+    `Host` says.
+    """
+    sec_fetch_site = headers.get("Sec-Fetch-Site")
+    if sec_fetch_site is not None:
+        return sec_fetch_site in _SAME_SITE_VALUES
+    origin = headers.get("Origin")
+    if origin is None:
+        # Neither fetch-metadata header present: a bare loopback
+        # CLI/script call (curl, requests, this project's own tests, the
+        # gateway's health probe) rather than a browser fetch. Browsers
+        # always send at least one of these two on a cross-site request,
+        # so treat "neither present" as same-site — see the module
+        # docstring for why this matches H7's original scope.
+        return True
+    origin_host = _origin_host(origin)
+    host_header = headers.get("Host")
+    if origin_host is None or host_header is None:
+        return False
+    return bool(origin_host == host_header)
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -170,15 +277,14 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def _passes_mutation_guard(self) -> bool:
-        """H7 — refuse a mutating request with 403 before it ever reaches
+        """H7 (redesigned) — refuse a mutating request with 403 before it
 
-        `_dispatch`/any `routes.*` function, unless it carries BOTH the
-        required custom header and a loopback `Host`. Returns whether the
-        request may proceed; on refusal it has already written the 403
-        response.
+        ever reaches `_dispatch`/any `routes.*` function, unless it
+        passes BOTH the same-site check and the loopback-`Host` check.
+        Returns whether the request may proceed; on refusal it has
+        already written the 403 response.
         """
-        header_value = self.headers.get(_REQUIRED_HEADER)
-        if header_value != _REQUIRED_HEADER_VALUE:
+        if not _is_same_site(self.headers):
             self._json(403, {"error": "forbidden"})
             return False
         if not _is_loopback_host(self.headers.get("Host")):

@@ -89,7 +89,6 @@ export default function ConfigSync() {
               <LocalChangesCard drift={status.drift} onPushNow={handlePushNow} pushing={pushing} />
               <LastPushCard lastPush={status.last_push} failure={status.last_push_failure} />
               <FromMainCard
-                applying={status.applying}
                 lastSeenSha={status.last_seen_sha}
                 pollFailure={status.last_poll_failure}
               />

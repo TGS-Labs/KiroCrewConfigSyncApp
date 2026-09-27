@@ -28,19 +28,7 @@ export default function LastApplyCard({
           <p style={{ margin: '0.5rem 0' }}>
             {lastApply.outcome === 'applied' ? 'Applied' : `Outcome: ${lastApply.outcome}`}
           </p>
-          <p style={mutedStyle}>Applied sha: {lastApply.merged_sha.slice(0, 7)}</p>
-
-          {lastApply.pr_urls.map((url) => {
-            const prNumberMatch = url.match(/\/pull\/(\d+)/)
-            const label = prNumberMatch ? `Merged PR #${prNumberMatch[1]}` : 'Merged PR'
-            return (
-              <p key={url}>
-                <a href={url} target="_blank" rel="noreferrer">
-                  {label}
-                </a>
-              </p>
-            )
-          })}
+          <p style={mutedStyle}>Applied sha: {lastApply.sha.slice(0, 7)}</p>
 
           <button
             type="button"
@@ -70,16 +58,14 @@ export default function LastApplyCard({
             </div>
           ) : null}
 
-          {lastApply.not_applied.length > 0 ? (
+          {Object.keys(lastApply.not_applied).length > 0 ? (
             <div style={calloutStyle('warn')}>
               <strong>Not applied</strong>
               <ul style={{ margin: '0.25rem 0 0', paddingLeft: '1.25rem' }}>
-                {lastApply.not_applied.map((path) => (
+                {Object.entries(lastApply.not_applied).map(([path, reason]) => (
                   <li key={path}>
                     {path}
-                    {lastApply.not_applied_reasons[path]
-                      ? `: ${lastApply.not_applied_reasons[path]}`
-                      : null}
+                    {reason ? `: ${reason}` : null}
                   </li>
                 ))}
               </ul>
@@ -93,7 +79,7 @@ export default function LastApplyCard({
             // credential callout would only duplicate the not-applied
             // reason for the same path. Filter those out.
             const notAppliedFiles = new Set(
-              lastApply.not_applied.map((path) => path.split(':')[0]),
+              Object.keys(lastApply.not_applied).map((path) => path.split(':')[0]),
             )
             const visibleNeedsCredential = lastApply.needs_credential.filter(
               (key) => !notAppliedFiles.has(key.split(':')[0]),

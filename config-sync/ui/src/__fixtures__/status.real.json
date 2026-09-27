@@ -1,0 +1,66 @@
+{
+  "drift": true,
+  "last_apply": {
+    "applied": [
+      "steering/fixture-demo-2.md"
+    ],
+    "apply_id": "apply-20260927073610-e54f64d1",
+    "changed_instance_names": [],
+    "dropped_cron_names": [],
+    "ignored_paths": [],
+    "incomplete_registrations": {},
+    "needs_credential": [],
+    "non_portable_paths": [],
+    "not_applied": {
+      "mcp.json": "mcp.json: refused \u2014 could not parse as JSON"
+    },
+    "outcome": "partial",
+    "paused_cron_names": [],
+    "propagation": {
+      "steering/fixture-demo-2.md": {
+        "message": "Live in a new session \u2014 steering loads at session start (or a post-compaction warm reinjection); it is not live in an already-running session, and nothing else needs to happen for steering alone.",
+        "propagation_class": "live_in_new_session",
+        "requires_restart": false
+      }
+    },
+    "propagation_report": {},
+    "reason": "",
+    "root": {
+      "mcp.json": "A"
+    },
+    "sha": "f99d48863e98d93266df6030d728294986fe37b5",
+    "unresolved_references": [],
+    "untracked_prompt_agents": []
+  },
+  "last_poll_failure": null,
+  "last_push": {
+    "branch": "",
+    "pr_url": null,
+    "time": "2026-09-27T07:36:10Z",
+    "tree_hash": "86852bf02dc14f9ddb4e043f9f9036472c93f03e10bad1fff89d6026aeb00f00"
+  },
+  "last_push_failure": {
+    "reason": "secret scan found 1 finding; push refused",
+    "time": "2026-09-27T07:36:10Z"
+  },
+  "last_seen_sha": "7851d09e2e90198f295dd4ca2daeebd8b898166a",
+  "pending": {
+    "author": "t",
+    "changed_commands": [],
+    "classified_paths": {
+      "mcp.json": "live_on_next_resolution",
+      "steering/fixture-demo-2.md": "live_in_new_session"
+    },
+    "ignored_paths": [],
+    "not_applied": {
+      "mcp.json": "mcp.json: refused \u2014 could not parse as JSON"
+    },
+    "sha": "f99d48863e98d93266df6030d728294986fe37b5",
+    "subject": "add another file, break mcp.json",
+    "touched_classes": [
+      "live_in_new_session",
+      "live_on_next_resolution"
+    ]
+  },
+  "status": "ok"
+}

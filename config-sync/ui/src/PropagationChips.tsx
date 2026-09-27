@@ -20,6 +20,12 @@ export default function PropagationChips({ lastApply }: { lastApply: LastApply }
     live_on_next_resolution: 0,
   }
   for (const entry of Object.values(lastApply.propagation ?? {})) {
+    // Real `status()` payloads have been observed with a propagation entry
+    // that carries `message`/`requires_restart` but no `propagation_class`
+    // at all (ui/src/__fixtures__/status.real.json) — skip rather than
+    // index `counts` with `undefined`, which would silently corrupt every
+    // other chip's count via an `undefined` object key.
+    if (entry.propagation_class === undefined) continue
     counts[entry.propagation_class] = (counts[entry.propagation_class] ?? 0) + 1
   }
 

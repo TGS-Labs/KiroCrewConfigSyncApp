@@ -5,5 +5,8 @@ __pycache__/
 .venv/
 *.egg-info/
 node_modules/
-dist/
+# ui/dist/index.mjs is the shipped page bundle and is committed on purpose:
+# `kirocrew app install` copies the app directory as-is and never runs
+# `vite build`, and the gateway serves <app>/ui/<ui.entry> verbatim.
+# tests/test_ui_bundle.py fails if it drifts from a fresh build of ui/src.
 .coverage
