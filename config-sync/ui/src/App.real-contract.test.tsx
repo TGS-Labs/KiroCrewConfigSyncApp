@@ -12,9 +12,10 @@
  *   1. Renders `App` against `test-stubs/app-sdk.ts`'s
  *      `buildRealShapedAppApi()` — a stub with the REAL SDK's exact
  *      surface (`post(path, body)` takes NO third `headers`/`init`
- *      argument; `get(path, init)` DOES forward `init.headers`; every
- *      path is prefixed with the app's own `/api/apps/config-sync`
- *      base) — not the ad-hoc mock `App.test.tsx` writes for itself.
+ *      argument; `get(path, init)` DOES forward `init.headers`; NO path
+ *      prefixing — only the real `permissions.api` check against the real
+ *      `app.json`, so `App.tsx` must call `/apps/config-sync/api/...`
+ *      itself) — not the ad-hoc mock `App.test.tsx` writes for itself.
  *   2. Feeds it the REAL `status()` JSON captured from an actual poll
  *      tick (`tests/test_fixture_status_real.py`,
  *      `ui/src/__fixtures__/status.real.json`), not hand-written
@@ -128,7 +129,7 @@ import App from './App'
 describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped SDK (round-3 C-B)', () => {
   it('renders without crashing on the real fixture and shows the three stat cards', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => realStatusFixture,
+      'GET /apps/config-sync/api/status': () => realStatusFixture,
     })
 
     render(<App />)
@@ -142,7 +143,7 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
 
   it('renders the last-apply card using the REAL not_applied dict shape and its real reason string', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => realStatusFixture,
+      'GET /apps/config-sync/api/status': () => realStatusFixture,
     })
 
     render(<App />)
@@ -164,7 +165,7 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
 
   it('renders the applied sha from the real `sha` field, not a nonexistent `merged_sha`', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => realStatusFixture,
+      'GET /apps/config-sync/api/status': () => realStatusFixture,
     })
 
     render(<App />)
@@ -182,7 +183,7 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
 
   it('renders the real last_push_failure object ({reason, time}), not a bare string', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => realStatusFixture,
+      'GET /apps/config-sync/api/status': () => realStatusFixture,
     })
 
     render(<App />)
@@ -197,7 +198,7 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
 
   it('does not crash or render "undefined"/"[object Object]" anywhere on the real payload', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => realStatusFixture,
+      'GET /apps/config-sync/api/status': () => realStatusFixture,
     })
 
     render(<App />)
@@ -212,8 +213,8 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
 
   it('every mutating POST (Push now) hits the real prefixed path — using the REAL post() signature', async () => {
     const { calls } = installFetchMock({
-      'GET /api/apps/config-sync/status': () => ({ ...realStatusFixture, drift: true }),
-      'POST /api/apps/config-sync/push': () => ({ status: 'ok', outcome: 'pushed' }),
+      'GET /apps/config-sync/api/status': () => ({ ...realStatusFixture, drift: true }),
+      'POST /apps/config-sync/api/push': () => ({ status: 'ok', outcome: 'pushed' }),
     })
 
     render(<App />)
@@ -223,31 +224,30 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
 
     await waitFor(() => {
       const pushCalls = calls.filter(
-        (c) => c.path === '/api/apps/config-sync/push' && c.init?.method === 'POST',
+        (c) => c.path === '/apps/config-sync/api/push' && c.init?.method === 'POST',
       )
       expect(pushCalls).toHaveLength(1)
     })
 
     const pushCall = calls.find(
-      (c) => c.path === '/api/apps/config-sync/push' && c.init?.method === 'POST',
+      (c) => c.path === '/apps/config-sync/api/push' && c.init?.method === 'POST',
     )
     // C-B: the real SDK's post(path, body) has no headers parameter at
     // all, so App.tsx cannot and does not attach a custom header here —
-    // backend/server.py's H7 guard was redesigned to rely on
-    // Sec-Fetch-Site/Origin fetch-metadata instead (see that module's
-    // docstring), neither of which any app UI code can or needs to set:
-    // a real browser adds them automatically on every same-origin fetch.
-    // This test only proves the call reaches the correctly-prefixed path
+    // backend/server.py authenticates on the gateway HMAC plus the
+    // browser-set Sec-Fetch-Site header (see that module's docstring),
+    // neither of which any app UI code can or needs to set.
+    // This test only proves the call reaches the declared-prefix path
     // with the real two-arg post() signature.
-    expect(pushCall?.path).toBe('/api/apps/config-sync/push')
+    expect(pushCall?.path).toBe('/apps/config-sync/api/push')
   })
 
   it('every mutating POST (Undo) hits the real restore/<apply_id> path — using the REAL post() signature', async () => {
     const realLastApply = (realStatusFixture as { last_apply: { apply_id: string } })
       .last_apply
     const { calls } = installFetchMock({
-      'GET /api/apps/config-sync/status': () => realStatusFixture,
-      [`POST /api/apps/config-sync/restore/${realLastApply.apply_id}`]: () => ({
+      'GET /apps/config-sync/api/status': () => realStatusFixture,
+      [`POST /apps/config-sync/api/restore/${realLastApply.apply_id}`]: () => ({
         status: 'ok',
         restored: { A: [], B: [] },
         removed: { A: [], B: [] },
@@ -271,7 +271,21 @@ describe('ConfigSync dashboard against the REAL status() payload + REAL-shaped S
       (c) => c.path.includes('/restore/') && c.init?.method === 'POST',
     )
     expect(undoCall?.path).toBe(
-      `/api/apps/config-sync/restore/${realLastApply.apply_id}`,
+      `/apps/config-sync/api/restore/${realLastApply.apply_id}`,
+    )
+  })
+
+  it('the real-shaped stub adds no prefix and refuses an undeclared path before fetch (round 4 C-B)', async () => {
+    const { calls } = installFetchMock({})
+    const client = appSdkStub.buildRealShapedAppApi()
+
+    await expect(client.get('/status')).rejects.toThrow(
+      '[app-sdk] App "config-sync" not permitted to access /status. Declared: [/apps/config-sync/api]',
+    )
+    await expect(client.post('/api/push')).rejects.toThrow(/not permitted to access \/api\/push/)
+    expect(calls).toHaveLength(0)
+    expect(appSdkStub.resolvePath('/apps/config-sync/api/status?x=1')).toBe(
+      '/apps/config-sync/api/status?x=1',
     )
   })
 })

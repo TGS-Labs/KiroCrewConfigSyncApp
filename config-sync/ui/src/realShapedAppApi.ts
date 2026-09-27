@@ -1,4 +1,4 @@
-// Real-SDK-shaped `useAppApi()` client factory (senior review round 3, C-B).
+// Real-SDK-shaped `useAppApi()` client factory (senior review rounds 3-4, C-B).
 //
 // Deliberately OUTSIDE the `@kirocrew/app-sdk` alias target
 // (`test-stubs/app-sdk.ts`, which `vitest.config.ts` resolves the bare
@@ -12,47 +12,42 @@
 //
 // Mirrors the REAL host implementation exactly (verified against
 // `/usr/local/lib/python3.12/site-packages/kiro_crew/static/dist/assets/
-// App-*.js`, function `Dse`, which is what every `useAppApi().api` is built
-// from via `MF`'s `AppApiProvider`):
+// App-*.js`, function `Dse(e, t, n)`: `e` = `manifest.permissions.api`,
+// `t` = app name — every `useAppApi().api` is built from it):
 //
-//   function Dse(allowedApiPaths, appName, sessionKey) {
-//     let resolve = (path) => { ...prefixes/validates against allowedApiPaths... }
-//     let request = async (path, init) => {
-//       let resolved = resolve(path)
-//       let headers = new Headers(init?.headers)
-//       if (sessionKey && !headers.has('X-Session-Key')) headers.set(...)
-//       let res = await fetch(resolved, { ...init, headers })
-//       ...
-//     }
-//     return {
-//       get: (path, init) => request(path, { ...init, method: 'GET' }),
-//       post: (path, body) => request(path, {
-//         method: 'POST',
-//         headers: { 'Content-Type': 'application/json' },
-//         body: body == null ? undefined : JSON.stringify(body),
-//       }),
-//       ...
-//     }
+//   let r = n => {
+//     if (absolute-URL or backslash) throw Error(`[app-sdk] Absolute URLs
+//       are not allowed: ${n}`)
+//     let pathname = new URL(n, 'http://localhost').pathname
+//     if (!e.some(e => pathname === e || pathname.startsWith(
+//           e.endsWith('/') ? e : e + '/')))
+//       throw Error(`[app-sdk] App "${t}" not permitted to access
+//         ${pathname}. Declared: [${e.join(', ')}]`)
+//     return pathname + search
 //   }
+//   get: (path, init) => request(path, { ...init, method: 'GET' }),
+//   post: (path, body) => request(path, { method: 'POST',
+//     headers: { 'Content-Type': 'application/json' }, body: ... }),
 //
-// Two behaviours this reproduces EXACTLY, because they are the exact gap the
-// PREVIOUS stub (which let a bespoke `post(path, body, { headers })` three-arg
-// call through) hid from every test that used it:
+// Three behaviours this reproduces EXACTLY:
 //
-// 1. Path prefixing: the real client resolves a caller-given path (e.g.
-//    `/status`) against ONE base the host already knows (this app's own
-//    `/api/apps/config-sync` prefix) — `App.tsx` never spells out that prefix
-//    itself; the SDK adds it.
-// 2. `post(path, body)` takes exactly TWO positional arguments. There is NO
-//    THIRD `init`/`headers` parameter on the real `post` — its headers are
-//    hardcoded to `{'Content-Type': 'application/json'}` inside the SDK
-//    itself. A caller cannot pass a custom header through `post()`. `get(path,
-//    init)` DOES forward a second `init` argument's `headers` into the
-//    underlying `fetch`. This is WHY `backend/server.py`'s H7 guard was
-//    redesigned around `Sec-Fetch-Site`/`Origin` rather than a custom header
-//    (see that module's docstring) — this factory's `post()` intentionally has
-//    no way to attach one, matching production.
-export const APP_PREFIX = '/api/apps/config-sync'
+// 1. NO prefixing. The SDK only VALIDATES the caller-given path against the
+//    declared `permissions.api` list and fetches it unchanged. `App.tsx`
+//    must therefore spell out `/apps/config-sync/api/...` itself (round 4:
+//    the previous stub prepended a prefix the real SDK never adds).
+// 2. The declared list is read from the REAL `app.json`, so an undeclared
+//    path throws the real error message shape before `fetch` is reached.
+// 3. `post(path, body)` takes exactly TWO positional arguments — its headers
+//    are hardcoded to `{'Content-Type': 'application/json'}`; a caller can
+//    never attach a custom header through it. (This is why the backend's
+//    mutation guard is not a custom-header check — see `backend/server.py`.)
+import manifest from '../../app.json'
+
+export const APP_NAME: string = manifest.name
+
+/** `app.json`'s declared `permissions.api` prefixes, exactly as the host
+ * hands them to `Dse`. */
+export const DECLARED_API_PATHS: string[] = manifest.permissions?.api ?? []
 
 export interface AppApiClient {
   get: (path: string, init?: RequestInit) => Promise<unknown>
@@ -62,15 +57,26 @@ export interface AppApiClient {
   del: (path: string) => Promise<unknown>
 }
 
-function resolvePath(path: string): string {
+/** Port of `Dse`'s resolver: validate, never rewrite. */
+export function resolvePath(
+  path: string,
+  declared: string[] = DECLARED_API_PATHS,
+  appName: string = APP_NAME,
+): string {
   if (/^(?:https?:)?\/\//i.test(path) || path.includes('\\')) {
     throw new Error(`[app-sdk] Absolute URLs are not allowed: ${path}`)
   }
   const url = new URL(path, 'http://localhost')
-  const prefixed = url.pathname.startsWith(APP_PREFIX)
-    ? url.pathname
-    : `${APP_PREFIX}${url.pathname}`
-  return `${prefixed}${url.search}`
+  const pathname = url.pathname
+  const permitted = declared.some(
+    (entry) => pathname === entry || pathname.startsWith(entry.endsWith('/') ? entry : entry + '/'),
+  )
+  if (!permitted) {
+    throw new Error(
+      `[app-sdk] App "${appName}" not permitted to access ${pathname}. Declared: [${declared.join(', ')}]`,
+    )
+  }
+  return pathname + url.search
 }
 
 async function request(path: string, init?: RequestInit): Promise<unknown> {
@@ -85,9 +91,9 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
   return text.trim() !== '' ? JSON.parse(text) : undefined
 }
 
-/** Build a client with the REAL SDK's exact surface — no third `headers`
-
- * argument on `post`/`put`/`patch`, matching production exactly. */
+/** Build a client with the REAL SDK's exact surface — no prefixing, the
+ * real permission check, and no third `headers` argument on
+ * `post`/`put`/`patch`. */
 export function buildRealShapedAppApi(): AppApiClient {
   return {
     get: (path, init) => request(path, { ...init, method: 'GET' }),

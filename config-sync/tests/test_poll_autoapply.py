@@ -15,7 +15,7 @@ Today none of this holds:
   human decision that this ruling says no longer exists.
 - ``backend/routes.py`` still defines ``approve``/``decline`` routes and
   ``backend/server.py`` still wires them to
-  ``POST /api/apps/config-sync/pending/<sha>/approve`` and ``.../decline``.
+  ``POST /api/pending/<sha>/approve`` and ``.../decline``.
 - ``apply.ApplyResult.not_applied`` is a bare ``list[str]`` of relpaths
   with NO per-path reason at all — ``routes.approve`` synthesizes the
   placeholder string ``"not applied — see apply result for details"``
@@ -42,6 +42,8 @@ from typing import Any, Iterator
 import pytest
 
 from backend import state
+from backend.server import _PREFIX
+from proxy_sign import PROXY_SECRET_ENV, TEST_PROXY_SECRET, signed_headers
 
 from test_routes_approve_seam import (
     _bundle_repo_url_env,
@@ -563,6 +565,7 @@ def test_routes_module_has_no_decline_function() -> None:
 @pytest.fixture
 def running_server(
     isolated_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[tuple[str, int]]:
     """Starts the REAL ``backend/server.py`` HTTP server on an ephemeral
 
@@ -579,6 +582,7 @@ def running_server(
 
     import backend.server as server_module
 
+    monkeypatch.setenv(PROXY_SECRET_ENV, TEST_PROXY_SECRET)
     importlib.reload(server_module)
 
     httpd = HTTPServer(("127.0.0.1", 0), server_module.Handler)
@@ -620,10 +624,7 @@ def _post(host: str, port: int, path: str) -> int:
         conn.request(
             "POST",
             path,
-            headers={
-                "Host": f"{host}:{port}",
-                "X-Config-Sync-Request": "1",
-            },
+            headers=signed_headers("POST", path, b"", {"Host": f"{host}:{port}"}),
         )
         resp = conn.getresponse()
         resp.read()
@@ -637,14 +638,14 @@ def test_server_returns_404_for_post_approve(
 ) -> None:
     """RED reason: ``backend/server.py`` still routes
 
-    ``POST /api/apps/config-sync/pending/<sha>/approve`` to
+    ``POST /api/pending/<sha>/approve`` to
     ``routes.approve`` (verified by reading the file's route table: the
     3-segment ``("pending", sha, "approve")`` branch dispatches to
     ``routes.approve``), so this request is currently handled by real
     handler logic (200/an error payload) rather than 404ing.
     """
     host, port = running_server
-    status = _post(host, port, "/api/apps/config-sync/pending/deadbeef/approve")
+    status = _post(host, port, f"{_PREFIX}/pending/deadbeef/approve")
 
     assert status == 404, f"expected 404 for a removed route, got {status}"
 
@@ -654,12 +655,12 @@ def test_server_returns_404_for_post_decline(
 ) -> None:
     """RED reason: ``backend/server.py`` still routes
 
-    ``POST /api/apps/config-sync/pending/<sha>/decline`` to
+    ``POST /api/pending/<sha>/decline`` to
     ``routes.decline`` (same 3-segment branch as approve, keyed on the
     ``"decline"`` literal), so this request is currently handled by real
     handler logic rather than 404ing.
     """
     host, port = running_server
-    status = _post(host, port, "/api/apps/config-sync/pending/deadbeef/decline")
+    status = _post(host, port, f"{_PREFIX}/pending/deadbeef/decline")
 
     assert status == 404, f"expected 404 for a removed route, got {status}"

@@ -316,8 +316,8 @@ deployment has merged, per the folder-scoped PR-first workflow.
   - [ ] 6.1 `backend/routes.py` exposes status (push state, drift flag,
         last-seen SHA, last-apply summary incl. outcome, not-applied paths
         with real reasons, `changed_commands`), drift, push-now, and undo —
-        every route refuses while disabled, every mutating POST refuses a
-        cross-site or non-loopback request (7.7), no credential leaks. NO
+        every route refuses while disabled or without a valid gateway HMAC,
+        mutating POSTs refuse cross-site/non-loopback (7.7), no credential leaks. NO
         approve/decline route: the poll cron alone calls `apply.py`.
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 4.9, 4.14, 7.1, 7.2, 7.4, 7.5, 7.7_
@@ -325,7 +325,7 @@ deployment has merged, per the folder-scoped PR-first workflow.
   - [ ] 6.2 The restore (Undo) route returns the instance to the exact bytes
         recorded before a chosen apply, using only the local restore
         directory (no second network round trip), is behind the 7.7
-        same-site guard, and reports which files it restored.
+        guard (gateway HMAC + mutation guard), and reports restored files.
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 4.7, 4.8, 7.7_
 
@@ -339,8 +339,8 @@ deployment has merged, per the folder-scoped PR-first workflow.
         now" / "within 60s" / "new session" / "next resolution") rendered
         distinctly; and the Requirement 6 call-out inline whenever
         `crons.json`/`instances.json` appear in the last-applied range. No
-        approve/decline control anywhere. Every mutating fetch uses the real
-        SDK `post()` (7.7 is enforced server-side).
+        approve/decline control anywhere. Every fetch uses the real SDK with
+        the declared `/apps/config-sync/api` prefix (7.7 is server-side).
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 5.9, 6.2, 7.1, 7.2, 7.3, 7.7_
 
@@ -349,8 +349,8 @@ deployment has merged, per the folder-scoped PR-first workflow.
     _Requirements: 7.4, 7.7, 8.6_
 
     - Run the full test suite, black, flake8, mypy; coverage ≥95%
-    - Confirm every route refuses while disabled and mutating POSTs refuse a
-      cross-site `Sec-Fetch-Site`/`Origin` or a non-loopback `Host` (7.7)
+    - Confirm every route refuses while disabled, non-health routes refuse a
+      bad HMAC, mutating POSTs a cross-site `Sec-Fetch-Site`/non-loopback `Host`
     - Confirm no approve/decline route or control anywhere
     - Simulate a merged commit touching steering, a skill and `crons.json`
       applying automatically; confirm propagation states and paused cron

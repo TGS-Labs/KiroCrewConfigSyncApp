@@ -13,11 +13,14 @@ file covers are the ones that remain:
 
   | Route | Purpose |
   |---|---|
-  | GET  /api/apps/config-sync/status  | push state, drift flag, last-seen
-  |                                       SHA |
-  | GET  /api/apps/config-sync/drift   | tree hash vs last pushed + changed
-  |                                       files |
-  | POST /api/apps/config-sync/push    | push-now |
+  | GET  /api/status  | push state, drift flag, last-seen
+  |                     SHA |
+  | GET  /api/drift   | tree hash vs last pushed + changed
+  |                     files |
+  | POST /api/push    | push-now |
+
+(Backend paths as the gateway forwards them; the browser calls
+`/apps/config-sync/api/...`.)
 
 Interface:
 

@@ -520,15 +520,18 @@ landed from `main` without reading logs.
 5. WHEN the app is disabled THEN every backend route SHALL refuse the request,
    so the app is inert until explicitly enabled.
 6. No UI field or API response SHALL contain an unredacted credential.
-7. Every state-mutating POST route (push-now, undo) SHALL refuse a request
-   that a browser marks as cross-site — `Sec-Fetch-Site` other than
-   `same-origin`/`none`, or, when that header is absent, an `Origin` whose
-   host differs from the request's own loopback `Host` — and SHALL refuse a
-   non-loopback `Host`; a request from another site open in the operator's
-   browser therefore cannot trigger a mutation. (The dashboard's real
-   `@kirocrew/app-sdk` `post()` cannot attach a custom header, so the
-   original `X-Config-Sync-Request: 1` rule is superseded by this
-   fetch-metadata check.)
+7. Every backend route except `GET /health` SHALL refuse (401, before any
+   route logic runs) a request that does not carry a valid, fresh (±60 s)
+   KiroCrew gateway signature (`X-KiroCrew-Proxy`, HMAC-SHA256 over
+   timestamp, method, raw request-target and body hash, keyed by the
+   per-app `KIROCREW_PROXY_SECRET`), so a local process that reaches the
+   loopback socket directly cannot bypass the gateway. Every state-mutating
+   POST route (push-now, undo) SHALL additionally refuse (403) a request
+   whose `Sec-Fetch-Site` is present and other than `same-origin`/`none`,
+   and a non-loopback `Host`. (Superseded: the `X-Config-Sync-Request: 1`
+   header rule — the real `@kirocrew/app-sdk` `post()` cannot attach a
+   header — and the `Origin`-vs-`Host` fallback — the gateway forwards the
+   dashboard `Origin` with a rewritten loopback `Host`, so it never matched.)
 
 ### Requirement 8
 

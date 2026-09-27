@@ -1,28 +1,28 @@
-import { jsxs as t, jsx as n, Fragment as u } from "react/jsx-runtime";
-import { useAppApi as L } from "@kirocrew/app-sdk";
-import { PageHeader as k } from "@kirocrew/app-sdk/ui";
-import { useRef as N, useState as m, useEffect as R } from "react";
-const p = {
+import { jsxs as r, jsx as n, Fragment as u } from "react/jsx-runtime";
+import { useAppApi as j } from "@kirocrew/app-sdk";
+import { PageHeader as P } from "@kirocrew/app-sdk/ui";
+import { useRef as N, useState as h, useEffect as z } from "react";
+const m = {
   background: "var(--card)",
   color: "var(--card-fg)",
   border: "1px solid var(--border)",
   borderRadius: 8,
   padding: "1rem"
-}, d = {
+}, c = {
   color: "var(--muted)"
 };
 function g(e) {
-  const r = e === "warn" ? "--warn-subtle" : e === "danger" ? "--danger-subtle" : "--ok-subtle", i = e === "warn" ? "--warn" : e === "danger" ? "--danger" : "--ok";
+  const i = e === "warn" ? "--warn-subtle" : e === "danger" ? "--danger-subtle" : "--ok-subtle", t = e === "warn" ? "--warn" : e === "danger" ? "--danger" : "--ok";
   return {
-    background: `var(${r})`,
-    color: `var(${i})`,
-    border: `1px solid var(${i})`,
+    background: `var(${i})`,
+    color: `var(${t})`,
+    border: `1px solid var(${t})`,
     borderRadius: 6,
     padding: "0.5rem 0.75rem",
     marginTop: "0.5rem"
   };
 }
-function z() {
+function R() {
   return {
     background: "var(--accent-subtle)",
     color: "var(--accent)",
@@ -35,7 +35,7 @@ function z() {
     fontSize: "0.85rem"
   };
 }
-function w() {
+function S() {
   return {
     background: "var(--accent)",
     color: "var(--card)",
@@ -46,7 +46,7 @@ function w() {
     fontSize: "0.85rem"
   };
 }
-function v(e) {
+function _(e) {
   if (!e) return "never";
   try {
     return new Date(e).toLocaleString();
@@ -54,51 +54,58 @@ function v(e) {
     return e;
   }
 }
-function $({
+function E({
   drift: e,
-  onPushNow: r,
-  pushing: i
+  onPushNow: i,
+  pushing: t
 }) {
-  return /* @__PURE__ */ t("div", { style: p, children: [
+  return /* @__PURE__ */ r("div", { style: m, children: [
     /* @__PURE__ */ n("h2", { style: { margin: 0, fontSize: "0.9rem" }, children: "Local changes" }),
     /* @__PURE__ */ n("p", { style: { fontSize: "1.5rem", margin: "0.5rem 0" }, children: e ? "Yes" : "No changes yet" }),
-    e ? /* @__PURE__ */ n("button", { type: "button", style: w(), onClick: r, disabled: i, children: i ? "Pushing…" : "Push now" }) : /* @__PURE__ */ n("p", { style: d, children: "Tracked tree matches the last pushed hash." })
+    e ? /* @__PURE__ */ n("button", { type: "button", style: S(), onClick: i, disabled: t, children: t ? "Pushing…" : "Push now" }) : /* @__PURE__ */ n("p", { style: c, children: "Tracked tree matches the last pushed hash." })
   ] });
 }
 function O({
   lastPush: e,
-  failure: r
+  failure: i
 }) {
-  return /* @__PURE__ */ t("div", { style: p, children: [
+  return /* @__PURE__ */ r("div", { style: m, children: [
     /* @__PURE__ */ n("h2", { style: { margin: 0, fontSize: "0.9rem" }, children: "Last push" }),
-    e ? /* @__PURE__ */ t(u, { children: [
-      /* @__PURE__ */ n("p", { style: { margin: "0.5rem 0" }, children: v(e.time) }),
+    e ? /* @__PURE__ */ r(u, { children: [
+      /* @__PURE__ */ n("p", { style: { margin: "0.5rem 0" }, children: _(e.time) }),
       /* @__PURE__ */ n("p", { children: /* @__PURE__ */ n("a", { href: e.pr_url, target: "_blank", rel: "noreferrer", children: e.pr_url }) }),
-      /* @__PURE__ */ n("p", { style: d, children: e.merged ? "Merged" : "Open — needs merging" })
-    ] }) : /* @__PURE__ */ n("p", { style: d, children: "No push yet — never pushed." }),
-    r ? /* @__PURE__ */ t("p", { style: { color: "var(--danger)" }, children: [
-      r.reason,
-      r.time ? ` (${v(r.time)})` : null
+      /* @__PURE__ */ n("p", { style: c, children: e.merged ? "Merged" : "Open — needs merging" })
+    ] }) : /* @__PURE__ */ n("p", { style: c, children: "No push yet — never pushed." }),
+    i ? /* @__PURE__ */ r("p", { style: { color: "var(--danger)" }, children: [
+      i.reason,
+      i.time ? ` (${_(i.time)})` : null
     ] }) : null
   ] });
 }
-function P({
+function U({
   lastSeenSha: e,
-  pollFailure: r
+  pollFailure: i,
+  consecutiveFailures: t,
+  pollPaused: l
 }) {
-  return /* @__PURE__ */ t("div", { style: p, children: [
+  return /* @__PURE__ */ r("div", { style: m, children: [
     /* @__PURE__ */ n("h2", { style: { margin: 0, fontSize: "0.9rem" }, children: "From main" }),
-    /* @__PURE__ */ n("p", { style: { fontSize: "1.1rem", margin: "0.5rem 0" }, children: "Up to date" }),
-    /* @__PURE__ */ t("p", { style: d, children: [
+    /* @__PURE__ */ n("p", { style: { fontSize: "1.1rem", margin: "0.5rem 0" }, children: l ? "Polling paused" : "Up to date" }),
+    /* @__PURE__ */ r("p", { style: c, children: [
       "Last-seen sha: ",
       e ? e.slice(0, 7) : "none"
     ] }),
-    r ? /* @__PURE__ */ t("div", { style: { color: "var(--danger)" }, children: [
-      /* @__PURE__ */ t("p", { style: { margin: "0.25rem 0" }, children: [
-        r.reason,
-        r.time ? ` (${v(r.time)})` : null
+    i ? /* @__PURE__ */ r("div", { style: { color: "var(--danger)" }, children: [
+      /* @__PURE__ */ r("p", { style: { margin: "0.25rem 0" }, children: [
+        i.reason,
+        i.time ? ` (${_(i.time)})` : null
       ] }),
-      /* @__PURE__ */ n("p", { style: d, children: "The poll job is failing — see the reason above. Repeated failures may pause the poll job (KiroCrew pauses a cron after 5 consecutive failures); the status response has no field reporting a consecutive-failure count or paused state." })
+      t > 0 ? /* @__PURE__ */ r("p", { style: { margin: "0.25rem 0" }, children: [
+        t,
+        " consecutive poll failure",
+        t === 1 ? "" : "s"
+      ] }) : null,
+      l ? /* @__PURE__ */ n("p", { style: c, children: "Polling is paused after repeated failures; Push now or Undo resumes it." }) : null
     ] }) : null
   ] });
 }
@@ -108,31 +115,31 @@ const T = [
   { cls: "live_in_new_session", label: "live in a new session" },
   { cls: "live_on_next_resolution", label: "live on next resolution" }
 ];
-function E({ lastApply: e }) {
-  const r = {
+function I({ lastApply: e }) {
+  const i = {
     live_immediate: 0,
     live_within_60s: 0,
     live_in_new_session: 0,
     live_on_next_resolution: 0
   };
-  for (const i of Object.values(e.propagation ?? {}))
-    i.propagation_class !== void 0 && (r[i.propagation_class] = (r[i.propagation_class] ?? 0) + 1);
-  return /* @__PURE__ */ n("div", { style: { display: "flex", flexWrap: "wrap", gap: "0.5rem", marginTop: "0.75rem" }, children: T.map(({ cls: i, label: c }) => /* @__PURE__ */ t("span", { style: z(), children: [
-    c,
-    /* @__PURE__ */ n("span", { children: r[i] })
-  ] }, i)) });
+  for (const t of Object.values(e.propagation ?? {}))
+    t.propagation_class !== void 0 && (i[t.propagation_class] = (i[t.propagation_class] ?? 0) + 1);
+  return /* @__PURE__ */ n("div", { style: { display: "flex", flexWrap: "wrap", gap: "0.5rem", marginTop: "0.75rem" }, children: T.map(({ cls: t, label: l }) => /* @__PURE__ */ r("span", { style: R(), children: [
+    l,
+    /* @__PURE__ */ n("span", { children: i[t] })
+  ] }, t)) });
 }
-function U({
+function B({
   lastApply: e,
-  onUndo: r,
-  undoing: i
+  onUndo: i,
+  undoing: t
 }) {
-  var c, h;
-  return /* @__PURE__ */ t("div", { style: p, children: [
+  var l, p;
+  return /* @__PURE__ */ r("div", { style: m, children: [
     /* @__PURE__ */ n("h2", { style: { margin: 0, fontSize: "0.9rem" }, children: "Last apply" }),
-    e ? /* @__PURE__ */ t(u, { children: [
+    e ? /* @__PURE__ */ r(u, { children: [
       /* @__PURE__ */ n("p", { style: { margin: "0.5rem 0" }, children: e.outcome === "applied" ? "Applied" : `Outcome: ${e.outcome}` }),
-      /* @__PURE__ */ t("p", { style: d, children: [
+      /* @__PURE__ */ r("p", { style: c, children: [
         "Applied sha: ",
         e.sha.slice(0, 7)
       ] }),
@@ -140,97 +147,101 @@ function U({
         "button",
         {
           type: "button",
-          style: w(),
-          onClick: () => r(e.apply_id),
-          disabled: i,
-          children: i ? "Undoing…" : "Undo this apply"
+          style: S(),
+          onClick: () => i(e.apply_id),
+          disabled: t,
+          children: t ? "Undoing…" : "Undo this apply"
         }
       ),
-      /* @__PURE__ */ n(E, { lastApply: e }),
-      e.paused_cron_names.length > 0 ? /* @__PURE__ */ t("div", { style: g("warn"), children: [
+      /* @__PURE__ */ n(I, { lastApply: e }),
+      e.paused_cron_names.length > 0 ? /* @__PURE__ */ r("div", { style: g("warn"), children: [
         /* @__PURE__ */ n("strong", { children: "Paused crons" }),
-        /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: e.paused_cron_names.map((a) => {
-          const s = e.changed_commands.find((o) => o.name === a);
-          return /* @__PURE__ */ t("li", { children: [
-            a,
-            s ? /* @__PURE__ */ t(u, { children: [
+        /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: e.paused_cron_names.map((o) => {
+          const s = e.changed_commands.find((d) => d.name === o);
+          return /* @__PURE__ */ r("li", { children: [
+            o,
+            s ? /* @__PURE__ */ r(u, { children: [
               " — ",
               /* @__PURE__ */ n("code", { children: s.command })
             ] }) : null
-          ] }, a);
+          ] }, o);
         }) })
       ] }) : null,
-      Object.keys(e.not_applied).length > 0 ? /* @__PURE__ */ t("div", { style: g("warn"), children: [
+      Object.keys(e.not_applied).length > 0 ? /* @__PURE__ */ r("div", { style: g("warn"), children: [
         /* @__PURE__ */ n("strong", { children: "Not applied" }),
-        /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: Object.entries(e.not_applied).map(([a, s]) => /* @__PURE__ */ t("li", { children: [
-          a,
+        /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: Object.entries(e.not_applied).map(([o, s]) => /* @__PURE__ */ r("li", { children: [
+          o,
           s ? `: ${s}` : null
-        ] }, a)) })
+        ] }, o)) })
       ] }) : null,
       (() => {
-        const a = new Set(
-          Object.keys(e.not_applied).map((o) => o.split(":")[0])
+        const o = new Set(
+          Object.keys(e.not_applied).map((d) => d.split(":")[0])
         ), s = e.needs_credential.filter(
-          (o) => !a.has(o.split(":")[0])
+          (d) => !o.has(d.split(":")[0])
         );
-        return s.length > 0 ? /* @__PURE__ */ t("div", { style: g("danger"), children: [
+        return s.length > 0 ? /* @__PURE__ */ r("div", { style: g("danger"), children: [
           /* @__PURE__ */ n("strong", { children: "Needs credential" }),
-          /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: s.map((o) => /* @__PURE__ */ n("li", { children: o }, o)) })
+          /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: s.map((d) => /* @__PURE__ */ n("li", { children: d }, d)) })
         ] }) : null;
       })(),
-      e.applied.includes("crons.json") || e.applied.includes("instances.json") || (((c = e.changed_instance_names) == null ? void 0 : c.length) ?? 0) > 0 ? /* @__PURE__ */ t("div", { style: g("ok"), children: [
+      e.applied.includes("crons.json") || e.applied.includes("instances.json") || (((l = e.changed_instance_names) == null ? void 0 : l.length) ?? 0) > 0 ? /* @__PURE__ */ r("div", { style: g("ok"), children: [
         "This is a deliberate exception to instance isolation: crons.json/instances.json sync by design.",
-        (((h = e.changed_instance_names) == null ? void 0 : h.length) ?? 0) > 0 ? /* @__PURE__ */ t(u, { children: [
+        (((p = e.changed_instance_names) == null ? void 0 : p.length) ?? 0) > 0 ? /* @__PURE__ */ r(u, { children: [
           " ",
           "Instances affected: ",
           e.changed_instance_names.join(", "),
           "."
         ] }) : null
       ] }) : null
-    ] }) : /* @__PURE__ */ n("p", { style: d, children: "Never applied yet." })
+    ] }) : /* @__PURE__ */ n("p", { style: c, children: "Never applied yet." })
   ] });
 }
-function F() {
-  const e = L(), r = N(e);
-  r.current = e;
-  const [i, c] = m(null), [h, a] = m(null), [s, o] = m(!0), [S, _] = m(!1), [x, b] = m(!1);
+const w = "/apps/config-sync/api";
+function V() {
+  const e = j(), i = N(e);
+  i.current = e;
+  const t = {
+    get: (a) => i.current.get(`${w}${a}`),
+    post: (a) => i.current.post(`${w}${a}`)
+  }, [l, p] = h(null), [o, s] = h(null), [d, x] = h(!0), [C, v] = h(!1), [L, b] = h(!1);
   async function f() {
     try {
-      const l = await r.current.get("/status");
-      c(l), a(null);
-    } catch (l) {
-      a(l instanceof Error ? l.message : String(l));
+      const a = await t.get("/status");
+      p(a), s(null);
+    } catch (a) {
+      s(a instanceof Error ? a.message : String(a));
     } finally {
-      o(!1);
+      x(!1);
     }
   }
-  R(() => {
+  z(() => {
     f();
   }, []);
-  async function C() {
-    _(!0);
+  async function k() {
+    v(!0);
     try {
-      await r.current.post("/push"), await f();
-    } catch (l) {
-      a(l instanceof Error ? l.message : String(l));
+      await t.post("/push"), await f();
+    } catch (a) {
+      s(a instanceof Error ? a.message : String(a));
     } finally {
-      _(!1);
+      v(!1);
     }
   }
-  async function j(l) {
+  async function $(a) {
     b(!0);
     try {
-      await r.current.post(`/restore/${l}`), await f();
+      await t.post(`/restore/${a}`), await f();
     } catch (y) {
-      a(y instanceof Error ? y.message : String(y));
+      s(y instanceof Error ? y.message : String(y));
     } finally {
       b(!1);
     }
   }
-  return /* @__PURE__ */ t(u, { children: [
-    /* @__PURE__ */ n(k, { title: "Config bundle status", subtitle: "Keeps this box aligned with Kiro-Config-Bundles" }),
-    /* @__PURE__ */ n("div", { className: "px-6 pb-8 overflow-y-auto flex-1 min-h-0", children: s ? /* @__PURE__ */ n("p", { style: d, children: "Loading…" }) : h ? /* @__PURE__ */ n("div", { style: p, children: /* @__PURE__ */ n("p", { style: { color: "var(--danger)" }, children: h }) }) : i ? /* @__PURE__ */ t(u, { children: [
-      /* @__PURE__ */ t(
+  return /* @__PURE__ */ r(u, { children: [
+    /* @__PURE__ */ n(P, { title: "Config bundle status", subtitle: "Keeps this box aligned with Kiro-Config-Bundles" }),
+    /* @__PURE__ */ n("div", { className: "px-6 pb-8 overflow-y-auto flex-1 min-h-0", children: d ? /* @__PURE__ */ n("p", { style: c, children: "Loading…" }) : o ? /* @__PURE__ */ n("div", { style: m, children: /* @__PURE__ */ n("p", { style: { color: "var(--danger)" }, children: o }) }) : l ? /* @__PURE__ */ r(u, { children: [
+      /* @__PURE__ */ r(
         "div",
         {
           style: {
@@ -240,22 +251,24 @@ function F() {
             marginBottom: "1.5rem"
           },
           children: [
-            /* @__PURE__ */ n($, { drift: i.drift, onPushNow: C, pushing: S }),
-            /* @__PURE__ */ n(O, { lastPush: i.last_push, failure: i.last_push_failure }),
+            /* @__PURE__ */ n(E, { drift: l.drift, onPushNow: k, pushing: C }),
+            /* @__PURE__ */ n(O, { lastPush: l.last_push, failure: l.last_push_failure }),
             /* @__PURE__ */ n(
-              P,
+              U,
               {
-                lastSeenSha: i.last_seen_sha,
-                pollFailure: i.last_poll_failure
+                lastSeenSha: l.last_seen_sha,
+                pollFailure: l.last_poll_failure,
+                consecutiveFailures: l.poll_consecutive_failures,
+                pollPaused: l.poll_paused
               }
             )
           ]
         }
       ),
-      /* @__PURE__ */ n(U, { lastApply: i.last_apply, onUndo: j, undoing: x })
+      /* @__PURE__ */ n(B, { lastApply: l.last_apply, onUndo: $, undoing: L })
     ] }) : null })
   ] });
 }
 export {
-  F as default
+  V as default
 };

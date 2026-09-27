@@ -13,32 +13,27 @@ the poll tick applies automatically with no box-side decision step.
 `push` and `restore` remain as the two mutation-capable POST targets
 this guard is proven against.**
 
-## Redesigned guard (senior review round 3, finding C-B)
+## Redesigned guard (round 3 C-B; round 4 fix B)
 
 The original H7 design required a custom header
 (``X-Config-Sync-Request: 1``) on every mutating request. Reading the
 REAL ``@kirocrew/app-sdk`` host implementation showed its ``post()`` has
-no headers parameter at all — a real app UI can never attach a custom
-header to a mutating call, so a header-only guard would permanently
-403 every legitimate mutation from the shipped dashboard page. See
-``backend/server.py``'s module docstring ("Mutation-request guard") for
-the full rationale. The guard is redesigned around fetch-metadata
-headers a browser sets and page JavaScript cannot override
-(``Sec-Fetch-Site``, falling back to an ``Origin``-vs-``Host`` match
-when it is absent) plus the original ``Host`` loopback pin. Every
-assertion below is updated to this contract; see the docstring on each
-changed test for the exact before/after.
+no headers parameter at all, so that rule is superseded. Round 4 made
+the gateway HMAC (``X-KiroCrew-Proxy``, see
+``tests/test_review4_proxy_auth.py``) the authentication on every
+non-health route and REMOVED round 3's ``Origin``-vs-``Host`` fallback:
+the gateway rewrites ``Host`` to the backend's loopback address but
+forwards the dashboard's ``Origin`` unchanged, so that fallback 403'd
+every legitimate mutation on a non-localhost dashboard. Every request
+this file sends is validly signed unless a test says otherwise, so each
+assertion isolates the same-site/Host guard layered on top.
 
 ## Pinned interfaces this file requires `backend/server.py` to implement
 
-1. **Same-site check.** A mutating request must be same-site: either
-   ``Sec-Fetch-Site`` is ``same-origin``/``none``, or (when that header
-   is absent) an ``Origin`` header whose host matches the request's own
-   ``Host``, or (when BOTH are absent — a bare loopback CLI/script call)
-   it is treated as same-site. A cross-site browser `fetch` always sets
-   at least one of these two forbidden-header-name values, so this is a
-   real CSRF barrier a malicious page cannot spoof, unlike the retired
-   custom-header check the real SDK could never satisfy.
+1. **Same-site check.** A mutating request carrying ``Sec-Fetch-Site``
+   must carry ``same-origin``/``none``; any other value is refused with
+   ``403``. An absent ``Sec-Fetch-Site`` is not refused, whatever
+   ``Origin`` says — there is no ``Origin`` fallback.
 2. **Loopback-only `Host` header.** A request whose `Host` header is not
    a loopback name/address (``127.0.0.1``, ``localhost``, ``[::1]``, each
    optionally with a port) is refused with ``403`` — this is DNS
@@ -47,15 +42,17 @@ changed test for the exact before/after.
    the browser send a request with a `Host` header of anything but
    `evil.example` unless it already resolved to loopback, so pinning
    `Host` catches the rebinding case the loopback bind alone does not.
-3. **GET routes are unaffected.** Neither check applies to `GET status`
-   or `GET drift` — this is a mutation guard, not a blanket auth layer
-   the design does not otherwise call for.
+3. **GET routes are unaffected by checks 1-2** (they still require the
+   gateway signature).
 4. **Cross-origin `Origin` + form content-type is still caught.** A
    cross-origin `fetch` sending
    `Content-Type: application/x-www-form-urlencoded` (a "simple request"
    that skips CORS preflight) with a real browser's `Sec-Fetch-Site:
    cross-site` is still refused — proving the guard does not
    special-case content-type.
+5. **An unsigned request never reaches a route**, whatever its
+   fetch-metadata headers — a local process bypassing the gateway gets
+   ``401``.
 
 This file does not prescribe HOW the check is implemented inside
 `Handler._dispatch` (or wherever) — only the request/response contract
@@ -74,14 +71,17 @@ from typing import Any, Dict, Iterator, List, Tuple
 
 import pytest
 
+from backend.server import _PREFIX
+from proxy_sign import PROXY_SECRET_ENV, TEST_PROXY_SECRET, signed_headers
+
 _MUTATING_REQUESTS: List[Tuple[str, str]] = [
-    ("POST", "/api/apps/config-sync/push"),
-    ("POST", "/api/apps/config-sync/restore/apply-1"),
+    ("POST", f"{_PREFIX}/push"),
+    ("POST", f"{_PREFIX}/restore/apply-1"),
 ]
 
 _GET_REQUESTS: List[Tuple[str, str]] = [
-    ("GET", "/api/apps/config-sync/status"),
-    ("GET", "/api/apps/config-sync/drift"),
+    ("GET", f"{_PREFIX}/status"),
+    ("GET", f"{_PREFIX}/drift"),
 ]
 
 
@@ -95,6 +95,7 @@ _GET_REQUESTS: List[Tuple[str, str]] = [
 def isolated_state_dir(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     state_dir = tmp_path / "config-sync-state"
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv(PROXY_SECRET_ENV, TEST_PROXY_SECRET)
     yield state_dir
 
 
@@ -175,10 +176,16 @@ def _request(
     path: str,
     headers: Dict[str, str] | None = None,
     body: bytes | None = None,
+    *,
+    signed: bool = True,
 ) -> Tuple[int, Dict[str, str], bytes]:
+    """Send one request; validly gateway-signed unless ``signed=False``."""
+    out = dict(headers or {})
+    if signed:
+        out = signed_headers(method, path, body or b"", out)
     conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
-        conn.request(method, path, body=body, headers=headers or {})
+        conn.request(method, path, body=body, headers=out)
         resp = conn.getresponse()
         payload = resp.read()
         response_headers = {k.lower(): v for k, v in resp.getheaders()}
@@ -274,24 +281,47 @@ def test_mutating_request_with_same_site_sec_fetch_site_is_refused_403(
 
 
 @pytest.mark.parametrize("method,path", _MUTATING_REQUESTS)
-def test_mutating_request_with_cross_site_origin_and_no_sec_fetch_site_is_refused_403(
+def test_mutating_request_with_mismatched_origin_and_no_sec_fetch_site_is_allowed(
     running_server: Tuple[str, int],
     route_calls: Dict[str, int],
     method: str,
     path: str,
 ) -> None:
-    """When `Sec-Fetch-Site` is absent (an older browser), the `Origin`
+    """Round 4 fix B: the `Origin`-vs-`Host` fallback is REMOVED. A
 
-    fallback must still catch a mismatched Origin: an `Origin` whose host
-    does not match the request's own loopback `Host` is refused, even
-    with no `Sec-Fetch-Site` header at all.
+    validly-signed request with no `Sec-Fetch-Site` and an `Origin` that
+    does not match `Host` — exactly what the gateway forwards from a
+    non-localhost dashboard — reaches the route. (Previously 403.)
     """
     host, port = running_server
     headers = {"Host": f"{host}:{port}", "Origin": "https://evil.example"}
 
     status_code, _headers, _body = _request(host, port, method, path, headers=headers)
 
-    assert status_code == 403
+    assert status_code == 200
+    assert sum(route_calls.values()) == 1
+
+
+@pytest.mark.parametrize("method,path", _MUTATING_REQUESTS)
+def test_mutating_request_with_mismatched_origin_unsigned_is_refused_401(
+    running_server: Tuple[str, int],
+    route_calls: Dict[str, int],
+    method: str,
+    path: str,
+) -> None:
+    """The HMAC, not `Origin`, is what refuses a caller that bypassed the
+
+    gateway: the same headers as above WITHOUT a signature -> 401, route
+    never called.
+    """
+    host, port = running_server
+    headers = {"Host": f"{host}:{port}", "Origin": "https://evil.example"}
+
+    status_code, _headers, _body = _request(
+        host, port, method, path, headers=headers, signed=False
+    )
+
+    assert status_code == 401
     assert sum(route_calls.values()) == 0
 
 
@@ -302,11 +332,10 @@ def test_mutating_request_with_matching_origin_and_no_sec_fetch_site_reaches_the
     method: str,
     path: str,
 ) -> None:
-    """Control for the Origin fallback: an `Origin` whose host DOES match
+    """A signed request whose `Origin` matches `Host`, with no
 
-    `Host`, with no `Sec-Fetch-Site` at all, is same-site and must reach
-    the route — proves the fallback isn't just refusing everything when
-    `Sec-Fetch-Site` is absent.
+    `Sec-Fetch-Site`, reaches the route (unchanged by the fallback's
+    removal).
     """
     host, port = running_server
     headers = {"Host": f"{host}:{port}", "Origin": f"http://{host}:{port}"}
@@ -324,12 +353,10 @@ def test_mutating_request_with_neither_fetch_metadata_header_reaches_the_route(
     method: str,
     path: str,
 ) -> None:
-    """A bare loopback CLI/script call (no `Sec-Fetch-Site`, no `Origin`
+    """A signed request with no `Sec-Fetch-Site` and no `Origin` passes
 
-    at all) is treated as same-site — this is the shape of the gateway's
-    own proxied request and this project's other test suites, none of
-    which are browser fetches and none of which set fetch-metadata
-    headers.
+    the same-site check — the shape of a gateway-forwarded non-browser
+    call.
     """
     host, port = running_server
     headers = {"Host": f"{host}:{port}"}
@@ -338,6 +365,29 @@ def test_mutating_request_with_neither_fetch_metadata_header_reaches_the_route(
 
     assert status_code == 200
     assert sum(route_calls.values()) == 1
+
+
+@pytest.mark.parametrize("method,path", _MUTATING_REQUESTS + _GET_REQUESTS)
+def test_unsigned_request_with_neither_fetch_metadata_header_is_refused_401(
+    running_server: Tuple[str, int],
+    route_calls: Dict[str, int],
+    method: str,
+    path: str,
+) -> None:
+    """A bare local-process call straight to the loopback socket (no
+
+    signature, no fetch-metadata) is refused 401 before any route runs —
+    loopback reachability is not authentication.
+    """
+    host, port = running_server
+    headers = {"Host": f"{host}:{port}"}
+
+    status_code, _headers, _body = _request(
+        host, port, method, path, headers=headers, signed=False
+    )
+
+    assert status_code == 401
+    assert sum(route_calls.values()) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -455,3 +505,63 @@ def test_cross_origin_form_style_request_without_header_is_still_refused(
 
     assert status_code == 403
     assert sum(route_calls.values()) == 0
+
+
+# ---------------------------------------------------------------------------
+# The signature covers the body, so the body is read (bounded) before the
+# signature is checked; an unusable Content-Length is refused outright.
+# ---------------------------------------------------------------------------
+
+
+def _raw_post(host: str, port: int, path: str, content_length: str) -> int:
+    """POST with a hand-set `Content-Length` (http.client would compute
+    its own from the body) and return the status code."""
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", f"{host}:{port}")
+        for name, value in signed_headers("POST", path, b"").items():
+            conn.putheader(name, value)
+        conn.putheader("Content-Length", content_length)
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("content_length", ["abc", "-1", str(2 * 1024 * 1024)])
+def test_unusable_content_length_is_refused_400_before_any_route(
+    running_server: Tuple[str, int],
+    route_calls: Dict[str, int],
+    content_length: str,
+) -> None:
+    host, port = running_server
+
+    status_code = _raw_post(host, port, f"{_PREFIX}/push", content_length)
+
+    assert status_code == 400
+    assert sum(route_calls.values()) == 0
+
+
+def test_signed_request_body_is_read_and_verified(
+    running_server: Tuple[str, int],
+    route_calls: Dict[str, int],
+) -> None:
+    """A body the signature covers is accepted; the same request with one
+    byte changed is refused 401 — proves the body is actually hashed."""
+    host, port = running_server
+    path = f"{_PREFIX}/push"
+    body = b'{"k": "v"}'
+    base = {"Host": f"{host}:{port}", "Sec-Fetch-Site": "same-origin"}
+
+    ok_status, _h, _b = _request(host, port, "POST", path, headers=base, body=body)
+    tampered = signed_headers("POST", path, body, base)
+    bad_status, _h2, _b2 = _request(
+        host, port, "POST", path, headers=tampered, body=b'{"k": "w"}', signed=False
+    )
+
+    assert ok_status == 200
+    assert bad_status == 401
+    assert sum(route_calls.values()) == 1

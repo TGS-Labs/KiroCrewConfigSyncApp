@@ -50,6 +50,8 @@ from typing import Any, Callable, Dict, Iterator, List, Tuple
 
 import pytest
 
+from backend.server import _PREFIX
+from proxy_sign import PROXY_SECRET_ENV, TEST_PROXY_SECRET, signed_headers
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -60,6 +62,9 @@ import pytest
 def isolated_state_dir(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     state_dir = tmp_path / "config-sync-state"
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    # Every non-health route requires the gateway HMAC; sign with the
+    # shared test secret (tests/proxy_sign.py).
+    monkeypatch.setenv(PROXY_SECRET_ENV, TEST_PROXY_SECRET)
     yield state_dir
 
 
@@ -166,17 +171,14 @@ def running_server(
         thread.join(timeout=5)
 
 
-# senior-review H7 (see tests/test_server_security.py): every mutating
-# POST now requires this custom header plus a loopback Host, or the
-# server refuses it with 403 before any route runs. This file's own
-# tests are about HTTP-to-function WIRING (verb, path, path-parameter
-# extraction, status/content-type shape, loopback-only bind) — not
-# about H7's guard itself — so every request _request() sends carries
-# a satisfying header/Host pair by default, letting each test keep
-# exercising what it was written for instead of being redirected into
-# a 403 the guard produces before the PATH guard/dispatch ever runs.
-_SECURITY_HEADER = "X-Config-Sync-Request"
-_SECURITY_HEADER_VALUE = "1"
+# Every non-health route requires a valid gateway signature, and every
+# mutating POST a loopback Host (see tests/test_server_security.py and
+# tests/test_review4_proxy_auth.py). This file's own tests are about
+# HTTP-to-function WIRING (verb, path, path-parameter extraction,
+# status/content-type shape, loopback-only bind) — not about the guard
+# itself — so every request _request() sends is signed and carries a
+# loopback Host, letting each test keep exercising what it was written
+# for instead of being redirected into a 401/403 before dispatch.
 
 
 def _request(
@@ -188,10 +190,7 @@ def _request(
 ) -> Tuple[int, Dict[str, str], bytes]:
     conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
-        headers = {
-            "Host": f"{host}:{port}",
-            _SECURITY_HEADER: _SECURITY_HEADER_VALUE,
-        }
+        headers = signed_headers(method, path, body or b"", {"Host": f"{host}:{port}"})
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         payload = resp.read()
@@ -211,9 +210,7 @@ def test_get_status_dispatches_to_routes_status(
     route_calls: Dict[str, List[Tuple[Any, ...]]],
 ) -> None:
     host, port = running_server
-    status_code, headers, body = _request(
-        host, port, "GET", "/api/apps/config-sync/status"
-    )
+    status_code, headers, body = _request(host, port, "GET", f"{_PREFIX}/status")
 
     assert status_code == 200
     assert headers.get("content-type", "").startswith("application/json")
@@ -227,9 +224,7 @@ def test_get_drift_dispatches_to_routes_drift(
     route_calls: Dict[str, List[Tuple[Any, ...]]],
 ) -> None:
     host, port = running_server
-    status_code, headers, body = _request(
-        host, port, "GET", "/api/apps/config-sync/drift"
-    )
+    status_code, headers, body = _request(host, port, "GET", f"{_PREFIX}/drift")
 
     assert status_code == 200
     assert headers.get("content-type", "").startswith("application/json")
@@ -243,9 +238,7 @@ def test_post_push_dispatches_to_routes_push_now(
     route_calls: Dict[str, List[Tuple[Any, ...]]],
 ) -> None:
     host, port = running_server
-    status_code, headers, body = _request(
-        host, port, "POST", "/api/apps/config-sync/push"
-    )
+    status_code, headers, body = _request(host, port, "POST", f"{_PREFIX}/push")
 
     assert status_code == 200
     assert headers.get("content-type", "").startswith("application/json")
@@ -261,7 +254,7 @@ def test_post_restore_dispatches_to_routes_restore_with_id(
     host, port = running_server
     apply_id = "apply-20260101010101"
     status_code, headers, body = _request(
-        host, port, "POST", f"/api/apps/config-sync/restore/{apply_id}"
+        host, port, "POST", f"{_PREFIX}/restore/{apply_id}"
     )
 
     assert status_code == 200
@@ -280,8 +273,8 @@ def test_post_restore_dispatches_to_routes_restore_with_id(
 @pytest.mark.parametrize(
     "path",
     [
-        "/api/apps/config-sync/push",
-        "/api/apps/config-sync/restore/apply-1",
+        f"{_PREFIX}/push",
+        f"{_PREFIX}/restore/apply-1",
     ],
 )
 def test_get_on_a_post_only_route_is_405_or_404(
@@ -305,8 +298,8 @@ def test_get_on_a_post_only_route_is_405_or_404(
 @pytest.mark.parametrize(
     "path",
     [
-        "/api/apps/config-sync/status",
-        "/api/apps/config-sync/drift",
+        f"{_PREFIX}/status",
+        f"{_PREFIX}/drift",
     ],
 )
 def test_post_on_a_get_only_route_is_405_or_404(
@@ -325,9 +318,12 @@ def test_post_on_a_get_only_route_is_405_or_404(
     "path",
     [
         "/",
-        "/api/apps/config-sync/",
-        "/api/apps/config-sync/nonexistent",
+        f"{_PREFIX}/",
+        f"{_PREFIX}/nonexistent",
         "/api/apps/other-app/status",
+        # The browser-visible SDK path is never served directly: only
+        # the gateway-rewritten `/api/...` form reaches a route.
+        "/apps/config-sync/api/status",
     ],
 )
 def test_unknown_path_is_404(
@@ -353,7 +349,7 @@ def test_restore_path_parameter_containing_slash_or_traversal_never_reaches_rout
 ) -> None:
     host, port = running_server
     status_code, _headers, _body = _request(
-        host, port, "POST", f"/api/apps/config-sync/restore/{apply_id}"
+        host, port, "POST", f"{_PREFIX}/restore/{apply_id}"
     )
 
     assert status_code in (400, 404, 405, 501)
@@ -365,10 +361,10 @@ def test_response_body_is_valid_json_with_json_content_type_on_every_route(
 ) -> None:
     host, port = running_server
     requests = [
-        ("GET", "/api/apps/config-sync/status"),
-        ("GET", "/api/apps/config-sync/drift"),
-        ("POST", "/api/apps/config-sync/push"),
-        ("POST", "/api/apps/config-sync/restore/apply-1"),
+        ("GET", f"{_PREFIX}/status"),
+        ("GET", f"{_PREFIX}/drift"),
+        ("POST", f"{_PREFIX}/push"),
+        ("POST", f"{_PREFIX}/restore/apply-1"),
     ]
     for method, path in requests:
         status_code, headers, body = _request(host, port, method, path)

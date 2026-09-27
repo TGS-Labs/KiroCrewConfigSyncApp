@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import subprocess
 from pathlib import Path
@@ -50,18 +51,21 @@ def test_shipped_ui_bundle_is_tracked_by_git() -> None:
         text=True,
         check=False,
     )
-    assert result.returncode == 0, (
-        f"{bundle.relative_to(APP_ROOT)} is not tracked by git: {result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"{bundle.relative_to(APP_ROOT)} is not tracked by git: {result.stderr}"
 
 
 def test_shipped_ui_bundle_matches_a_fresh_build(tmp_path: Path) -> None:
     """Rebuild into a scratch outDir and compare bytes: a source edit without
     a rebuilt, committed bundle fails here instead of shipping stale UI."""
+    # conftest.py redirects HOME to a per-test tmp dir, so Path.home() must
+    # not be used here: resolve the account's real home from the passwd db.
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     node_env = Path(
         os.environ.get(
             "CONFIG_SYNC_NODE_ENV",
-            str(Path.home() / ".kiro/crew/workspace/tools/node-env.sh"),
+            str(real_home / ".kiro/crew/workspace/tools/node-env.sh"),
         )
     )
     if shutil.which("npx") is None and not node_env.is_file():

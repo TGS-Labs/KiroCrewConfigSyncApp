@@ -392,17 +392,33 @@ no longer a decision to pend), `history` (bounded), and `restore_dirs`.
 
 Routes on the scaffolded backend (`backend/server.py`, `port: "auto"`,
 `healthCheck: "/health"`), every one wrapped in an enabled check so the app is
-inert while disabled. Every state-mutating POST additionally passes a
-same-site check (`Sec-Fetch-Site`, else `Origin` vs loopback `Host`) and a
-loopback `Host` check (Requirement 7.7) and is refused otherwise:
+inert while disabled. Request guard (Requirement 7.7), checked before any
+route runs:
 
-| Route | Purpose |
-|---|---|
-| `GET /health` | Scaffold-provided liveness |
-| `GET /api/apps/config-sync/status` | Push state, drift flag, last-seen SHA, last-apply summary (outcome, not-applied paths + reasons, `changed_commands`) |
-| `GET /api/apps/config-sync/drift` | Collected-tree hash vs last pushed, with per-file changed list |
-| `POST /api/apps/config-sync/push` | Run the push now (same code path as the cron); same-site + loopback-Host guard |
-| `POST /api/apps/config-sync/undo/{restore_id}` | Restore a backup from a previous apply; same-site + loopback-Host guard |
+1. Every route except `GET /health` requires a valid gateway signature
+   (`X-KiroCrew-Proxy: <ts>:<hmac_sha256(KIROCREW_PROXY_SECRET,
+   "<ts>:<method>:<raw target>:<sha256(body)>")>`, ±60 s, fail closed on an
+   empty secret) — else 401. `/health` stays unsigned for the gateway probe.
+2. Every mutating POST also refuses a present `Sec-Fetch-Site` other than
+   `same-origin`/`none`, and a non-loopback `Host` — else 403.
+
+Superseded: the `X-Config-Sync-Request` header rule and the `Origin`-vs-`Host`
+fallback (the gateway forwards the dashboard `Origin` with a rewritten
+loopback `Host`, so it could never match on a non-localhost dashboard).
+
+**SDK path contract.** The real `@kirocrew/app-sdk` adds no prefix: it refuses
+any path outside `app.json` `permissions.api` (`["/apps/config-sync/api"]`)
+and fetches the path as given. The gateway forwards
+`/apps/config-sync/api/<x>` to the backend as `/api/<x>`, so the backend's
+`_PREFIX` is `/api`.
+
+| UI calls (SDK path) | Backend route | Purpose |
+|---|---|---|
+| — (gateway probe) | `GET /health` | Scaffold-provided liveness; unsigned |
+| `GET /apps/config-sync/api/status` | `GET /api/status` | Push state, drift flag, last-seen SHA, last-apply summary (outcome, not-applied paths + reasons, `changed_commands`) |
+| `GET /apps/config-sync/api/drift` | `GET /api/drift` | Collected-tree hash vs last pushed, with per-file changed list |
+| `POST /apps/config-sync/api/push` | `POST /api/push` | Run the push now (same code path as the cron); mutation guard |
+| `POST /apps/config-sync/api/restore/{apply_id}` | `POST /api/restore/{apply_id}` | Restore a backup from a previous apply; mutation guard |
 
 There is deliberately **no approve or decline route**: the poll cron is the
 only caller of `apply.py`, and it calls it automatically on every new head.
@@ -424,9 +440,10 @@ only caller of `apply.py`, and it calls it automatically on every new head.
 - The Requirement 6 exception call-out rendered inline whenever
   `crons.json` or `instances.json` appear in the last-applied range.
 
-Every mutating fetch from the UI goes through the real `@kirocrew/app-sdk`
-`post()` (JSON body, no custom headers); the browser's own fetch metadata
-satisfies the same-site guard.
+Every UI fetch goes through the real `@kirocrew/app-sdk` (`App.tsx` spells out
+the declared `/apps/config-sync/api` prefix; mutating calls use `post()` with a
+JSON body and no custom headers); the gateway signs the forwarded request and
+the browser sets `Sec-Fetch-Site`.
 
 ## Data Flow
 

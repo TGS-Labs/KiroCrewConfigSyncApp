@@ -25,15 +25,16 @@
  * `get`/`post` are thin wrappers over global `fetch` against the app's own
  * route table (design.md's route table). Mocking at `fetch` — not mocking
  * `api.get`/`api.post` themselves — is what lets a test assert the exact
- * request path/method/body `App.tsx` sends. (Requirement 7.7's cross-site
- * protection is enforced server-side from browser fetch metadata — the real
- * SDK's `post()` cannot attach a custom header, see realShapedAppApi.ts.)
+ * request path/method/body `App.tsx` sends. (Requirement 7.7's protection
+ * is enforced server-side: the gateway HMAC plus browser fetch metadata —
+ * the real SDK's `post()` cannot attach a custom header, see
+ * realShapedAppApi.ts.)
  *
- * Route table (design.md, "backend/routes.py and the UI"):
- *   - GET  /api/apps/config-sync/status
- *   - GET  /api/apps/config-sync/drift
- *   - POST /api/apps/config-sync/push
- *   - POST /api/apps/config-sync/undo/{restore_id}
+ * Route table (design.md, "backend/routes.py and the UI") — the
+ * SDK-visible paths `App.tsx` calls; the real SDK adds NO prefix:
+ *   - GET  /apps/config-sync/api/status
+ *   - POST /apps/config-sync/api/push
+ *   - POST /apps/config-sync/api/restore/{apply_id}
  *
  * There is deliberately NO approve/decline/pending route in this design.
  *
@@ -61,22 +62,16 @@ import type { ReactNode } from 'react'
 // own relative API paths, matching demo-app's bundle (`api.get('/api/agents')`).
 // ---------------------------------------------------------------------------
 vi.mock('@kirocrew/app-sdk', () => {
-  const API_BASE = '/api/apps/config-sync'
-
   async function request(method: 'GET' | 'POST', path: string, body?: unknown) {
-    // Matches the REAL SDK's request shape exactly (see
-    // `realShapedAppApi.ts`): post() hardcodes only Content-Type, with no
-    // caller-supplied header of any kind — there is no
-    // `X-Config-Sync-Request` injection here or in production. The H7
-    // mutation guard (backend/server.py) was redesigned around
-    // `Sec-Fetch-Site`/`Origin` fetch-metadata precisely because no header
-    // this mock — or the real SDK — could ever attach would reach the
-    // backend from `post()`.
+    // Matches the REAL SDK's request shape (see `realShapedAppApi.ts`): the
+    // path is fetched exactly as given (no prefix is added), and post()
+    // hardcodes only Content-Type, with no caller-supplied header of any
+    // kind.
     const headers: Record<string, string> = {}
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json'
     }
-    const res = await fetch(`${API_BASE}${path}`, {
+    const res = await fetch(path, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -238,7 +233,7 @@ import App from './App'
 describe('ConfigSync dashboard — no approve/decline anywhere (operator ruling, requirements.md Introduction + 4.4)', () => {
   it('never renders an approve or decline control, even with a fresh unmerged last_push', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
     })
 
@@ -256,9 +251,9 @@ describe('ConfigSync dashboard — no approve/decline anywhere (operator ruling,
 
   it('never POSTs to a pending/approve or pending/decline path', async () => {
     const { calls } = installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
-      'POST /api/apps/config-sync/push': () => ({ status: 'ok', outcome: 'pushed' }),
+      'POST /apps/config-sync/api/push': () => ({ status: 'ok', outcome: 'pushed' }),
     })
 
     render(<App />)
@@ -285,7 +280,7 @@ describe('ConfigSync dashboard — no approve/decline anywhere (operator ruling,
 describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
   it('renders the local-changes card with drift state and a "Push now" button', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => statusResponse({ drift: true }),
+      'GET /apps/config-sync/api/status': () => statusResponse({ drift: true }),
     })
 
     render(<App />)
@@ -299,7 +294,7 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
 
   it('renders the local-changes card as "no" drift when the hash matches', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => statusResponse({ drift: false }),
+      'GET /apps/config-sync/api/status': () => statusResponse({ drift: false }),
     })
 
     render(<App />)
@@ -312,7 +307,7 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
 
   it('renders the last-push card with time, PR link, and unmerged status', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_push: {
             time: '2026-09-20T08:00:00Z',
@@ -336,7 +331,7 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
 
   it('renders the last-push card as merged when the PR has merged', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_push: {
             time: '2026-09-20T08:00:00Z',
@@ -357,7 +352,7 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
 
   it('renders the sync-from-main card with up-to-date state, last-seen sha, and check time', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_seen_sha: 'f1e2d3c4b5a69788716253748596a0b1c2d3e4f',
         }),
@@ -374,10 +369,10 @@ describe('ConfigSync dashboard — three stat cards (Requirement 7.1)', () => {
 })
 
 describe('ConfigSync dashboard — Push now issues the push POST (Requirement 7.1)', () => {
-  it('POSTs /api/apps/config-sync/push as JSON via the real post() surface on click', async () => {
+  it('POSTs /apps/config-sync/api/push as JSON via the real post() surface on click', async () => {
     const { calls } = installFetchMock({
-      'GET /api/apps/config-sync/status': () => statusResponse({ drift: true }),
-      'POST /api/apps/config-sync/push': () => ({ status: 'ok', outcome: 'pushed' }),
+      'GET /apps/config-sync/api/status': () => statusResponse({ drift: true }),
+      'POST /apps/config-sync/api/push': () => ({ status: 'ok', outcome: 'pushed' }),
     })
 
     render(<App />)
@@ -387,23 +382,23 @@ describe('ConfigSync dashboard — Push now issues the push POST (Requirement 7.
 
     await waitFor(() => {
       const pushCalls = calls.filter(
-        (c) => c.path === '/api/apps/config-sync/push' && c.init?.method === 'POST',
+        (c) => c.path === '/apps/config-sync/api/push' && c.init?.method === 'POST',
       )
       expect(pushCalls).toHaveLength(1)
     })
 
     const pushCall = calls.find(
-      (c) => c.path === '/api/apps/config-sync/push' && c.init?.method === 'POST',
+      (c) => c.path === '/apps/config-sync/api/push' && c.init?.method === 'POST',
     )
     expect(pushCall?.init?.method).toBe('POST')
-    expect(pushCall?.path).toBe('/api/apps/config-sync/push')
+    expect(pushCall?.path).toBe('/apps/config-sync/api/push')
   })
 })
 
 describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', () => {
   it('shows the merged PR link, paused crons with their command, and needs-credential keys', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
     })
 
@@ -424,7 +419,7 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
 
   it('shows not-applied paths with their real per-path reasons on a partial outcome', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_apply: {
             ...LAST_APPLY_FULL,
@@ -451,9 +446,9 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
 
   it('renders an "Undo this apply" button that POSTs restore/<id> via the real post() surface', async () => {
     const { calls } = installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
-      [`POST /api/apps/config-sync/restore/${LAST_APPLY_FULL.apply_id}`]: () => ({
+      [`POST /apps/config-sync/api/restore/${LAST_APPLY_FULL.apply_id}`]: () => ({
         status: 'ok',
         restored: { A: ['steering/testing-standards.md'], B: [] },
         removed: { A: [], B: [] },
@@ -477,14 +472,14 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
       (c) => c.path.includes('/restore/') && c.init?.method === 'POST',
     )
     expect(undoCall?.path).toBe(
-      `/api/apps/config-sync/restore/${LAST_APPLY_FULL.apply_id}`,
+      `/apps/config-sync/api/restore/${LAST_APPLY_FULL.apply_id}`,
     )
     expect(undoCall?.init?.method).toBe('POST')
   })
 
   it('does not render a last-apply card or Undo button when nothing has ever been applied', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () => statusResponse({ last_apply: null }),
+      'GET /apps/config-sync/api/status': () => statusResponse({ last_apply: null }),
     })
 
     render(<App />)
@@ -500,7 +495,7 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
 describe('ConfigSync dashboard — propagation timing chips render distinctly (Requirement 5.9, 7.3)', () => {
   it('renders all four propagation chips with counts, never collapsed into one status', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_apply: {
             ...LAST_APPLY_FULL,
@@ -560,7 +555,7 @@ describe('ConfigSync dashboard — propagation timing chips render distinctly (R
 describe('ConfigSync dashboard — Requirement 6 exception call-out', () => {
   it('shows the deliberate-exception call-out when the last-applied range touched crons.json', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
     })
 
@@ -575,7 +570,7 @@ describe('ConfigSync dashboard — Requirement 6 exception call-out', () => {
 
   it('shows the call-out when the last-applied range touched instances.json', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_apply: {
             ...LAST_APPLY_FULL,
@@ -602,7 +597,7 @@ describe('ConfigSync dashboard — Requirement 6 exception call-out', () => {
 
   it('does NOT show the exception call-out when the last-applied range touched neither file', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_apply: {
             ...LAST_APPLY_FULL,
@@ -649,7 +644,7 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
 
   it('shows plain-language empty state when there is no drift, no push yet, and nothing applied', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           drift: false,
           last_push: null,
@@ -669,7 +664,7 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
 
   it('surfaces a push failure in plain language without claiming success', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_push_failure: {
             reason: 'secret scan found 1 finding; push refused',
@@ -689,7 +684,7 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
 
   it('surfaces a poll failure in plain language', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_poll_failure: {
             reason: 'could not reach bundle repository: timeout',
@@ -706,6 +701,28 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
       ).toBeInTheDocument()
     })
   })
+
+  it('shows the consecutive poll-failure count and the paused state', async () => {
+    installFetchMock({
+      'GET /apps/config-sync/api/status': () =>
+        statusResponse({
+          last_poll_failure: {
+            reason: 'could not reach bundle repository: timeout',
+            time: '2026-09-27T07:17:42Z',
+          },
+          poll_consecutive_failures: 5,
+          poll_paused: true,
+        }),
+    })
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/5 consecutive poll failures/i)).toBeInTheDocument()
+    })
+    expect(screen.getByText(/^Polling paused$/)).toBeInTheDocument()
+    expect(screen.queryByText(/^Up to date$/)).toBeNull()
+  })
 })
 
 describe('ConfigSync dashboard — no raw credential-looking values rendered (Requirement 7.5, 3.8, 7.6)', () => {
@@ -713,7 +730,7 @@ describe('ConfigSync dashboard — no raw credential-looking values rendered (Re
     const leakedShapedToken = 'ghp_ThisLooksLikeARealGitHubPAT1234567890'
 
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           drift: false,
           // Not a documented status field — simulates a backend regression
@@ -735,7 +752,7 @@ describe('ConfigSync dashboard — no raw credential-looking values rendered (Re
     // needs_credential entries are KEY PATHS (server/job name + key), never
     // the placeholder value itself.
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({
           last_apply: {
             ...LAST_APPLY_FULL,
@@ -758,7 +775,7 @@ describe('ConfigSync dashboard — no raw credential-looking values rendered (Re
 describe('ConfigSync dashboard — accessibility (buttons have accessible names)', () => {
   it('every rendered button has an accessible name (queryable by role)', async () => {
     installFetchMock({
-      'GET /api/apps/config-sync/status': () =>
+      'GET /apps/config-sync/api/status': () =>
         statusResponse({ last_apply: LAST_APPLY_FULL }),
     })
 

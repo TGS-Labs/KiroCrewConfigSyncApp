@@ -9,6 +9,9 @@
   "agents": [],
   "skills": ["skills/complete-pr-handoff"],
   "tags": [],
+  "permissions": {
+    "api": ["/apps/config-sync/api"]
+  },
   "backend": {
     "entryPoint": "backend/server.py",
     "port": "auto",

@@ -1,6 +1,6 @@
 """Backend HTTP server for config-sync (tasks.md 6.2's "HTTP wiring";
 
-design.md's routes table, ~lines 331-345) — a KiroCrew app.
+design.md's routes table) — a KiroCrew app.
 
 Run with: python backend/server.py
 Or let KiroCrew manage it via the app manifest backend section.
@@ -10,9 +10,10 @@ Dispatches each design-table verb/path pair to its matching
 per request (see ``_get_store`` below) — the route functions themselves
 hold no HTTP knowledge (``backend/routes.py``'s own docstring: they are
 "plain, framework-agnostic functions"). This module owns exactly:
-verb/path matching, path-parameter extraction, the mutation-request guard,
-JSON response shape, and the loopback-only bind — never route BEHAVIOUR,
-which is `backend.routes`'/`backend.apply`'s job and is tested there.
+verb/path matching, path-parameter extraction, gateway-signature
+verification, the mutation-request guard, JSON response shape, and the
+loopback-only bind — never route BEHAVIOUR, which is
+`backend.routes`'/`backend.apply`'s job and is tested there.
 
 A path parameter (``sha``/``apply_id``) is extracted only when the
 request path has EXACTLY the expected number of ``/``-separated
@@ -21,6 +22,16 @@ would let a literal or percent-encoded ``/`` or ``..`` inside the
 parameter slot masquerade as extra path structure. The raw path is
 percent-decoded via ``urllib.parse.unquote`` before segment-splitting,
 so ``%2F`` is caught by the same segment-count check as a literal ``/``.
+
+## Request path contract (round 4, finding C-B)
+
+The browser reaches this backend only through the real
+``@kirocrew/app-sdk``'s ``useAppApi()``. That SDK adds NO prefix: it
+refuses any path not under an entry of ``app.json``'s
+``permissions.api`` (``["/apps/config-sync/api"]``) and fetches the path
+as given. The gateway route ``/apps/{name}/api/{path}`` then forwards to
+this backend as ``/api/{path}``. So ``_PREFIX`` is ``/api`` — the only
+prefix a gateway-forwarded request can ever carry.
 
 ## Cross-process staleness (senior-review C1)
 
@@ -40,93 +51,52 @@ This trades one extra JSON parse per request for correctness; the state
 document is small and local disk I/O, not a real cost at this app's
 request volume.
 
-## Mutation-request guard (senior-review H7, redesigned round 3 finding C-B)
+## Request authentication and mutation guard (H7; round 4 fix B)
 
-Every mutating request (``POST``) must pass BOTH a same-site check and a
-loopback ``Host`` check — checked in ``_dispatch`` BEFORE any route
-runs. The server binds loopback-only, but that alone only stops a
-remote attacker; a plain unauthenticated HTTP server is still reachable
-by `fetch`/a form submit from ANY page open in a browser on the same
-machine.
+Loopback binding stops remote hosts, but NOT another local process (a
+different app's backend, a compromised tool, a prompt-injected agent)
+connecting straight to this socket and bypassing the gateway's token
+auth and per-app scope enforcement (CWE-306). Loopback alone is
+therefore never treated as authentication. Every request is checked in
+this order, BEFORE any ``routes.*`` function runs:
 
-### Why this is NOT a custom-header check
+1. **Gateway HMAC on every route except ``GET /health``.** The gateway
+   signs each forwarded request as
+   ``X-KiroCrew-Proxy: <ts>:<hex hmac_sha256(secret,
+   "<ts>:<method>:<target>:<sha256(body)>")>`` where ``target`` is the
+   raw request-target (``self.path``, query included) and the secret is
+   the per-app ``KIROCREW_PROXY_SECRET`` env var injected at spawn.
+   ``verify_proxy_request`` re-implements the host's
+   ``kiro_crew.apps.proxy_auth`` semantics with the stdlib only (this
+   backend runs standalone and cannot import ``kiro_crew``): fail closed
+   on an empty secret, a missing/malformed header, a timestamp outside
+   ±60 s, or a digest mismatch (constant-time compare). Failure -> 401
+   ``{"status": "error", "reason": ...}``. ``/health`` stays unsigned
+   because the gateway's own health probe calls it directly.
+2. **Mutating requests (``POST``) additionally pass a same-site check**:
+   a present ``Sec-Fetch-Site`` (a browser-set, script-unforgeable
+   header) must be ``same-origin`` or ``none``; any other value 403s. An
+   absent ``Sec-Fetch-Site`` is not refused — the HMAC above is the
+   authentication. There is deliberately NO ``Origin``-vs-``Host``
+   fallback: the gateway rewrites ``Host`` to this backend's loopback
+   address but forwards the dashboard's ``Origin`` unchanged, so on any
+   non-localhost dashboard the two can never match and the fallback
+   would 403 every legitimate mutation.
+3. **Loopback-only ``Host`` on mutating requests** (DNS-rebinding
+   defence): a ``Host`` that is missing or not a loopback name 403s.
 
-H7 originally required a custom header (``X-Config-Sync-Request: 1``)
-on every mutating request, reasoning that a simple cross-origin request
-cannot set one. That is true of a bare cross-origin ``fetch``/``<form>``
-— but this app is served *through the KiroCrew gateway's own app UI
-host*, and the UI can only reach its own backend via the real
-``@kirocrew/app-sdk``'s ``useAppApi()``. Reading the actual SDK
-implementation (the host bundle's ``Dse`` factory, which every
-``useAppApi().api`` is built from) shows:
-
-- ``get(path, init)`` merges ``init.headers`` into the request — a
-  custom header CAN reach ``fetch`` through ``get()``.
-- ``post(path, body)``/``put``/``patch`` take **no headers parameter at
-  all** — their headers are hardcoded to
-  ``{"Content-Type": "application/json"}`` inside the SDK itself. There
-  is no way for this app's UI code to attach a custom header to a real
-  mutating request, because the SDK's own ``post()`` does not expose
-  that capability.
-
-So a header-based guard on ``POST`` cannot be satisfied by the real SDK
-at all — it would permanently 403 every legitimate mutation from the
-shipped UI, and Requirement 7.7 (refuse a forged cross-site POST while
-still accepting the app's own proxied requests) has to be met a
-different way.
-
-### The redesigned checks
-
-1. **Same-site check via `Sec-Fetch-Site`.** Every modern browser sets
-   this fetch-metadata header on every request and — critically — it is
-   a "forbidden header name": no page JavaScript can set, override, or
-   suppress it via ``fetch()``/``XMLHttpRequest``, unlike a custom
-   header, which a same-origin script could always set anyway. A
-   cross-site page's `fetch`/`<form>` POST to this loopback server
-   always carries ``Sec-Fetch-Site: cross-site`` (or ``same-site`` for a
-   different-but-related site — also refused, since nothing legitimately
-   calls this backend from another site at all); the app's own
-   same-origin UI call carries ``same-origin`` (or, for a top-level
-   navigation-triggered request, ``none``). Refuse any value other than
-   ``same-origin``/``none``.
-2. **`Origin` fallback when `Sec-Fetch-Site` is absent.** Older browsers
-   and non-browser HTTP clients (``curl``, ``requests``, this project's
-   own test suite, the gateway's own health probe) never send
-   ``Sec-Fetch-Site`` at all. When it is missing, fall back to requiring
-   an ``Origin`` header whose host matches the request's own loopback
-   ``Host`` — a genuine cross-site browser *fetch* still always sends
-   ``Origin`` (also a forbidden header name), so a forged browser
-   request cannot spoof its way past this fallback either. A request
-   with **neither** header (e.g. a bare loopback CLI/script call with no
-   ``Origin`` at all) is treated as same-site: this mirrors H7's original
-   scope — the guard defends against a *browser* page reaching this
-   server, not against arbitrary local process access, which loopback
-   binding plus the gateway's own proxy already gate for the shipped
-   deployment path (the gateway signs every proxied request with
-   ``X-KiroCrew-Proxy``; a caller that reaches this backend directly
-   without going through the gateway already had to be on the same
-   machine).
-3. **Loopback-only `Host` header**, unchanged from the original H7
-   design: catches DNS rebinding, where a page's JS can cause the
-   browser to send a request to ``127.0.0.1`` while the ``Host`` header
-   it sends still reflects whatever hostname resolved there.
-4. **`GET` requests are unaffected** — this remains a mutation guard, not
-   a blanket auth layer the design does not otherwise call for.
-
-This still satisfies every original H7 property: a bare cross-origin
-`fetch`/`<form>` POST (no `Origin`-matching-`Host`, and
-`Sec-Fetch-Site: cross-site`) is refused; DNS rebinding is refused via
-`Host`; `GET` is untouched — while remaining satisfiable by the real
-SDK's `post()`, which sends neither a custom header nor any control over
-`Sec-Fetch-Site`/`Origin` (both are ordinary same-origin `fetch` calls
-from the app's own UI origin, so the browser sets them correctly with no
-code in this app needing to do anything).
+No custom request header is required: the real SDK's ``post()`` has no
+headers parameter, so a header rule could never be satisfied by the
+shipped UI (superseded H7 design).
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlsplit
@@ -136,27 +106,62 @@ from backend import routes, state
 PORT = int(os.environ.get("PORT", 9100))
 APP_NAME = os.environ.get("KIROCREW_APP_NAME", "config-sync")
 
-_PREFIX = "/api/apps/config-sync"
+#: The prefix every gateway-forwarded request carries: the gateway maps
+#: `/apps/config-sync/api/{path}` to `/api/{path}` (module docstring,
+#: "Request path contract").
+_PREFIX = "/api"
 
-#: H7 (redesigned, round 3 C-B) — `Sec-Fetch-Site` values that count as
-#: same-site. `same-origin` is the ordinary case for this app's own UI
-#: calling its own backend; `none` covers a top-level navigation (not a
-#: fetch at all) and a bare loopback CLI/script call, which never sets
-#: fetch metadata. Both are "forbidden header names" a page's JS cannot
-#: set, override, or suppress — unlike the custom header this guard used
-#: to require, which the real `@kirocrew/app-sdk`'s `post()` has no way
-#: to attach at all (see the module docstring's "Why this is NOT a
-#: custom-header check").
+#: Gateway proxy-signature header and the env var carrying its secret —
+#: identical to `kiro_crew.apps.proxy_auth`.
+_PROXY_HEADER = "X-KiroCrew-Proxy"
+_PROXY_SECRET_ENV = "KIROCREW_PROXY_SECRET"
+_MAX_SKEW_SECONDS = 60
+
+#: Upper bound on a request body read for signature verification. No
+#: route consumes a body; this only stops an oversized upload from being
+#: buffered before it is refused.
+_MAX_BODY_BYTES = 1024 * 1024
+
+#: `Sec-Fetch-Site` values that count as same-site. `same-origin` is the
+#: app's own UI calling through the gateway; `none` is a user-initiated
+#: navigation. Both are browser-set "forbidden header names" a page's JS
+#: cannot forge.
 _SAME_SITE_VALUES = ("same-origin", "none")
 
-#: H7 — loopback hostnames/addresses a mutating request's `Host` header
-#: must match (with or without a trailing `:<port>`). Pinning `Host`
-#: catches DNS rebinding: an attacker's page can cause the victim's
-#: browser to send a request to `127.0.0.1`, but cannot make the browser
-#: send a `Host` header other than the one reflecting whatever hostname
-#: it believes it navigated to, unless that hostname itself already
-#: resolves to loopback.
+#: Loopback hostnames/addresses a mutating request's `Host` header must
+#: match (with or without a trailing `:<port>`) — DNS-rebinding defence.
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+def verify_proxy_request(
+    header_value: str,
+    *,
+    method: str,
+    target: str,
+    body: bytes,
+    secret: str,
+    now: Optional[float] = None,
+) -> bool:
+    """Return whether ``header_value`` is a valid, fresh gateway signature
+
+    for (``method``, ``target``, ``body``) under ``secret`` — the same
+    semantics as the host's `kiro_crew.apps.proxy_auth
+    .verify_proxy_request`. Fails closed: an empty secret, an
+    absent/malformed header, a non-numeric or stale (±60 s) timestamp, or
+    a signature mismatch all return ``False``.
+    """
+    if not secret or not header_value or ":" not in header_value:
+        return False
+    ts_str, _, sig = header_value.partition(":")
+    if not ts_str.isdigit() or not sig:
+        return False
+    clock = time.time() if now is None else now
+    if abs(clock - int(ts_str)) > _MAX_SKEW_SECONDS:
+        return False
+    body_hash = hashlib.sha256(body or b"").hexdigest()
+    msg = f"{ts_str}:{method}:{target}:{body_hash}"
+    expected = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
 
 
 def _get_store() -> "state.StateStore":
@@ -224,44 +229,17 @@ def _is_loopback_host(host_header: Optional[str]) -> bool:
     return host_only in _LOOPBACK_HOSTS
 
 
-def _origin_host(origin_header: Optional[str]) -> Optional[str]:
-    """Extract the host[:port] authority from an ``Origin`` header value,
-
-    or ``None`` if it is missing/unparseable. ``Origin`` is always
-    ``scheme://host[:port]`` with no path — `urlsplit` on it yields the
-    authority in `.netloc` directly.
-    """
-    if not origin_header:
-        return None
-    netloc = urlsplit(origin_header).netloc
-    return netloc or None
-
-
 def _is_same_site(headers: "Any") -> bool:
-    """H7 (redesigned) — whether a mutating request's fetch-metadata
+    """H7 — whether a mutating request's `Sec-Fetch-Site` permits it.
 
-    headers indicate it originated same-site, per the module docstring's
-    "The redesigned checks" section. Checked BEFORE `Host`, since a
-    request that fails this can never be same-site regardless of what
-    `Host` says.
+    A present value must be one of `_SAME_SITE_VALUES`; an absent one is
+    not refused (the gateway HMAC is the authentication, and there is no
+    `Origin` fallback — see the module docstring).
     """
     sec_fetch_site = headers.get("Sec-Fetch-Site")
-    if sec_fetch_site is not None:
-        return sec_fetch_site in _SAME_SITE_VALUES
-    origin = headers.get("Origin")
-    if origin is None:
-        # Neither fetch-metadata header present: a bare loopback
-        # CLI/script call (curl, requests, this project's own tests, the
-        # gateway's health probe) rather than a browser fetch. Browsers
-        # always send at least one of these two on a cross-site request,
-        # so treat "neither present" as same-site — see the module
-        # docstring for why this matches H7's original scope.
+    if sec_fetch_site is None:
         return True
-    origin_host = _origin_host(origin)
-    host_header = headers.get("Host")
-    if origin_host is None or host_header is None:
-        return False
-    return bool(origin_host == host_header)
+    return bool(sec_fetch_site in _SAME_SITE_VALUES)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -269,18 +247,60 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"status": "ok", "app": APP_NAME})
             return
+        if not self._passes_proxy_auth("GET"):
+            return
         self._dispatch("GET")
 
     def do_POST(self) -> None:
+        if not self._passes_proxy_auth("POST"):
+            return
         if not self._passes_mutation_guard():
             return
         self._dispatch("POST")
 
-    def _passes_mutation_guard(self) -> bool:
-        """H7 (redesigned) — refuse a mutating request with 403 before it
+    def _read_body(self) -> Optional[bytes]:
+        """Read the request body per `Content-Length` (empty if absent).
 
-        ever reaches `_dispatch`/any `routes.*` function, unless it
-        passes BOTH the same-site check and the loopback-`Host` check.
+        Returns ``None`` after writing a 400 when the header is not a
+        non-negative integer no larger than `_MAX_BODY_BYTES`.
+        """
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            return b""
+        stripped = raw_length.strip()
+        if not stripped.isdigit() or int(stripped) > _MAX_BODY_BYTES:
+            self._json(400, {"status": "error", "reason": "invalid content-length"})
+            return None
+        return self.rfile.read(int(stripped))
+
+    def _passes_proxy_auth(self, method: str) -> bool:
+        """Refuse with 401 unless the request carries a valid gateway
+
+        signature (module docstring, check 1). Returns whether the
+        request may proceed; on refusal the response is already written.
+        """
+        body = self._read_body()
+        if body is None:
+            return False
+        if not verify_proxy_request(
+            self.headers.get(_PROXY_HEADER) or "",
+            method=method,
+            target=self.path,
+            body=body,
+            secret=os.environ.get(_PROXY_SECRET_ENV, ""),
+        ):
+            self._json(
+                401,
+                {"status": "error", "reason": "missing or invalid proxy signature"},
+            )
+            return False
+        return True
+
+    def _passes_mutation_guard(self) -> bool:
+        """H7 — refuse a mutating request with 403 before it reaches
+
+        `_dispatch` unless it passes BOTH the `Sec-Fetch-Site` check and
+        the loopback-`Host` check (module docstring, checks 2-3).
         Returns whether the request may proceed; on refusal it has
         already written the 403 response.
         """
@@ -348,10 +368,8 @@ def build_server(host: str = "127.0.0.1", port: int = 0) -> HTTPServer:
     """Build (never starts) an `HTTPServer` bound to loopback only.
 
     ``host`` defaults to `127.0.0.1` — never `0.0.0.0` or any other
-    all-interfaces address — because `approve` triggers a real apply and
-    every other route reads or mutates this instance's own configuration;
-    exposing this server beyond loopback would let any host that can
-    reach this machine drive it with no authentication at all.
+    all-interfaces address. Loopback binding keeps remote hosts out; the
+    gateway HMAC (module docstring) keeps out other local processes.
     """
     return HTTPServer((host, port), Handler)
 

@@ -76,6 +76,8 @@ from typing import Any, Iterator, Tuple
 import pytest
 
 from backend import state as state_module
+from backend.server import _PREFIX
+from proxy_sign import PROXY_SECRET_ENV, TEST_PROXY_SECRET, signed_headers
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -98,6 +100,8 @@ def isolated_state_dir(
     """
     state_dir = tmp_path / "config-sync-state"
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    # Every non-health route requires the gateway HMAC (tests/proxy_sign.py).
+    monkeypatch.setenv(PROXY_SECRET_ENV, TEST_PROXY_SECRET)
 
     root_a = tmp_path / "kiro-crew-home"
     root_b = tmp_path / "kiro-home"
@@ -176,10 +180,10 @@ def _request(
 ) -> Tuple[int, dict[str, str], bytes]:
     conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
-        # H7: every mutating request must carry this header; these tests
-        # exercise cross-process state, not the CSRF guard itself
-        # (tests/test_server_security.py owns that).
-        headers_out = {"X-Config-Sync-Request": "1"} if method == "POST" else {}
+        # Every non-health route requires the gateway signature; these
+        # tests exercise cross-process state, not the request guard
+        # itself (tests/test_server_security.py owns that).
+        headers_out = signed_headers(method, path, body or b"")
         conn.request(method, path, body=body, headers=headers_out)
         resp = conn.getresponse()
         payload = resp.read()
@@ -223,9 +227,7 @@ def test_status_sees_pending_written_by_second_process_after_server_start(
 
     # Force the server to have already built (and cached) its store by
     # making one real request before the second process writes.
-    status_code, _headers, body = _request(
-        host, port, "GET", "/api/apps/config-sync/status"
-    )
+    status_code, _headers, body = _request(host, port, "GET", f"{_PREFIX}/status")
     assert status_code == 200
     assert json.loads(body)["pending"] is None
 
@@ -237,9 +239,7 @@ def test_status_sees_pending_written_by_second_process_after_server_start(
         classified_paths={"some/file.md": "instant"},
     )
 
-    status_code, _headers, body = _request(
-        host, port, "GET", "/api/apps/config-sync/status"
-    )
+    status_code, _headers, body = _request(host, port, "GET", f"{_PREFIX}/status")
     assert status_code == 200
     parsed = json.loads(body)
     assert parsed["pending"] is not None

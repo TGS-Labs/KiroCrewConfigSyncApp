@@ -6,6 +6,12 @@ import { LocalChangesCard, LastPushCard, FromMainCard } from './StatCardsRow'
 import LastApplyCard from './LastApplyCard'
 import { cardStyle, mutedStyle } from './styles'
 
+/** The browser-visible API base. Must equal `app.json`'s
+ * `permissions.api[0]`: the real `@kirocrew/app-sdk` adds NO prefix and
+ * refuses any path outside the declared list, and the gateway forwards
+ * `/apps/config-sync/api/<x>` to this app's backend as `/api/<x>`. */
+const API_BASE = '/apps/config-sync/api'
+
 export default function ConfigSync() {
   const api = useAppApi()
   // `useAppApi()` returns a fresh object every render (see the host SDK
@@ -15,6 +21,12 @@ export default function ConfigSync() {
   // infinite render loop.
   const apiRef = useRef(api)
   apiRef.current = api
+  // Every call site names its route relative to `API_BASE`; this is the
+  // one place the full SDK-visible path is composed.
+  const client = {
+    get: (route: string) => apiRef.current.get(`${API_BASE}${route}`),
+    post: (route: string) => apiRef.current.post(`${API_BASE}${route}`),
+  }
 
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -24,7 +36,7 @@ export default function ConfigSync() {
 
   async function loadStatus() {
     try {
-      const data = (await apiRef.current.get('/status')) as StatusResponse
+      const data = (await client.get('/status')) as StatusResponse
       setStatus(data)
       setError(null)
     } catch (err) {
@@ -45,7 +57,7 @@ export default function ConfigSync() {
   async function handlePushNow() {
     setPushing(true)
     try {
-      await apiRef.current.post('/push')
+      await client.post('/push')
       await loadStatus()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -57,7 +69,7 @@ export default function ConfigSync() {
   async function handleUndo(applyId: string) {
     setUndoing(true)
     try {
-      await apiRef.current.post(`/restore/${applyId}`)
+      await client.post(`/restore/${applyId}`)
       await loadStatus()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -91,6 +103,8 @@ export default function ConfigSync() {
               <FromMainCard
                 lastSeenSha={status.last_seen_sha}
                 pollFailure={status.last_poll_failure}
+                consecutiveFailures={status.poll_consecutive_failures}
+                pollPaused={status.poll_paused}
               />
             </div>
 

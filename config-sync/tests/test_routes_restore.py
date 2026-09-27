@@ -1,6 +1,6 @@
 """FAILING tests for the restore route (tasks.md 6.2; requirements.md 4.7,
 
-4.8; design.md's routes table, `POST /api/apps/config-sync/restore/{id}` —
+4.8; design.md's routes table, `POST /api/restore/{id}` —
 "Restore a backup from a previous apply").
 
 ## Interface pinned for software-engineer
