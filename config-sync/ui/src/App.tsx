@@ -1,30 +1,103 @@
 import { useAppApi } from '@kirocrew/app-sdk'
-import { Card, CardTitle, PageHeader, StatCard } from '@kirocrew/app-sdk/ui'
-import { useState, useEffect } from 'react'
+import { PageHeader } from '@kirocrew/app-sdk/ui'
+import { useEffect, useRef, useState } from 'react'
+import type { StatusResponse } from './types'
+import { LocalChangesCard, LastPushCard, FromMainCard } from './StatCardsRow'
+import LastApplyCard from './LastApplyCard'
+import { cardStyle, mutedStyle } from './styles'
 
 export default function ConfigSync() {
   const api = useAppApi()
+  // `useAppApi()` returns a fresh object every render (see the host SDK
+  // mock), so `api` itself is not a stable dependency — read it through a
+  // ref instead of putting it in a `useEffect` dependency array, which
+  // would otherwise re-run the fetch effect on every render and spin an
+  // infinite render loop.
+  const apiRef = useRef(api)
+  apiRef.current = api
+
+  const [status, setStatus] = useState<StatusResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [pushing, setPushing] = useState(false)
+  const [undoing, setUndoing] = useState(false)
+
+  async function loadStatus() {
+    try {
+      const data = (await apiRef.current.get('/status')) as StatusResponse
+      setStatus(data)
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    // Fetch initial data here
-    setLoading(false)
+    loadStatus()
+    // Deliberately empty: `loadStatus` closes over `apiRef` (stable) and
+    // setters (stable); it must run exactly once on mount, not on every
+    // render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  async function handlePushNow() {
+    setPushing(true)
+    try {
+      await apiRef.current.post('/push')
+      await loadStatus()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPushing(false)
+    }
+  }
+
+  async function handleUndo(applyId: string) {
+    setUndoing(true)
+    try {
+      await apiRef.current.post(`/restore/${applyId}`)
+      await loadStatus()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setUndoing(false)
+    }
+  }
 
   return (
     <>
-      <PageHeader title="Config Sync" subtitle="A Kiro Crew app: Config Sync" />
+      <PageHeader title="Config bundle status" subtitle="Keeps this box aligned with Kiro-Config-Bundles" />
       <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-        <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6">
-          <StatCard label="Status" value="OK" accent />
-        </div>
-        <Card>
-          <CardTitle>Overview</CardTitle>
-          {loading
-            ? <p className="text-sm text-muted">Loading…</p>
-            : <p className="text-sm text-muted">Your app content goes here.</p>
-          }
-        </Card>
+        {loading ? (
+          <p style={mutedStyle}>Loading…</p>
+        ) : error ? (
+          <div style={cardStyle}>
+            <p style={{ color: 'var(--danger)' }}>{error}</p>
+          </div>
+        ) : status ? (
+          <>
+            <div
+              style={{
+                display: 'grid',
+                gap: '0.875rem',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                marginBottom: '1.5rem',
+              }}
+            >
+              <LocalChangesCard drift={status.drift} onPushNow={handlePushNow} pushing={pushing} />
+              <LastPushCard lastPush={status.last_push} failure={status.last_push_failure} />
+              <FromMainCard
+                applying={status.applying}
+                lastSeenSha={status.last_seen_sha}
+                pollFailure={status.last_poll_failure}
+              />
+            </div>
+
+            <LastApplyCard lastApply={status.last_apply} onUndo={handleUndo} undoing={undoing} />
+          </>
+        ) : null}
       </div>
     </>
   )
