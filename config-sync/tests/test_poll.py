@@ -63,6 +63,10 @@ def isolated_state_dir(
     """
     state_dir = tmp_path / "state"
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    # The changed-head tick now applies and hashes the live roots; point
+    # both at disposable dirs so no test ever reads the real host's home.
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "root-a"))
+    monkeypatch.setenv("KIRO_HOME", str(tmp_path / "root-b"))
     yield state_dir
 
 
