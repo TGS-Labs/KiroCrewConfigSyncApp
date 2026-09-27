@@ -48,10 +48,12 @@ names, and outcome strings — never raw file content.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend import allowlist, collect, push, redact
@@ -86,12 +88,27 @@ def _split_paths_by_root(relpaths: List[str]) -> Dict[str, List[str]]:
     which root's allowlist actually matches each one — the same two-root
     probe ``poll.py``'s ``_classify_changed_paths`` performs, reusing
     ``allowlist.is_tracked`` rather than a second matcher.
+
+    A relpath matching NEITHER root's allowlist is still placed under
+    root ``"A"`` (the first ``_ROOT_IDS`` entry) rather than dropped
+    entirely: ``apply_commit`` runs its OWN allowlist gate over whatever
+    ``changed_paths`` it is handed and is the thing that actually reports
+    an untracked relpath in ``ApplyResult.ignored_paths`` — a relpath this
+    function silently drops before ``apply_commit`` ever sees it never
+    reaches that gate at all, so it never surfaces in the response
+    (senior-review Low). Root "A" is an arbitrary but consistent default
+    for this case only; ``apply_commit`` ignores the path regardless of
+    which root it is nominally filed under.
     """
     by_root: Dict[str, List[str]] = {root: [] for root in _ROOT_IDS}
     for relpath in relpaths:
+        matched = False
         for root in _ROOT_IDS:
             if allowlist.is_tracked(root, relpath):
                 by_root[root].append(relpath)
+                matched = True
+        if not matched:
+            by_root[_ROOT_IDS[0]].append(relpath)
     return by_root
 
 
@@ -153,11 +170,45 @@ def _materialize_pending_commit(
             ) from exc
 
         try:
-            shutil.unpack_archive(str(tar_path), extract_dir=str(commit_root))
-        except (shutil.ReadError, OSError) as exc:
+            # filter="data" (Python 3.12+) sanitizes an absolute-path or
+            # ``..``-escaping member by REWRITING it under commit_root
+            # (stripping the leading "/", collapsing ".."), rather than
+            # raising — verified empirically: a member named
+            # "/etc/passthrough.md" lands at
+            # "<commit_root>/etc/passthrough.md", never outside
+            # commit_root, but with no error either. That silent rewrite
+            # is not good enough here: this app must REFUSE a commit
+            # whose tree contains such a member outright (senior-review
+            # M1), not accept a rewritten shadow of it as legitimate
+            # content. So every member's name is checked explicitly,
+            # BEFORE any extraction, and the whole materialize is refused
+            # if one is absolute or contains a ``..`` segment; only once
+            # that check passes does ``filter="data"`` run — as a second,
+            # defence-in-depth layer against anything the explicit check
+            # does not anticipate (e.g. a symlink member whose target
+            # escapes commit_root).
+            with tarfile.open(tar_path) as tar_handle_check:
+                for member in tar_handle_check.getmembers():
+                    member_path = PurePosixPath(member.name)
+                    if member_path.is_absolute() or ".." in member_path.parts:
+                        raise _MaterializeError(
+                            f"commit {sha}'s tree contains an unsafe tar "
+                            f"member: {member.name!r}"
+                        )
+
+            shutil.unpack_archive(
+                str(tar_path), extract_dir=str(commit_root), filter="data"
+            )
+        except (shutil.ReadError, OSError, tarfile.TarError) as exc:
             raise _MaterializeError(
                 f"could not extract commit {sha}'s tree: {exc}"
             ) from exc
+    except _MaterializeError:
+        # Low: a materialization failure must not leave the temp
+        # commit_root directory (created above via tempfile.mkdtemp)
+        # behind under the state directory.
+        shutil.rmtree(commit_root, ignore_errors=True)
+        raise
     finally:
         tar_path.unlink(missing_ok=True)
 
@@ -168,10 +219,197 @@ def _materialize_pending_commit(
     deleted_paths: Dict[str, List[str]] = {root: [] for root in _ROOT_IDS}
     for root, relpaths in changed_paths.items():
         for relpath in relpaths:
-            if not (commit_root / relpath).exists():
+            # os.path.lexists — never Path.exists() — so a dangling
+            # symlink at this relpath in the extracted tree (a tar
+            # SYMTYPE member whose target is absent) is correctly seen
+            # as PRESENT (senior-review M2). Path.exists()/os.path.exists
+            # both follow the symlink and read a dangling one as absent,
+            # which misclassifies it as an upstream deletion and would
+            # make apply_commit unlink the corresponding LIVE file even
+            # though the approved commit never deleted it. lexists()
+            # reports on the link itself, matching git's own change-type
+            # detection (a symlink member is a real tree entry, deleted
+            # or not, independent of where it points).
+            if not os.path.lexists(commit_root / relpath):
                 deleted_paths[root].append(relpath)
 
     return commit_root, changed_paths, deleted_paths
+
+
+_HOOKS_RELPATH = "hooks.json"
+_MCP_RELPATH = "mcp.json"
+
+
+def _load_json_relpath(root: Path, relpath: str) -> Dict[str, Any]:
+    """Read and parse ``root/relpath`` as a JSON object, defaulting to
+
+    ``{}`` when the file is absent, unreadable, or fails to parse — a
+    materialization/live-tree read for the M5 changed-commands summary
+    must never raise, since a malformed or missing file simply means
+    "nothing to diff on that side" (an added file looks identical to an
+    empty existing one; a removed file's commands are reported as
+    changed by the surviving side only, which is the pre-existing
+    ``apply_commit``/M5 shape — this summary never claims to report
+    removals on its own).
+    """
+    path = root / relpath
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _hook_commands(document: Dict[str, Any]) -> Dict[str, str]:
+    """Extract ``{hook_name: command}`` from a parsed ``hooks.json`` document.
+
+    Mirrors the real shape (``kiro_crew/hooks.py::ScriptHook`` — no
+    ``args`` field, a single shell string) that
+    ``tests/test_apply_command_vet.py`` establishes. An entry with no
+    usable name or no ``command`` string is skipped rather than raising.
+    """
+    commands: Dict[str, str] = {}
+    for hook in document.get("hooks", []):
+        if not isinstance(hook, dict):
+            continue
+        name = hook.get("name") or hook.get("id")
+        command = hook.get("command")
+        if isinstance(name, str) and name and isinstance(command, str) and command:
+            commands[name] = command
+    return commands
+
+
+def _mcp_server_commands(document: Dict[str, Any]) -> Dict[str, str]:
+    """Extract ``{server_name: joined_command}`` from a parsed ``mcp.json``
+
+    document, joining ``command`` + ``args`` with ``shlex.join`` — the
+    same joined-string shape ``test_apply_command_vet.py`` asserts
+    (``"new-arg" in server_entry["command"]``), and the same shape the
+    real subprocess invocation actually uses, so a change smuggled only
+    through ``args`` still registers as a changed command.
+    """
+    import shlex
+
+    commands: Dict[str, str] = {}
+    servers = document.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return commands
+    for name, server in servers.items():
+        if not isinstance(name, str) or not name or not isinstance(server, dict):
+            continue
+        command = server.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        args = server.get("args", [])
+        args_list = [str(a) for a in args] if isinstance(args, list) else []
+        commands[name] = shlex.join([command, *args_list])
+    return commands
+
+
+def _changed_commands_for_file(
+    relpath: str,
+    live_document: Dict[str, Any],
+    incoming_document: Dict[str, Any],
+    extractor: Any,
+) -> List[Dict[str, str]]:
+    """Diff one command-bearing file's live vs incoming commands by name,
+
+    returning ``[{file, name, command}]`` for every name that is either
+    new or whose command text changed — never for an unchanged or a
+    removed name (pinned by
+    ``test_apply_command_vet.py::test_apply_changed_commands_lists_only_added_or_changed_not_unchanged``,
+    which this route-level helper matches for the pre-approval summary).
+    """
+    live_commands = extractor(live_document)
+    incoming_commands = extractor(incoming_document)
+    changed: List[Dict[str, str]] = []
+    for name, command in incoming_commands.items():
+        if live_commands.get(name) != command:
+            changed.append({"file": relpath, "name": name, "command": command})
+    return changed
+
+
+def _changed_commands_summary(
+    live_root: Path, commit_root: Path
+) -> List[Dict[str, str]]:
+    """Compute the M5 pre-approval "what commands changed" summary by
+
+    comparing ``hooks.json``/``mcp.json`` in ``commit_root`` (the
+    materialized pending commit's tree) against the same files under
+    ``live_root``. A small, pure, routes-local re-implementation of
+    ``apply_commit``'s own changed-commands comparison (tasks.md: "if you
+    need apply's changed-command comparison, re-implement a small pure
+    helper in routes.py rather than editing apply.py") — this function
+    never calls ``apply_commit`` itself, which must only ever run from
+    ``approve`` (``apply.py``'s own module docstring).
+
+    Returns a flat list combining both files' entries, in a fixed
+    (hooks then mcp) order — the shape
+    ``test_apply_command_vet.py::test_status_pending_summary_lists_changed_commands_for_pending_commit``
+    pins: ``[{"file": ..., "name": ..., "command": ...}]``.
+    """
+    live_hooks = _load_json_relpath(live_root, _HOOKS_RELPATH)
+    commit_hooks = _load_json_relpath(commit_root, _HOOKS_RELPATH)
+    live_mcp = _load_json_relpath(live_root, _MCP_RELPATH)
+    commit_mcp = _load_json_relpath(commit_root, _MCP_RELPATH)
+
+    changed: List[Dict[str, str]] = []
+    changed.extend(
+        _changed_commands_for_file(
+            _HOOKS_RELPATH, live_hooks, commit_hooks, _hook_commands
+        )
+    )
+    changed.extend(
+        _changed_commands_for_file(
+            _MCP_RELPATH, live_mcp, commit_mcp, _mcp_server_commands
+        )
+    )
+    return changed
+
+
+def _pending_changed_commands(
+    store: "state_module.StateStore",
+) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """Compute the M5 changed-commands summary for the current pending
+
+    commit, if any.
+
+    Returns ``(changed_commands, materialize_error)``: on success
+    ``materialize_error`` is ``None`` and ``changed_commands`` holds the
+    diff; when there is no pending commit at all, both are empty/``None``
+    (nothing to summarize); when materialization fails, per the task
+    instruction ("if materialization fails report that in the summary,
+    don't raise") ``changed_commands`` is ``[]`` and
+    ``materialize_error`` carries the reason — ``status()`` must never
+    raise on this path.
+
+    Reuses ``_materialize_pending_commit`` (the SAME helper ``approve``
+    uses) so the pre-approval view is computed against exactly the tree
+    an actual approve would apply — and always cleans up the temporary
+    commit_root it creates, matching that helper's own cleanup contract.
+    """
+    pending = store.pending
+    if pending is None:
+        return [], None
+
+    sha = pending.get("sha")
+    if not isinstance(sha, str) or not sha:
+        return [], None
+
+    try:
+        commit_root, _changed_paths, _deleted_paths = _materialize_pending_commit(
+            store, sha
+        )
+    except _MaterializeError as exc:
+        return [], str(exc)
+
+    try:
+        root_a = _root_path("A")
+        return _changed_commands_summary(root_a, commit_root), None
+    finally:
+        shutil.rmtree(commit_root, ignore_errors=True)
 
 
 def is_app_enabled(name: str) -> bool:
@@ -215,8 +453,39 @@ def _redacted_tree() -> Dict[str, bytes]:
     return redact.redact(collect.collect())
 
 
+def _pending_with_changed_commands(
+    store: "state_module.StateStore",
+) -> Optional[Dict[str, Any]]:
+    """Build the ``pending`` value ``status()`` returns: ``store.pending``
+
+    verbatim, plus the M5 ``changed_commands`` summary (and, if
+    materialization failed, a ``changed_commands_error`` reason) —
+    without mutating the stored pending record itself. Returns ``None``
+    when nothing is pending, matching ``store.pending``'s own shape.
+    """
+    pending = store.pending
+    if pending is None:
+        return None
+
+    changed_commands, materialize_error = _pending_changed_commands(store)
+    enriched = dict(pending)
+    enriched["changed_commands"] = changed_commands
+    if materialize_error is not None:
+        enriched["changed_commands_error"] = materialize_error
+    return enriched
+
+
 def status(store: "state_module.StateStore") -> Dict[str, Any]:
-    """GET status: push state, drift flag, last-seen SHA, pending summary."""
+    """GET status: push state, drift flag, last-seen SHA, pending summary.
+
+    The pending summary (M5) additionally carries ``changed_commands`` —
+    every added/changed ``hooks.json``/``mcp.json`` command entry for the
+    pending commit, computed by comparing its materialized tree against
+    the live files (see ``_pending_changed_commands``) — so the operator
+    sees what commands a pending commit would change before clicking
+    approve. A materialization failure is reported via
+    ``changed_commands_error`` rather than raising.
+    """
     disabled = _require_enabled()
     if disabled is not None:
         return disabled
@@ -232,7 +501,7 @@ def status(store: "state_module.StateStore") -> Dict[str, Any]:
         "last_seen_sha": store.last_seen_sha,
         "last_poll_failure": store.last_poll_failure,
         "drift": drift_present,
-        "pending": store.pending,
+        "pending": _pending_with_changed_commands(store),
     }
 
 
@@ -272,6 +541,7 @@ def push_now(store: "state_module.StateStore") -> Dict[str, Any]:
         "outcome": result.outcome,
         "tree_hash": result.tree_hash,
         "reason": result.reason,
+        "non_portable": list(getattr(result, "non_portable", [])),
     }
 
 
@@ -292,19 +562,96 @@ def _report_to_dict(report: Any) -> Dict[str, Dict[str, Any]]:
     }
 
 
-def _apply_result_to_dict(result: Any) -> Dict[str, Any]:
+def _relpath_to_root(
+    relpath: str, changed_paths: Optional[Dict[str, List[str]]]
+) -> Optional[str]:
+    """Trace ``relpath`` back to the root id ("A"/"B") it belongs to,
+
+    using the ``changed_paths`` split ``_materialize_pending_commit``
+    already computed for this apply. Returns ``None`` when
+    ``changed_paths`` is not supplied, or ``relpath`` is not found in
+    either root's list (e.g. a relpath ``apply_commit`` reports that was
+    never part of this commit's own split — should not happen, but must
+    not raise).
+    """
+    if changed_paths is None:
+        return None
+    for root, relpaths in changed_paths.items():
+        if relpath in relpaths:
+            return root
+    return None
+
+
+def _root_map_for(
+    relpaths: List[str], changed_paths: Optional[Dict[str, List[str]]]
+) -> Dict[str, str]:
+    """Build a ``{relpath: root_id}`` map for every relpath this function
+
+    can trace to a root via ``changed_paths`` (senior-review Low).
+    ``ApplyResult.ignored_paths``/``not_applied`` are flat relpath lists
+    with no root id attached, so a caller cannot otherwise tell root A's
+    entries apart from root B's when the same relpath text could occur
+    under both. Kept as a SEPARATE mapping rather than prefixing the
+    relpath strings themselves, so ``ignored_paths``/``not_applied``
+    still carry the exact relpath text ``apply_commit`` reported (tests
+    and any existing caller match on that text verbatim). A relpath this
+    function cannot trace to a root is simply absent from the map.
+    """
+    root_map: Dict[str, str] = {}
+    for relpath in relpaths:
+        root = _relpath_to_root(relpath, changed_paths)
+        if root is not None:
+            root_map[relpath] = root
+    return root_map
+
+
+def _apply_result_to_dict(
+    result: Any, changed_paths: Optional[Dict[str, List[str]]] = None
+) -> Dict[str, Any]:
     """Convert an ``ApplyResult`` into a plain, JSON-serializable dict.
 
     Never includes raw file content — only outcome, counts, and names —
     so an applied file's (already-restored) live credential value can
     never reach a response body via this path either.
+
+    Every field is read with ``getattr`` and a documented default rather
+    than a direct attribute access: this module must not be edited to add
+    a field to ``ApplyResult`` itself (that dataclass belongs to
+    ``apply.py``, owned separately), so a field this dict wants that
+    ``ApplyResult`` does not yet carry degrades to its empty default
+    instead of raising ``AttributeError``.
+
+    ``non_portable_paths`` (requirements.md 4.12), ``unresolved_references``
+    (4.13), and ``untracked_prompt_agents`` (5.11(c)) are already present
+    on ``ApplyResult`` (populated by ``apply_commit``) — this function
+    previously dropped all three from the response; they are surfaced
+    here now (senior-review H5).
+
+    ``registration.Result.propagation_report`` (requirements.md 5.7) IS
+    surfaced: ``apply_commit`` copies it verbatim from
+    ``registration.check_registrations``'s own ``reg_result`` onto
+    ``ApplyResult.propagation_report`` (present only for agents in
+    ``complete_agents`` there). Read via the same documented-default
+    ``getattr`` every other field here uses, for the same reason: a
+    refusal path's result object (e.g. the sha-mismatch refusal) need not
+    carry every ``ApplyResult`` field.
+
+    ``changed_paths`` (the ``{"A": [...], "B": [...]}`` split
+    ``_materialize_pending_commit`` already computed for this apply) is
+    optional so callers with no such split on hand (there are none today,
+    but a future caller might not run through ``approve``) still get a
+    valid dict — the ``"root"`` map is then simply empty rather than
+    raising.
     """
     propagation = getattr(result, "propagation", None)
+    not_applied = list(getattr(result, "not_applied", []))
+    ignored_paths = list(getattr(result, "ignored_paths", []))
+    root_map = _root_map_for(not_applied + ignored_paths, changed_paths)
     return {
         "outcome": result.outcome,
         "applied": list(getattr(result, "applied", [])),
-        "not_applied": list(getattr(result, "not_applied", [])),
-        "ignored_paths": list(getattr(result, "ignored_paths", [])),
+        "not_applied": not_applied,
+        "ignored_paths": ignored_paths,
         "dropped_cron_names": list(getattr(result, "dropped_cron_names", [])),
         "paused_cron_names": list(getattr(result, "paused_cron_names", [])),
         "changed_instance_names": list(getattr(result, "changed_instance_names", [])),
@@ -312,9 +659,14 @@ def _apply_result_to_dict(result: Any) -> Dict[str, Any]:
             getattr(result, "incomplete_registrations", {})
         ),
         "needs_credential": list(getattr(result, "needs_credential", [])),
+        "non_portable_paths": list(getattr(result, "non_portable_paths", [])),
+        "unresolved_references": list(getattr(result, "unresolved_references", [])),
+        "untracked_prompt_agents": list(getattr(result, "untracked_prompt_agents", [])),
+        "propagation_report": dict(getattr(result, "propagation_report", {})),
         "propagation": _report_to_dict(propagation) if propagation is not None else {},
         "apply_id": getattr(result, "apply_id", None),
         "reason": getattr(result, "reason", ""),
+        "root": root_map,
     }
 
 
@@ -351,11 +703,20 @@ def approve(store: "state_module.StateStore", sha: str) -> Dict[str, Any]:
 
     ``state.resolve_pending`` (which advances ``base_sha`` and clears
     ``pending`` together) is called ONLY once ``apply_commit`` reports
-    outcome ``"applied"`` or ``"partial"`` — i.e. it actually ran against
-    the matching pending commit and attempted real work — never on a
-    refusal. Resolving on a refusal would advance ``base_sha``/clear
-    ``pending`` for a commit that was never actually applied, silently
-    dropping it from what the operator is shown next.
+    outcome ``"applied"`` (H4, ratified) — never on ``"partial"`` and
+    never on a refusal. A partial apply means at least one allowlisted
+    file failed to apply; resolving pending on that outcome would
+    silently drop the not-applied commit from what the operator is shown
+    next, even though it was never actually, fully applied. Instead, on
+    ``"partial"``, ``pending``/``base_sha`` are left exactly as they were
+    (``state.record_partial_apply`` only annotates the existing pending
+    record with the not-applied paths and reasons — it does not resolve
+    it), so the operator still sees this commit as pending and can
+    re-approve once the upstream issue is fixed. A later approve of the
+    SAME sha that fully applies (e.g. after an upstream fix lands and a
+    fresh pending record names the fixed sha) resolves pending normally;
+    ``decline`` still always clears pending regardless of any apply
+    outcome, since decline never calls ``apply_commit`` at all.
     """
     disabled = _require_enabled()
     if disabled is not None:
@@ -390,8 +751,23 @@ def approve(store: "state_module.StateStore", sha: str) -> Dict[str, Any]:
         shutil.rmtree(commit_root, ignore_errors=True)
 
     if result.outcome not in ("applied", "partial"):
-        payload = _apply_result_to_dict(result)
+        payload = _apply_result_to_dict(result, changed_paths)
         payload["status"] = "error"
+        return payload
+
+    if result.outcome == "partial":
+        # H4 (ratified): a partial apply does NOT resolve pending. Record
+        # the not-applied paths/reasons onto the still-pending record so
+        # they surface via status(); base_sha stays put, pending stays
+        # put, and re-approving the same sha is safe (this call simply
+        # re-runs, re-annotates, and never crashes).
+        not_applied_reasons = {
+            relpath: "not applied — see apply result for details"
+            for relpath in result.not_applied
+        }
+        store.record_partial_apply(sha=sha, not_applied=not_applied_reasons)
+        payload = _apply_result_to_dict(result, changed_paths)
+        payload["status"] = "ok"
         return payload
 
     resolve_error = _resolve_or_error(store, sha)
@@ -399,15 +775,14 @@ def approve(store: "state_module.StateStore", sha: str) -> Dict[str, Any]:
         # The #65 staleness race: pending moved between the check above
         # and this call (a poll tick accumulated a newer commit into it
         # mid-apply). apply_commit already ran against the sha it was
-        # given and reported applied/partial; report both the apply
-        # outcome and the resolve refusal rather than silently dropping
-        # either.
-        payload = _apply_result_to_dict(result)
+        # given and reported applied; report both the apply outcome and
+        # the resolve refusal rather than silently dropping either.
+        payload = _apply_result_to_dict(result, changed_paths)
         payload["status"] = "error"
         payload["resolve_error"] = resolve_error.get("reason", "")
         return payload
 
-    payload = _apply_result_to_dict(result)
+    payload = _apply_result_to_dict(result, changed_paths)
     payload["status"] = "ok"
     return payload
 
@@ -526,6 +901,15 @@ def restore(store: "state_module.StateStore", apply_id: str) -> Dict[str, Any]:
     second call re-copies the same backup bytes (a no-op rewrite) and
     finds the created files already absent (a no-op removal), rather than
     raising.
+
+    ``status`` is ``"partial"`` — never a silent ``"ok"`` — when any
+    individual restore write or created-file removal fails with
+    ``OSError`` (senior-review H6): requirements.md 4.7's exact-restore
+    guarantee is violated for that one relpath, and the operator must be
+    told which one rather than the failure being swallowed by a bare
+    ``continue``. Every OTHER relpath still gets its own restore/removal
+    attempt regardless of an earlier failure — one bad file must not
+    abort the rest of the restore.
     """
     disabled = _require_enabled()
     if disabled is not None:
@@ -544,6 +928,7 @@ def restore(store: "state_module.StateStore", apply_id: str) -> Dict[str, Any]:
 
     restored: Dict[str, List[str]] = {root: [] for root in _ROOT_IDS}
     removed: Dict[str, List[str]] = {root: [] for root in _ROOT_IDS}
+    failed: List[str] = []
 
     for root in _ROOT_IDS:
         root_path = _root_path(root)
@@ -561,12 +946,14 @@ def restore(store: "state_module.StateStore", apply_id: str) -> Dict[str, Any]:
                 suffix=".tmp",
                 dir=str(live_target.parent),
             )
+            os.close(fd)
             tmp_path = Path(tmp_name)
             try:
                 tmp_path.write_bytes(backup_path.read_bytes())
                 tmp_path.replace(live_target)
-            except OSError:
+            except OSError as exc:
                 tmp_path.unlink(missing_ok=True)
+                failed.append(f"{apply_id}:{root}:{relpath}: could not restore: {exc}")
                 continue
             restored[root].append(relpath)
 
@@ -578,8 +965,15 @@ def restore(store: "state_module.StateStore", apply_id: str) -> Dict[str, Any]:
                 continue
             try:
                 live_target.unlink(missing_ok=True)
-            except OSError:
+            except OSError as exc:
+                failed.append(f"{apply_id}:{root}:{relpath}: could not remove: {exc}")
                 continue
             removed[root].append(relpath)
 
-    return {"status": "ok", "restored": restored, "removed": removed}
+    status = "partial" if failed else "ok"
+    return {
+        "status": status,
+        "restored": restored,
+        "removed": removed,
+        "failed": failed,
+    }

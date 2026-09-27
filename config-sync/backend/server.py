@@ -6,12 +6,12 @@ Run with: python backend/server.py
 Or let KiroCrew manage it via the app manifest backend section.
 
 Dispatches each design-table verb/path pair to its matching
-``backend.routes.*`` function, passing a single module-level
-``state.StateStore`` every request shares — the route functions
-themselves hold no HTTP knowledge (``backend/routes.py``'s own
-docstring: they are "plain, framework-agnostic functions"). This module
-owns exactly: verb/path matching, path-parameter extraction, JSON
-response shape, and the loopback-only bind — never route BEHAVIOUR,
+``backend.routes.*`` function, passing a fresh ``state.StateStore`` built
+per request (see ``_get_store`` below) — the route functions themselves
+hold no HTTP knowledge (``backend/routes.py``'s own docstring: they are
+"plain, framework-agnostic functions"). This module owns exactly:
+verb/path matching, path-parameter extraction, the mutation-request guard,
+JSON response shape, and the loopback-only bind — never route BEHAVIOUR,
 which is `backend.routes`'/`backend.apply`'s job and is tested there.
 
 A path parameter (``sha``/``apply_id``) is extracted only when the
@@ -21,6 +21,41 @@ would let a literal or percent-encoded ``/`` or ``..`` inside the
 parameter slot masquerade as extra path structure. The raw path is
 percent-decoded via ``urllib.parse.unquote`` before segment-splitting,
 so ``%2F`` is caught by the same segment-count check as a literal ``/``.
+
+## Cross-process staleness (senior-review C1)
+
+``poll.py`` and ``push.py`` run as SEPARATE cron processes, each building
+its own ``StateStore`` and writing straight to the shared on-disk state
+file (``backend/state.py`` now holds a cross-process file lock around
+every one of its own read-modify-writes). A server that built ONE
+``StateStore`` at first use and cached it for the process's lifetime
+would never see a concurrent poll/push process's writes, and its own
+read-modify-writes (`resolve_pending` via approve/decline) would run the
+#65 staleness check against a stale in-memory ``pending`` and would
+clobber concurrently-written fields on save. ``_get_store`` therefore
+builds a FRESH ``StateStore`` on every call — one per request — so every
+route sees the newest on-disk state and every mutation
+(`state.StateStore._locked_rmw`) re-reads under the lock before writing.
+This trades one extra JSON parse per request for correctness; the state
+document is small and local disk I/O, not a real cost at this app's
+request volume.
+
+## Mutation-request guard (senior-review H7)
+
+Every mutating request (``POST``) must carry ``X-Config-Sync-Request: 1``
+and a loopback ``Host`` header (``127.0.0.1``/``localhost``/``[::1]``,
+optionally with a port) — checked in ``_dispatch`` BEFORE any route runs.
+The server binds loopback-only, but that alone only stops a remote
+attacker; a plain unauthenticated HTTP server is still reachable by
+`fetch`/a form submit from ANY page open in a browser on the same
+machine. A required custom header is a real CSRF barrier because a
+simple cross-origin request (one that skips CORS preflight, including a
+form submission) cannot set one; pinning ``Host`` additionally catches
+DNS rebinding, where a page's JS can cause the browser to send a request
+to ``127.0.0.1`` while the ``Host`` header it sends still reflects
+whatever hostname resolved there. ``GET`` requests are unaffected — this
+is a mutation guard, not a blanket auth layer the design does not
+otherwise call for.
 """
 
 from __future__ import annotations
@@ -38,37 +73,35 @@ APP_NAME = os.environ.get("KIROCREW_APP_NAME", "config-sync")
 
 _PREFIX = "/api/apps/config-sync"
 
-#: The single `StateStore` every request shares — module-level so the
-#: same store `routes.*` sees is the one the app's cron jobs and any
-#: other in-process caller also use, matching `test_server.py`'s own
-#: requirement that a test-seeded store's state is what a route call
-#: observes. Rebuilt from disk on the FIRST use (`_get_store`), never at
-#: import time — `state.load_state()` resolves the state directory
-#: (honouring `CONFIG_SYNC_STATE_DIR`) at call time, so a test that sets
-#: that env var before the server starts still gets its own store.
-_store: Optional["state.StateStore"] = None
+#: H7 — every mutating (POST) request must carry this header with this
+#: exact value. A cross-origin `fetch`/`<form>` submission — including
+#: the "simple request" shapes that skip CORS preflight entirely — has
+#: no way to set an arbitrary custom header, so requiring one is a real
+#: CSRF barrier rather than a check an attacker's request trivially
+#: satisfies.
+_REQUIRED_HEADER = "X-Config-Sync-Request"
+_REQUIRED_HEADER_VALUE = "1"
+
+#: H7 — loopback hostnames/addresses a mutating request's `Host` header
+#: must match (with or without a trailing `:<port>`). Pinning `Host`
+#: catches DNS rebinding: an attacker's page can cause the victim's
+#: browser to send a request to `127.0.0.1`, but cannot make the browser
+#: send a `Host` header other than the one reflecting whatever hostname
+#: it believes it navigated to, unless that hostname itself already
+#: resolves to loopback.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 
 
 def _get_store() -> "state.StateStore":
-    global _store
-    if _store is None:
-        _store = state.load_state()
-    return _store
+    """Build a FRESH `StateStore` for this call — never a cached,
 
-
-def _reset_store_for_tests() -> None:
-    """Drop the cached store so the next `_get_store()` call reloads from
-
-    (a possibly newly-pointed) `CONFIG_SYNC_STATE_DIR` — used only by
-    tests that reload this module (`importlib.reload`), since a plain
-    module reload does not by itself clear a `global` that already holds
-    a live object across the reload.
+    process-lifetime instance (senior-review C1: see the module
+    docstring's "Cross-process staleness" section). `state.load_state()`
+    resolves the state directory (honouring `CONFIG_SYNC_STATE_DIR`) at
+    call time, so a test that sets that env var before making a request
+    still gets a store pointed at its own isolated directory.
     """
-    global _store
-    _store = None
-
-
-_reset_store_for_tests()
+    return state.load_state()
 
 
 def _segments(path: str) -> Tuple[str, ...]:
@@ -98,6 +131,32 @@ def _is_safe_param_segment(segment: str) -> bool:
     return segment not in (".", "..")
 
 
+def _is_loopback_host(host_header: Optional[str]) -> bool:
+    """H7 — return whether ``host_header`` (the raw `Host` header value,
+
+    which may carry a trailing ``:<port>``) names a loopback
+    host/address. Missing entirely is NOT loopback — a request with no
+    `Host` header at all gets the same refusal as a hostile one, since
+    there is nothing to validate.
+    """
+    if not host_header:
+        return False
+    if host_header in _LOOPBACK_HOSTS:
+        # Exact match first: catches a bare, unbracketed IPv6 literal
+        # (`::1`) up front, before the generic ":"-based port-strip
+        # below would otherwise misparse it as `host:port` and strip
+        # everything after the first colon.
+        return True
+    # Strip a trailing :port, but not the brackets/colons that are part
+    # of a literal IPv6 address itself (`[::1]:9100` -> `[::1]`, `[::1]`
+    # stays `[::1]` with no port to strip at all).
+    if host_header.startswith("["):
+        host_only = host_header.rsplit("]", 1)[0] + "]"
+    else:
+        host_only = host_header.rsplit(":", 1)[0] if ":" in host_header else host_header
+    return host_only in _LOOPBACK_HOSTS
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -106,7 +165,26 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("GET")
 
     def do_POST(self) -> None:
+        if not self._passes_mutation_guard():
+            return
         self._dispatch("POST")
+
+    def _passes_mutation_guard(self) -> bool:
+        """H7 — refuse a mutating request with 403 before it ever reaches
+
+        `_dispatch`/any `routes.*` function, unless it carries BOTH the
+        required custom header and a loopback `Host`. Returns whether the
+        request may proceed; on refusal it has already written the 403
+        response.
+        """
+        header_value = self.headers.get(_REQUIRED_HEADER)
+        if header_value != _REQUIRED_HEADER_VALUE:
+            self._json(403, {"error": "forbidden"})
+            return False
+        if not _is_loopback_host(self.headers.get("Host")):
+            self._json(403, {"error": "forbidden"})
+            return False
+        return True
 
     def _dispatch(self, method: str) -> None:
         parsed = urlsplit(self.path)

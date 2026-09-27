@@ -176,6 +176,19 @@ def running_server(
         thread.join(timeout=5)
 
 
+# senior-review H7 (see tests/test_server_security.py): every mutating
+# POST now requires this custom header plus a loopback Host, or the
+# server refuses it with 403 before any route runs. This file's own
+# tests are about HTTP-to-function WIRING (verb, path, path-parameter
+# extraction, status/content-type shape, loopback-only bind) — not
+# about H7's guard itself — so every request _request() sends carries
+# a satisfying header/Host pair by default, letting each test keep
+# exercising what it was written for instead of being redirected into
+# a 403 the guard produces before the PATH guard/dispatch ever runs.
+_SECURITY_HEADER = "X-Config-Sync-Request"
+_SECURITY_HEADER_VALUE = "1"
+
+
 def _request(
     host: str,
     port: int,
@@ -185,11 +198,15 @@ def _request(
 ) -> Tuple[int, Dict[str, str], bytes]:
     conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
-        conn.request(method, path, body=body)
+        headers = {
+            "Host": f"{host}:{port}",
+            _SECURITY_HEADER: _SECURITY_HEADER_VALUE,
+        }
+        conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         payload = resp.read()
-        headers = {k.lower(): v for k, v in resp.getheaders()}
-        return resp.status, headers, payload
+        response_headers = {k.lower(): v for k, v in resp.getheaders()}
+        return resp.status, response_headers, payload
     finally:
         conn.close()
 

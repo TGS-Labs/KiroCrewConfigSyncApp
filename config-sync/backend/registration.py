@@ -238,6 +238,27 @@ def _resolve_prompt_outcome(
     return _PromptOutcome(required_root_id=root_id, required_relpath=relpath)
 
 
+def _has_symlinked_component(root: Path, relpath: str) -> bool:
+    """True if any component of ``relpath``, walked from ``root``, is a
+
+    symlink. Mirrors ``backend.apply._is_unsafe_source``'s own per-
+    segment ``lstat``/``is_symlink()`` walk exactly -- reimplemented
+    here rather than imported, because ``backend.apply`` already imports
+    ``backend.registration`` (registration handling is one step inside
+    ``apply_commit``), and importing ``apply`` back would create a
+    cycle. ``is_symlink()`` itself never follows the link (it is an
+    ``lstat``, not a ``stat``), so a symlinked ancestor anywhere between
+    ``root`` and the leaf -- pointing inside or entirely outside the
+    commit tree -- is caught before the final component is even reached.
+    """
+    current = root
+    for segment in relpath.split("/"):
+        current = current / segment
+        if current.is_symlink():
+            return True
+    return False
+
+
 def _prompt_file_present(root: Path, relpath: str) -> bool:
     """Does ``relpath`` exist as a regular, non-symlink file in the
 
@@ -248,7 +269,16 @@ def _prompt_file_present(root: Path, relpath: str) -> bool:
     ``check_registrations``'s own first argument, the commit-scoped tree
     that also holds the agent definition and the two shared files --
     never against a live configured root.
+
+    "Regular, non-symlink file" covers every path component, not only
+    the leaf (H2): a relpath resolving through a symlinked ANCESTOR
+    directory (``config-bundles/`` or ``config-bundles/agent-prompts/``
+    itself being a symlink) is a redirect, not a plain file at that path
+    in the tree as committed, even when the leaf it resolves through is
+    itself a real, non-symlink file.
     """
+    if _has_symlinked_component(root, relpath):
+        return False
     target = root / relpath
     return target.is_file() and not target.is_symlink()
 
@@ -306,6 +336,19 @@ def check_registrations(
     # blocked).
     prompt_requirers: Dict[str, List[str]] = {}
 
+    # C3 (fail-closed rule, pending operator confirmation): every agent
+    # whose OWN key is present in a shared file (config.json /
+    # agent_model_state.json) that ends up blocked must itself be
+    # treated as blocked too -- its agents/<name>.json is refused from
+    # applying alongside the shared file, and it is reported incomplete
+    # naming the agent whose incompleteness caused the block. Tracked
+    # per shared relpath so this can be resolved only after every
+    # candidate in the commit has been judged (mirrors the prompt
+    # third-pass shape above).
+    config_keyholders: Dict[str, List[str]] = {}
+    model_state_keyholders: Dict[str, List[str]] = {}
+    blocking_agent_by_shared_relpath: Dict[str, str] = {}
+
     for agent_name in agent_names:
         agent_def_path = agent_def_paths[agent_name]
         missing: List[str] = []
@@ -343,12 +386,16 @@ def check_registrations(
 
         if config_has_entry:
             config_claimed = True
-        else:
-            missing.append(_PART_CONFIG)
-
+            config_keyholders.setdefault(_CONFIG_RELPATH, []).append(agent_name)
         if model_state_has_entry:
             model_state_claimed = True
-        else:
+            model_state_keyholders.setdefault(_MODEL_STATE_RELPATH, []).append(
+                agent_name
+            )
+
+        if not config_has_entry:
+            missing.append(_PART_CONFIG)
+        if not model_state_has_entry:
             missing.append(_PART_MODEL_STATE)
 
         if missing:
@@ -365,11 +412,15 @@ def check_registrations(
                 result.blocked_paths.append(agent_def_path)
             if config_has_entry and _CONFIG_RELPATH not in result.blocked_paths:
                 result.blocked_paths.append(_CONFIG_RELPATH)
+                blocking_agent_by_shared_relpath.setdefault(_CONFIG_RELPATH, agent_name)
             if (
                 model_state_has_entry
                 and _MODEL_STATE_RELPATH not in result.blocked_paths
             ):
                 result.blocked_paths.append(_MODEL_STATE_RELPATH)
+                blocking_agent_by_shared_relpath.setdefault(
+                    _MODEL_STATE_RELPATH, agent_name
+                )
 
     # Third pass: block a required prompt file only when EVERY agent
     # that requires it is incomplete (requirements.md 5.13).
@@ -379,6 +430,46 @@ def check_registrations(
         if all(requirer in result.incomplete_agents for requirer in requirers):
             if relpath not in result.blocked_paths:
                 result.blocked_paths.append(relpath)
+
+    # Fourth pass (C3, fail-closed interim ruling pending operator
+    # confirmation): if config.json or agent_model_state.json is blocked
+    # from applying (because some agent in the commit is incomplete),
+    # then EVERY agent whose key is present in that committed shared
+    # file is also treated as blocked -- even an otherwise-complete
+    # agent -- because that shared file's entry for it will not be live
+    # either. Its own agents/<name>.json is added to blocked_paths and
+    # it moves from complete_agents to incomplete_agents, reported with
+    # a reason naming the agent whose incompleteness blocked the shared
+    # file. This prevents an agent ever being left half-registered:
+    # config.json refused, but a picker/planner reading complete_agents
+    # believing that agent's shared-file entry is live.
+    for shared_relpath, keyholders in (
+        (_CONFIG_RELPATH, config_keyholders.get(_CONFIG_RELPATH, [])),
+        (_MODEL_STATE_RELPATH, model_state_keyholders.get(_MODEL_STATE_RELPATH, [])),
+    ):
+        if shared_relpath not in result.blocked_paths:
+            continue
+        blocking_agent = blocking_agent_by_shared_relpath.get(shared_relpath, "")
+        part_name = (
+            _PART_CONFIG if shared_relpath == _CONFIG_RELPATH else _PART_MODEL_STATE
+        )
+        for keyholder_name in keyholders:
+            if keyholder_name in result.incomplete_agents:
+                continue
+            reason = (
+                f"{part_name} is blocked because agent "
+                f"'{blocking_agent}' in the same commit is incomplete"
+            )
+            result.incomplete_agents[keyholder_name] = [reason]
+            if keyholder_name in result.complete_agents:
+                result.complete_agents.remove(keyholder_name)
+            result.propagation_report.pop(keyholder_name, None)
+            keyholder_def_path = agent_def_paths.get(keyholder_name)
+            if (
+                keyholder_def_path is not None
+                and keyholder_def_path not in result.blocked_paths
+            ):
+                result.blocked_paths.append(keyholder_def_path)
 
     # A changed path is "unrelated" only when no registration this commit
     # touches claims it: every changed agent definition path is claimed

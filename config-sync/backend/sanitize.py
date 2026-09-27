@@ -30,10 +30,24 @@ failure to resolve or run it is treated as a rejection, never a silent pass.
 The vet decides what is unsafe; this module only enforces the consequences
 (drop / pause / report) and must not invent a stricter metacharacter
 denylist of its own.
+
+Operator ruling M5 extends this same vet contract to two more pulled files
+that carry a shell-executable ``command``: ``hooks.json`` (``{"hooks":
+[{name, event, matcher, command}]}``, one shell string per hook — no
+``args``) and ``mcp.json`` (``{"mcpServers": {name: {command, args, ...}}}``,
+vetted against ``command`` + ``args`` joined with ``shlex.join`` so an
+injection smuggled only through ``args`` is not missed). An entry whose vet
+returns a rejection string, or whose vet raises, is dropped and reported by
+name — fail-closed, exactly like a ``crons.json`` job. Other entries in the
+same file still apply. :func:`sanitize_hooks` and :func:`sanitize_mcp_servers`
+take the identical ``vet: VetCallable | None`` seam as :func:`sanitize_crons`
+(the SAME callable ``apply.apply_commit``'s ``cron_vet`` parameter already
+threads through, not a second differently-named parameter).
 """
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
@@ -203,4 +217,154 @@ def sanitize_instances(store: Dict[str, Any]) -> InstanceSanitizeResult:
     return InstanceSanitizeResult(
         sanitized_store=sanitized_store,
         changed_instance_names=changed_names,
+    )
+
+
+@dataclass
+class CommandSanitizeResult:
+    """Outcome of sanitizing one pulled ``hooks.json``/``mcp.json`` store
+
+    (operator ruling M5).
+
+    Attributes:
+        sanitized_store: The document to write, with every dropped entry
+            removed and every surviving entry otherwise unchanged.
+        dropped_names: Names of every hook/server removed because its
+            shell-joined command failed the vet or the vet raised.
+    """
+
+    sanitized_store: Dict[str, Any] = field(default_factory=dict)
+    dropped_names: List[str] = field(default_factory=list)
+
+
+def _hook_shell_command(hook: Dict[str, Any]) -> str:
+    """Return a ``hooks.json`` entry's own shell command, or ``""`` when it
+
+    carries none. A ``ScriptHook`` has no ``args`` field — its ``command``
+    is already the complete shell string to vet, unlike an ``mcp.json``
+    server entry.
+    """
+    command = hook.get("command")
+    return command if isinstance(command, str) else ""
+
+
+def _mcp_server_shell_command(server: Dict[str, Any]) -> str:
+    """Return an ``mcp.json`` server entry's shell-joined ``command`` +
+
+    ``args``, matching how the real subprocess is actually invoked — vetting
+    ``command`` alone would miss an injection smuggled through ``args``
+    (e.g. ``args: ["$(whoami)"]``).
+    """
+    command = server.get("command")
+    if not isinstance(command, str) or not command:
+        return ""
+    args = server.get("args", [])
+    args_list = [str(item) for item in args] if isinstance(args, list) else []
+    return shlex.join([command, *args_list])
+
+
+def sanitize_hooks(
+    store: Dict[str, Any], vet: VetCallable | None = None
+) -> CommandSanitizeResult:
+    """Sanitize a pulled ``hooks.json`` store per operator ruling M5.
+
+    Args:
+        store: The parsed ``hooks.json`` document, shaped
+            ``{"hooks": [...]}``.
+        vet: Same contract as :func:`sanitize_crons`'s ``vet`` — takes a
+            shell command string, returns ``None`` when clean or an
+            ``"Error: ..."`` string when refused. Defaults to the real
+            vet, resolved lazily, when not given.
+
+    Returns:
+        A ``CommandSanitizeResult`` whose ``sanitized_store`` never
+        contains a hook whose command failed the vet (or whose vet
+        raised), and whose ``dropped_names`` names each one. A hook with
+        no ``command`` is never vetted and always kept.
+    """
+    active_vet: VetCallable = vet if vet is not None else _default_vet
+
+    kept: List[Dict[str, Any]] = []
+    dropped_names: List[str] = []
+
+    for hook in store.get("hooks", []):
+        if not isinstance(hook, dict):
+            # Not command-shaped (a malformed entry) — nothing here to
+            # vet, so it is kept through unchanged rather than crashing;
+            # a shape defect in one entry must not block every other
+            # entry in the same file, and `apply.py`'s per-file
+            # try/except is the boundary for genuine bugs, not a place
+            # for this vet to invent its own strictness.
+            kept.append(hook)
+            continue
+        command = _hook_shell_command(hook)
+        if command:
+            try:
+                reason = active_vet(command)
+            except Exception:
+                reason = "Error: hook command could not be verified"
+            if reason is not None:
+                dropped_names.append(_name_of(hook))
+                continue
+        kept.append(hook)
+
+    sanitized_store = dict(store)
+    sanitized_store["hooks"] = kept
+
+    return CommandSanitizeResult(
+        sanitized_store=sanitized_store,
+        dropped_names=dropped_names,
+    )
+
+
+def sanitize_mcp_servers(
+    store: Dict[str, Any], vet: VetCallable | None = None
+) -> CommandSanitizeResult:
+    """Sanitize a pulled ``mcp.json`` store per operator ruling M5.
+
+    Args:
+        store: The parsed ``mcp.json`` document, shaped
+            ``{"mcpServers": {name: {command, args, ...}}}``.
+        vet: Same contract as :func:`sanitize_crons`'s ``vet``, called
+            against the shell-joined ``command`` + ``args`` string (never
+            ``command`` alone). Defaults to the real vet, resolved lazily,
+            when not given.
+
+    Returns:
+        A ``CommandSanitizeResult`` whose ``sanitized_store`` never
+        contains a server whose joined command failed the vet (or whose
+        vet raised), and whose ``dropped_names`` names each one. A server
+        with no ``command`` is never vetted and always kept. A non-dict
+        ``mcpServers`` value is treated as empty.
+    """
+    active_vet: VetCallable = vet if vet is not None else _default_vet
+
+    servers = store.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+
+    kept: Dict[str, Any] = {}
+    dropped_names: List[str] = []
+
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            kept[name] = server
+            continue
+        command = _mcp_server_shell_command(server)
+        if command:
+            try:
+                reason = active_vet(command)
+            except Exception:
+                reason = "Error: mcp server command could not be verified"
+            if reason is not None:
+                dropped_names.append(name if isinstance(name, str) else str(name))
+                continue
+        kept[name] = server
+
+    sanitized_store = dict(store)
+    sanitized_store["mcpServers"] = kept
+
+    return CommandSanitizeResult(
+        sanitized_store=sanitized_store,
+        dropped_names=dropped_names,
     )

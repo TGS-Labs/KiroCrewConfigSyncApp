@@ -233,8 +233,12 @@ def test_restore_reports_ok_when_the_copy_back_write_raises_oserror(
     """Simulate the copy-back write itself failing (`Path.replace` raising)
 
     for one relpath — `restore` must catch it, skip that relpath (leaving
-    it out of `restored`), and still report `status: ok` for the call as
-    a whole rather than propagating the exception.
+    it out of `restored`), report it in `failed`, and still process every
+    OTHER relpath rather than propagating the exception. Per
+    senior-review H6, a per-file restore failure is reported as
+    `status: "partial"` (never a silent "ok") — see
+    `tests/test_routes_review1.py::TestH6RestoreReportsFailureInsteadOfSilentlyContinuing`
+    for the finding this test was updated to match.
     """
     apply_id = _seed_and_apply(tmp_path, isolated_env, store)
 
@@ -249,8 +253,9 @@ def test_restore_reports_ok_when_the_copy_back_write_raises_oserror(
 
     result = routes_module.restore(store, apply_id)
 
-    assert result["status"] == "ok", result
+    assert result["status"] == "partial", result
     assert "config.json" not in result["restored"].get("A", [])
+    assert any("config.json" in entry for entry in result["failed"])
     # The other backed-up file is unaffected by the one failure.
     assert "steering/a.md" in result["restored"].get("A", [])
 
@@ -265,7 +270,9 @@ def test_restore_reports_ok_when_removing_a_created_file_raises_oserror(
     """Simulate `Path.unlink` raising for a legitimate (non-tampered)
 
     created-file manifest entry — `restore` must catch it, leave that
-    relpath out of `removed`, and still report `status: ok` overall.
+    relpath out of `removed`, report it in `failed`, and still report
+    `status: "partial"` overall (senior-review H6 — see
+    `tests/test_routes_review1.py::TestH6RestoreReportsFailureInsteadOfSilentlyContinuing`).
     """
     root_a = isolated_env["root_a"]
     (root_a / "steering").mkdir(parents=True, exist_ok=True)
@@ -304,8 +311,9 @@ def test_restore_reports_ok_when_removing_a_created_file_raises_oserror(
 
     restore_result = routes_module.restore(store, apply_id)
 
-    assert restore_result["status"] == "ok", restore_result
+    assert restore_result["status"] == "partial", restore_result
     assert "config.json" not in restore_result["removed"].get("A", [])
+    assert any("config.json" in entry for entry in restore_result["failed"])
 
 
 def test_restore_skips_a_created_relpath_whose_live_root_cannot_resolve(

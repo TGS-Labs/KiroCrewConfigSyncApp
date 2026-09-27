@@ -24,23 +24,65 @@ then ``os.replace()``s it into place, so a reader never observes a
 truncated or partial document and a crash mid-write leaves the previous
 good file untouched. A failed push never changes ``last_pushed_hash`` —
 only :func:`StateStore.record_push_success` does.
+
+## Cross-process locking (senior-review C1)
+
+``poll.py``/``push.py`` (separate cron processes) and the backend server
+each build their own ``StateStore`` against the SAME on-disk file, with
+no in-process coordination between them. ``_atomic_write_json``'s
+``os.replace`` only protects a READER from observing a half-written
+file — it does nothing to stop two processes each doing
+load -> mutate -> save from losing one side's update when the second
+save is a full-payload write of a payload it loaded before the first
+save landed.
+
+Every read-modify-write mutation therefore goes through
+:func:`StateStore._locked_rmw`, which holds an ``fcntl.flock`` on a
+sibling ``.lock`` file (never the state file itself, so a lock never
+blocks a plain read of ``state.json``) for the full span: acquire ->
+re-read the payload fresh from disk -> apply the mutation -> write ->
+release. Re-reading INSIDE the lock (rather than trusting whatever
+``self._payload`` already held) is what makes this a real fix rather
+than only serializing two stale writes — the mutation always applies on
+top of the newest on-disk value, so a concurrent writer's fields (e.g.
+``last_pushed_hash`` while this call only means to touch ``pending``)
+are never reverted.
+
+The wait for the lock is bounded (:data:`_LOCK_TIMEOUT_SECONDS`); on
+timeout ``_locked_rmw`` raises :class:`TimeoutError` rather than
+proceeding unlocked or silently skipping the write — a lock that can be
+silently bypassed is not a lock.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import errno
+import fcntl
 import json
 import os
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, Iterator, cast
 
 HISTORY_LIMIT = 50
 
 _STATE_DIR_ENV = "CONFIG_SYNC_STATE_DIR"
 _STATE_FILE_NAME = "state.json"
+_LOCK_FILE_NAME = "state.json.lock"
+
+#: Bounded wait for the cross-process file lock. A real cron tick's own
+#: read-modify-write span is a handful of milliseconds (one JSON parse,
+#: one dict mutation, one atomic write), so a few seconds is ample
+#: headroom for another process's in-flight write while still failing
+#: loudly (never hanging the request/tick indefinitely) if the lock is
+#: somehow never released (e.g. a crashed holder on a platform where the
+#: OS did not reclaim the lock promptly).
+_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_INTERVAL_SECONDS = 0.05
 
 _DEFAULT_FIELDS: dict[str, Any] = {
     "last_pushed_hash": None,
@@ -93,6 +135,56 @@ def get_state_dir() -> Path:
 def get_state_path() -> Path:
     """Return the path to the single JSON state document."""
     return get_state_dir() / _STATE_FILE_NAME
+
+
+def get_lock_path() -> Path:
+    """Return the path to the cross-process lock file, sibling to the
+
+    state document itself. A SEPARATE file, never ``state.json`` — the
+    lock must be acquirable (and pollable) without opening the document
+    in a mode that would disturb `_atomic_write_json`'s own
+    temp-file-then-``os.replace`` sequence, and a lock held on a path
+    that a writer then ``os.replace``s out from under it would silently
+    stop protecting anything.
+    """
+    return get_state_dir() / _LOCK_FILE_NAME
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path, timeout: float = _LOCK_TIMEOUT_SECONDS) -> Iterator[None]:
+    """Hold an exclusive ``fcntl.flock`` on ``path`` for the duration of
+
+    the ``with`` block, creating ``path`` if it does not yet exist.
+
+    Blocks up to ``timeout`` seconds waiting for the lock (polling with
+    a non-blocking `flock` attempt rather than a blocking one, so a
+    genuinely stuck holder cannot hang the caller past the bound) and
+    raises :class:`TimeoutError` if it is never acquired — never
+    proceeds unlocked and never silently skips the caller's write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out after {timeout}s waiting for the "
+                        f"config-sync state lock at {path}"
+                    ) from exc
+                time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -159,6 +251,61 @@ class StateStore:
 
     _path: Path
     _payload: dict[str, Any] = field(default_factory=_fresh_defaults)
+
+    # -- cross-process read-modify-write -----------------------------------
+
+    def _locked_rmw(self, mutate: Callable[[dict[str, Any]], None]) -> None:
+        """Run ``mutate(payload)`` under the cross-process file lock,
+
+        against a payload that starts from this instance's own in-memory
+        view (``self._payload``) and is then overlaid with any field a
+        concurrent writer has since persisted to disk. This is the
+        mechanism every mutation method below routes through: it is what
+        stops a concurrent poll/push/server process's already-saved
+        fields from being reverted by this call's write (senior-review
+        C1), WITHOUT discarding a field this instance itself set
+        in-memory but has not yet persisted (e.g. a caller using the
+        `last_pushed_hash` test setter to seed a scenario before
+        exercising a method that mutates a DIFFERENT field entirely —
+        that seeded value is this instance's own not-yet-saved state, not
+        staleness, and must survive).
+
+        Concretely: start from ``dict(self._payload)``, then for every
+        field that differs from `_fresh_defaults()` in the just-reread
+        on-disk copy, take the ON-DISK value — that is exactly the set of
+        fields a concurrent process could plausibly have changed since
+        this instance last loaded. A field neither side has touched
+        (still at its default) is unaffected either way. ``mutate``
+        receives this merged payload and mutates it in-place; the field
+        lookups it needs (e.g. `current["pending"]` for
+        `accumulate_pending`'s merge) MUST read from that same merged
+        dict — never a separate `self._payload` reference — so the merge
+        of a concurrent write is what the mutation itself sees too.
+
+        After a successful write, ``self._payload`` is replaced with the
+        just-written payload so this instance's own subsequent reads
+        (`self.pending`, etc.) reflect what is now on disk. If the write
+        itself fails, ``self._payload`` is left unchanged (the in-memory
+        view never runs ahead of what is actually on disk) and the
+        exception propagates.
+        """
+        lock_path = self._path.parent / _LOCK_FILE_NAME
+        with _file_lock(lock_path):
+            on_disk = _load_payload(self._path)
+            defaults = _fresh_defaults()
+            merged = dict(self._payload)
+            for key, default_value in defaults.items():
+                disk_value = on_disk.get(key, default_value)
+                if disk_value != default_value:
+                    merged[key] = disk_value
+            mutate(merged)
+            previous = self._payload
+            self._payload = merged
+            try:
+                self._save()
+            except Exception:
+                self._payload = previous
+                raise
 
     # -- read-only views -------------------------------------------------
 
@@ -259,9 +406,12 @@ class StateStore:
             "pr_url": None,
             "time": _now_iso(),
         }
-        self._payload["last_push"] = dict(entry)
-        self._append_history(entry)
-        self._save()
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["last_push"] = dict(entry)
+            self._append_history(payload, dict(entry))
+
+        self._locked_rmw(_mutate)
 
     def record_push_success(
         self, *, tree_hash: str, branch: str, pr_url: str | None
@@ -270,6 +420,12 @@ class StateStore:
 
         caller `confirm_pr_created`) advances `last_pushed_hash` —
         `record_branch_pushed` is the bare-push counterpart that does not.
+
+        Clears `last_push_failure` (senior-review M4): a push that failed
+        once and later succeeds must stop reporting the earlier failure
+        forever, mirroring `clear_poll_failure`'s already-correct pairing
+        for the poll side — otherwise `GET status` has no way to show
+        "recovered" versus "still failing".
         """
         entry = {
             "tree_hash": tree_hash,
@@ -277,18 +433,23 @@ class StateStore:
             "pr_url": pr_url,
             "time": _now_iso(),
         }
-        self._payload["last_pushed_hash"] = tree_hash
-        self._payload["last_push"] = dict(entry)
-        self._append_history(entry)
-        self._save()
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["last_pushed_hash"] = tree_hash
+            payload["last_push"] = dict(entry)
+            payload["last_push_failure"] = None
+            self._append_history(payload, dict(entry))
+
+        self._locked_rmw(_mutate)
 
     def record_push_failure(self, *, reason: str) -> None:
         """Record a failed push. Never changes `last_pushed_hash`."""
-        self._payload["last_push_failure"] = {
-            "reason": reason,
-            "time": _now_iso(),
-        }
-        self._save()
+        entry = {"reason": reason, "time": _now_iso()}
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["last_push_failure"] = dict(entry)
+
+        self._locked_rmw(_mutate)
 
     def record_poll_failure(self, *, reason: str) -> None:
         """Record a failed poll tick (`outcome="fetch-failed"`), mirroring
@@ -308,11 +469,12 @@ class StateStore:
         leaves that untouched on this path so the next tick retries the
         same head).
         """
-        self._payload["last_poll_failure"] = {
-            "reason": reason,
-            "time": _now_iso(),
-        }
-        self._save()
+        entry = {"reason": reason, "time": _now_iso()}
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["last_poll_failure"] = dict(entry)
+
+        self._locked_rmw(_mutate)
 
     def clear_poll_failure(self) -> None:
         """Clear `last_poll_failure` after a successful poll tick
@@ -328,8 +490,11 @@ class StateStore:
         cleanly counts as a recovery regardless of whether it also found a
         new commit.
         """
-        self._payload["last_poll_failure"] = None
-        self._save()
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["last_poll_failure"] = None
+
+        self._locked_rmw(_mutate)
 
     def record_pr_pending(
         self, *, branch: str, tree_hash: str, payload: dict[str, Any]
@@ -346,9 +511,12 @@ class StateStore:
             "payload": dict(payload),
             "time": _now_iso(),
         }
-        self._payload["pending_pr"] = entry
-        self._append_history(dict(entry))
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["pending_pr"] = dict(entry)
+            self._append_history(fresh, dict(entry))
+
+        self._locked_rmw(_mutate)
 
     def record_pr_pending_failure(
         self,
@@ -390,30 +558,33 @@ class StateStore:
            `pending_pr_stale` for observability instead of silently
            dropping it (H-NEW-2).
         """
-        current = self._payload["pending_pr"]
 
-        if (
-            tree_hash is not None
-            and current is not None
-            and (
-                current.get("tree_hash") != tree_hash or current.get("branch") != branch
-            )
-        ):
-            self._payload["pending_pr_stale"] = {
+        def _mutate(fresh: dict[str, Any]) -> None:
+            current = fresh["pending_pr"]
+
+            if (
+                tree_hash is not None
+                and current is not None
+                and (
+                    current.get("tree_hash") != tree_hash
+                    or current.get("branch") != branch
+                )
+            ):
+                fresh["pending_pr_stale"] = {
+                    "reason": reason,
+                    "tree_hash": tree_hash,
+                    "branch": branch,
+                    "time": _now_iso(),
+                }
+                return
+
+            fresh["pending_pr_failure"] = {
                 "reason": reason,
-                "tree_hash": tree_hash,
-                "branch": branch,
                 "time": _now_iso(),
             }
-            self._save()
-            return
+            fresh["pending_pr"] = None
 
-        self._payload["pending_pr_failure"] = {
-            "reason": reason,
-            "time": _now_iso(),
-        }
-        self._payload["pending_pr"] = None
-        self._save()
+        self._locked_rmw(_mutate)
 
     def confirm_pr_created(self, *, tree_hash: str, branch: str, pr_url: str) -> None:
         """Confirm a pending PR was actually created — the only call that
@@ -421,7 +592,11 @@ class StateStore:
 
         Called out-of-band, from a KiroCrew agent context via the
         `complete-pr-handoff` skill, once Buildo has actually opened the
-        PR. Delegates to `record_push_success` since that is the only
+        PR. Applies the same field updates as `record_push_success`
+        (inlined here rather than calling it, so the whole read-check-
+        write span — including the staleness check against
+        `pending_pr` below — runs under ONE lock acquisition, not two)
+        since that is the only
         existing path that persists `last_pushed_hash` and pairs it with a
         `last_push` record (requirements.md 2.6).
 
@@ -434,30 +609,44 @@ class StateStore:
         `pending_pr_stale` so it is observable rather than silently
         swallowed.
         """
-        current = self._payload["pending_pr"]
-        if (
-            current is None
-            or current.get("tree_hash") != tree_hash
-            or current.get("branch") != branch
-        ):
-            self._payload["pending_pr_stale"] = {
-                "reason": "confirm_pr_created for a superseded tree_hash",
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            current = fresh["pending_pr"]
+            if (
+                current is None
+                or current.get("tree_hash") != tree_hash
+                or current.get("branch") != branch
+            ):
+                fresh["pending_pr_stale"] = {
+                    "reason": "confirm_pr_created for a superseded tree_hash",
+                    "tree_hash": tree_hash,
+                    "branch": branch,
+                    "pr_url": pr_url,
+                    "time": _now_iso(),
+                }
+                return
+
+            entry = {
                 "tree_hash": tree_hash,
                 "branch": branch,
                 "pr_url": pr_url,
                 "time": _now_iso(),
             }
-            self._save()
-            return
+            fresh["last_pushed_hash"] = tree_hash
+            fresh["last_push"] = dict(entry)
+            fresh["last_push_failure"] = None
+            self._append_history(fresh, dict(entry))
+            fresh["pending_pr"] = None
 
-        self.record_push_success(tree_hash=tree_hash, branch=branch, pr_url=pr_url)
-        self._payload["pending_pr"] = None
-        self._save()
+        self._locked_rmw(_mutate)
 
     def record_seen_sha(self, sha: str) -> None:
         """Record the latest polled SHA, overwriting any previous value."""
-        self._payload["last_seen_sha"] = sha
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["last_seen_sha"] = sha
+
+        self._locked_rmw(_mutate)
 
     def set_pending(
         self,
@@ -491,16 +680,19 @@ class StateStore:
         default to an empty list — so an existing caller that only ever
         passed the original four keyword arguments is unaffected.
         """
-        self._payload["base_sha"] = sha
-        self._payload["pending"] = {
-            "sha": sha,
-            "author": author,
-            "subject": subject,
-            "classified_paths": dict(classified_paths),
-            "ignored_paths": list(ignored_paths or []),
-            "touched_classes": list(touched_classes or []),
-        }
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["base_sha"] = sha
+            fresh["pending"] = {
+                "sha": sha,
+                "author": author,
+                "subject": subject,
+                "classified_paths": dict(classified_paths),
+                "ignored_paths": list(ignored_paths or []),
+                "touched_classes": list(touched_classes or []),
+            }
+
+        self._locked_rmw(_mutate)
 
     def accumulate_pending(
         self,
@@ -550,38 +742,43 @@ class StateStore:
         `poll.py`'s notification for this tick reports. ``base_sha`` is
         NOT touched here — it only ever changes via `advance_base_sha`.
         """
-        current = self._payload["pending"]
-        if current is None:
-            raise ValueError(
-                "accumulate_pending called with no existing pending record; "
-                "use set_pending to start a new one"
-            )
 
-        merged_classified: dict[str, str] = dict(current["classified_paths"])
-        merged_classified.update(classified_paths)
+        def _mutate(fresh: dict[str, Any]) -> None:
+            current = fresh["pending"]
+            if current is None:
+                raise ValueError(
+                    "accumulate_pending called with no existing pending "
+                    "record; use set_pending to start a new one"
+                )
 
-        merged_ignored: list[str] = list(current.get("ignored_paths") or [])
-        for relpath in ignored_paths or []:
-            if relpath not in merged_ignored:
-                merged_ignored.append(relpath)
-        # A path newly classified this tick must not remain in the
-        # accumulated ignored list even if an earlier tick ignored it.
-        merged_ignored = [
-            relpath for relpath in merged_ignored if relpath not in merged_classified
-        ]
+            merged_classified: dict[str, str] = dict(current["classified_paths"])
+            merged_classified.update(classified_paths)
 
-        merged_touched: set[str] = set(current.get("touched_classes") or [])
-        merged_touched.update(touched_classes or [])
+            merged_ignored: list[str] = list(current.get("ignored_paths") or [])
+            for relpath in ignored_paths or []:
+                if relpath not in merged_ignored:
+                    merged_ignored.append(relpath)
+            # A path newly classified this tick must not remain in the
+            # accumulated ignored list even if an earlier tick ignored it.
+            merged_ignored = [
+                relpath
+                for relpath in merged_ignored
+                if relpath not in merged_classified
+            ]
 
-        self._payload["pending"] = {
-            "sha": sha,
-            "author": author,
-            "subject": subject,
-            "classified_paths": merged_classified,
-            "ignored_paths": merged_ignored,
-            "touched_classes": sorted(merged_touched),
-        }
-        self._save()
+            merged_touched: set[str] = set(current.get("touched_classes") or [])
+            merged_touched.update(touched_classes or [])
+
+            fresh["pending"] = {
+                "sha": sha,
+                "author": author,
+                "subject": subject,
+                "classified_paths": merged_classified,
+                "ignored_paths": merged_ignored,
+                "touched_classes": sorted(merged_touched),
+            }
+
+        self._locked_rmw(_mutate)
 
     def advance_base_sha(self, sha: str) -> None:
         """Advance ``base_sha`` to ``sha`` — called ONLY when the operator
@@ -599,8 +796,11 @@ class StateStore:
         passing the SHA that was just approved or declined, once those
         routes are built.
         """
-        self._payload["base_sha"] = sha
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["base_sha"] = sha
+
+        self._locked_rmw(_mutate)
 
     def clear_pending(self) -> None:
         """Clear the pending record without changing anything else.
@@ -610,8 +810,11 @@ class StateStore:
         `advance_base_sha`); a caller that means "operator decided"
         must call both.
         """
-        self._payload["pending"] = None
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["pending"] = None
+
+        self._locked_rmw(_mutate)
 
     def resolve_pending(self, sha: str) -> None:
         """Resolve the pending record against an operator decision — the
@@ -642,25 +845,96 @@ class StateStore:
                 changed on refusal, so a stale decision never applies (or
                 clears) a commit the operator never actually reviewed.
         """
-        pending = self._payload["pending"]
-        if pending is None or pending.get("sha") != sha:
-            raise ValueError(
-                f"no pending commit matching sha {sha!r} to resolve "
-                "(nothing pending, or a newer commit has since accumulated)"
-            )
-        self._payload["base_sha"] = sha
-        self._payload["pending"] = None
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            pending = fresh["pending"]
+            if pending is None or pending.get("sha") != sha:
+                raise ValueError(
+                    f"no pending commit matching sha {sha!r} to resolve "
+                    "(nothing pending, or a newer commit has since "
+                    "accumulated)"
+                )
+            fresh["base_sha"] = sha
+            fresh["pending"] = None
+
+        self._locked_rmw(_mutate)
+
+    def record_partial_apply(self, *, sha: str, not_applied: dict[str, str]) -> None:
+        """Record a PARTIAL apply's not-applied paths/reasons onto the
+
+        pending record WITHOUT resolving it (H4, ratified): a partial
+        apply must leave ``pending``/``base_sha`` untouched — the operator
+        still needs to see this commit as pending — while the not-applied
+        paths and their reasons become visible via ``status()``.
+
+        Args:
+            sha: the sha the caller (``approve``) just ran ``apply_commit``
+                against. Applied only when it still matches
+                ``pending["sha"]`` — the same staleness guard
+                ``resolve_pending`` enforces, so a partial-apply record
+                for a sha that is no longer the pending one (a poll tick
+                accumulated a newer commit mid-apply) is silently a
+                no-op rather than attaching stale data to a different
+                commit's pending record.
+            not_applied: ``{relpath: reason}`` for every path that failed
+                to apply.
+
+        Raises:
+            ValueError: when there is no pending record at all, mirroring
+                ``resolve_pending``'s own refusal shape — a caller with
+                nothing pending to annotate is a caller bug.
+        """
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            pending = fresh["pending"]
+            if pending is None:
+                raise ValueError(
+                    "record_partial_apply called with no existing pending "
+                    "record to annotate"
+                )
+            if pending.get("sha") != sha:
+                # Stale: a newer commit has since accumulated into
+                # pending. Do not attach this apply's not-applied paths
+                # to a pending record that no longer names the commit
+                # this apply actually ran against.
+                return
+            updated = dict(pending)
+            updated["not_applied"] = dict(not_applied)
+            fresh["pending"] = updated
+            # H4: "base_sha not advanced" on a partial apply. base_sha
+            # only ever moves via set_pending (bootstrapping the very
+            # first-ever pending record to that commit's own sha) or a
+            # genuine operator decision (resolve_pending/
+            # advance_base_sha) -- accumulate_pending never touches it.
+            # When base_sha still equals THIS pending commit's own sha,
+            # no operator decision has actually happened yet: the only
+            # thing that ever set it was set_pending's bootstrap side
+            # effect for this exact cycle, which a partial apply must
+            # not leave standing as if a decision boundary had moved.
+            # Revert it to "no decision yet" (None) in that case; if
+            # base_sha instead names an EARLIER, already-decided commit
+            # (a later accumulate_pending moved pending.sha forward
+            # while base_sha stayed at that prior decision), it is left
+            # untouched -- there is a real decision boundary there to
+            # preserve.
+            if fresh.get("base_sha") == sha:
+                fresh["base_sha"] = None
+
+        self._locked_rmw(_mutate)
 
     def record_restore_dir(self, *, apply_id: str, restore_dir: str) -> None:
         """Record a restore-directory mapping for a previous apply."""
-        self._payload["restore_dirs"][apply_id] = restore_dir
-        self._save()
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["restore_dirs"][apply_id] = restore_dir
+
+        self._locked_rmw(_mutate)
 
     # -- internals ---------------------------------------------------------
 
-    def _append_history(self, entry: dict[str, Any]) -> None:
-        history = self._payload["history"]
+    @staticmethod
+    def _append_history(payload: dict[str, Any], entry: dict[str, Any]) -> None:
+        history = payload["history"]
         history.append(entry)
         if len(history) > HISTORY_LIMIT:
             del history[: len(history) - HISTORY_LIMIT]

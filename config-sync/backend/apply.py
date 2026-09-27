@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import shlex
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -68,6 +70,8 @@ _ROOT_B_DEFAULT = "~/.kiro"
 
 _CRONS_RELPATH = "crons.json"
 _INSTANCES_RELPATH = "instances.json"
+_HOOKS_RELPATH = "hooks.json"
+_MCP_RELPATH = "mcp.json"
 
 
 @dataclass(frozen=True)
@@ -87,9 +91,19 @@ class ApplyResult:
             (requirements.md 4.5) — refused before any write attempt,
             including a path-traversal or symlink-shaped relpath.
         dropped_cron_names: Cron job names dropped by
-            ``sanitize.sanitize_crons``'s vet.
+            ``sanitize.sanitize_crons``'s vet. Per operator ruling M5,
+            also carries every ``hooks.json`` hook name and ``mcp.json``
+            server name dropped by ``sanitize.sanitize_hooks``/
+            ``sanitize.sanitize_mcp_servers`` — the same fail-closed
+            vet, same name-only reporting contract, one combined list.
         paused_cron_names: Cron job names imported paused.
         changed_instance_names: Instance record names forced disconnected.
+        changed_commands: Every ADDED or CHANGED ``hooks.json``/
+            ``mcp.json`` command surviving the vet, as ``{"file": <hooks.
+            json|mcp.json>, "name": <hook/server name>, "command": <the
+            shell command/joined command+args string>}`` — an unchanged
+            command (identical to the live file's) is never listed
+            (operator ruling M5).
         incomplete_registrations: Agent name -> missing-part descriptions,
             per ``registration.check_registrations``.
         needs_credential: Key paths (by server/job name and key) where a
@@ -111,6 +125,12 @@ class ApplyResult:
             ``registration.Result.untracked_prompt_agents`` (tasks.md
             7.5) — an agent whose ``prompt`` resolves to an untracked
             relpath, or to neither root.
+        propagation_report: Agent name -> requirements.md 5.7 reporting
+            string, carried verbatim from
+            ``registration.Result.propagation_report`` — present only
+            for agents in ``complete_agents`` there, so this is already
+            scoped to COMPLETE registrations by the time it reaches this
+            field; nothing here re-filters it.
         propagation: The per-applied-file propagation report.
         apply_id: The restore-directory id for this apply, or ``None``
             when the gate refused before any backup was made.
@@ -124,11 +144,13 @@ class ApplyResult:
     dropped_cron_names: List[str] = field(default_factory=list)
     paused_cron_names: List[str] = field(default_factory=list)
     changed_instance_names: List[str] = field(default_factory=list)
+    changed_commands: List[Dict[str, str]] = field(default_factory=list)
     incomplete_registrations: Dict[str, List[str]] = field(default_factory=dict)
     needs_credential: List[str] = field(default_factory=list)
     non_portable_paths: List[str] = field(default_factory=list)
     unresolved_references: List[str] = field(default_factory=list)
     untracked_prompt_agents: List[str] = field(default_factory=list)
+    propagation_report: Dict[str, str] = field(default_factory=dict)
     propagation: propagate.Report = field(
         default_factory=lambda: propagate.Report(entries={})
     )
@@ -397,6 +419,48 @@ def _load_json_or_none(content: bytes) -> Any:
         return None
 
 
+def _entry_identity(entry: Any) -> Optional[Tuple[str, str]]:
+    """Return a ``(kind, value)`` identity key for a list entry, or
+
+    ``None`` when the entry carries neither a usable ``name`` nor ``id``
+    (C2, requirements.md 4.10: list-shaped restore must match live-vs-
+    commit entries by stable identity, never by list index). ``name`` is
+    tried first, ``id`` only as a fallback when ``name`` is absent —
+    mirroring ``sanitize._name_of``'s own precedence — and the two kinds
+    are namespaced separately so a job named ``"1"`` can never collide
+    with a different job whose ``id`` happens to be ``"1"``.
+    """
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    if isinstance(name, str) and name:
+        return ("name", name)
+    entry_id = entry.get("id")
+    if isinstance(entry_id, str) and entry_id:
+        return ("id", entry_id)
+    return None
+
+
+def _index_live_list_by_identity(live_list: List[Any]) -> Dict[Tuple[str, str], Any]:
+    """Index a live list's entries by :func:`_entry_identity`.
+
+    An entry with no usable identity, or an identity that collides with an
+    earlier entry's, is simply not indexed — it can never be matched by
+    identity, so it is treated the same as "no live counterpart" rather
+    than risking a wrong match via index or a later duplicate silently
+    winning.
+    """
+    by_identity: Dict[Tuple[str, str], Any] = {}
+    seen: set = set()
+    for item in live_list:
+        identity = _entry_identity(item)
+        if identity is None or identity in seen:
+            continue
+        seen.add(identity)
+        by_identity[identity] = item
+    return by_identity
+
+
 def _restore_redacted_values(
     commit_doc: Any, live_doc: Any, relpath: str, needs_credential: List[str]
 ) -> Any:
@@ -414,6 +478,17 @@ def _restore_redacted_values(
     is listed in ``needs_credential``, keyed by the nearest enclosing
     object's own dict key (e.g. the server name under ``mcpServers``, or
     the job name under a cron entry) when available, else the bare key.
+
+    C2 (requirements.md 4.10, Kiro-Config-Bundles senior review): when
+    ``commit_node``/``live_node`` are both lists, entries are paired by
+    stable identity (``name``, then ``id`` — :func:`_entry_identity`),
+    never by list index. A commit entry with no live counterpart at that
+    identity — because it is new, or because its identity could not be
+    determined — restores against ``None`` (i.e. every placeholder in it
+    stays a placeholder and is reported in ``needs_credential``), exactly
+    as if the whole live document were absent. This is what stops a
+    reordered or inserted entry from ever receiving a DIFFERENT entry's
+    live credential.
     """
 
     def _walk(commit_node: Any, live_node: Any, owner_label: str) -> Any:
@@ -454,10 +529,21 @@ def _restore_redacted_values(
             return result
         if isinstance(commit_node, list):
             live_list = live_node if isinstance(live_node, list) else []
-            return [
-                _walk(item, live_list[i] if i < len(live_list) else None, owner_label)
-                for i, item in enumerate(commit_node)
-            ]
+            live_by_identity = _index_live_list_by_identity(live_list)
+            walked: List[Any] = []
+            for item in commit_node:
+                identity = _entry_identity(item)
+                live_counterpart = (
+                    live_by_identity.get(identity) if identity is not None else None
+                )
+                # An item's own name/id (when it has one) is a better
+                # `needs_credential` label than the parent's — it is
+                # what lets an inserted job like "C" be reported as
+                # "crons.json:C.env.TOKEN" rather than under the file's
+                # bare relpath.
+                item_label = str(identity[1]) if identity is not None else owner_label
+                walked.append(_walk(item, live_counterpart, item_label))
+            return walked
         return commit_node
 
     return _walk(commit_doc, live_doc, relpath)
@@ -495,6 +581,100 @@ def _frontmatter_changed(relpath: str, new_content: bytes, live_path: Path) -> b
     return new_fm != old_fm
 
 
+def _changed_hook_commands(
+    final_doc: Dict[str, Any], live_doc: Any, relpath: str
+) -> List[Dict[str, str]]:
+    """Operator ruling M5: every surviving ``hooks.json`` hook whose
+
+    ``command`` is ADDED or CHANGED relative to the live document,
+    shaped ``{"file", "name", "command"}``. An unchanged command is
+    never listed. Compares by the same name/id identity
+    :func:`_entry_identity` uses, so a renamed hook is treated as one
+    entry removed and one added rather than silently matched.
+    """
+    live_hooks = live_doc.get("hooks", []) if isinstance(live_doc, dict) else []
+    live_by_identity = _index_live_list_by_identity(
+        [h for h in live_hooks if isinstance(h, dict)]
+    )
+    changed: List[Dict[str, str]] = []
+    for hook in final_doc.get("hooks", []):
+        if not isinstance(hook, dict):
+            continue
+        command = hook.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        identity = _entry_identity(hook)
+        live_counterpart = (
+            live_by_identity.get(identity) if identity is not None else None
+        )
+        live_command = live_counterpart.get("command") if live_counterpart else None
+        if live_command == command:
+            continue
+        changed.append(
+            {"file": relpath, "name": _hook_display_name(hook), "command": command}
+        )
+    return changed
+
+
+def _hook_display_name(hook: Dict[str, Any]) -> str:
+    """Return a hook-shaped dict's display name, falling back to id.
+
+    Mirrors ``sanitize._name_of``'s own precedence exactly (name first,
+    then id) — duplicated here rather than imported because it operates
+    on the applied, already-sanitized document, a different lifecycle
+    stage than `sanitize.py`'s own private helper.
+    """
+    name = hook.get("name")
+    return name if isinstance(name, str) and name else str(hook.get("id", ""))
+
+
+def _mcp_command_string(server: Dict[str, Any]) -> str:
+    """Return an ``mcp.json`` server entry's shell-joined ``command`` +
+
+    ``args``, matching ``sanitize._mcp_server_shell_command``'s exact
+    join convention so a changed ``args`` entry is detected the same way
+    the vet sees it.
+    """
+    command = server.get("command")
+    if not isinstance(command, str) or not command:
+        return ""
+    args = server.get("args", [])
+    args_list = [str(item) for item in args] if isinstance(args, list) else []
+    return shlex.join([command, *args_list])
+
+
+def _changed_mcp_commands(
+    final_doc: Dict[str, Any], live_doc: Any, relpath: str
+) -> List[Dict[str, str]]:
+    """Operator ruling M5: every surviving ``mcp.json`` server whose
+
+    shell-joined ``command`` + ``args`` is ADDED or CHANGED relative to
+    the live document, shaped ``{"file", "name", "command"}``. An
+    unchanged command is never listed.
+    """
+    live_servers = live_doc.get("mcpServers", {}) if isinstance(live_doc, dict) else {}
+    if not isinstance(live_servers, dict):
+        live_servers = {}
+    servers = final_doc.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return []
+    changed: List[Dict[str, str]] = []
+    for name, server in servers.items():
+        if not isinstance(name, str) or not isinstance(server, dict):
+            continue
+        command = _mcp_command_string(server)
+        if not command:
+            continue
+        live_server = live_servers.get(name)
+        live_command = (
+            _mcp_command_string(live_server) if isinstance(live_server, dict) else ""
+        )
+        if live_command == command:
+            continue
+        changed.append({"file": relpath, "name": name, "command": command})
+    return changed
+
+
 def _split_by_root(paths: Dict[str, List[str]]) -> List[tuple]:
     """Flatten a ``{"A": [...], "B": [...]}`` mapping to ``(root, relpath)``
 
@@ -505,6 +685,257 @@ def _split_by_root(paths: Dict[str, List[str]]) -> List[tuple]:
         for relpath in paths.get(root, []):
             pairs.append((root, relpath))
     return pairs
+
+
+def _new_apply_id() -> str:
+    """Generate a per-apply id unique even for two applies within the
+
+    same wall-clock second (Low, senior review). ``time.strftime`` alone
+    has one-second resolution, so two applies started in the same second
+    would otherwise collide on both ``apply_id`` and restore directory —
+    the second apply's backups landing in the first apply's directory.
+    The random suffix (4 bytes / 8 hex chars from ``secrets.token_hex``,
+    a CSPRNG) disambiguates them; it is a distinctness tool here, not a
+    security boundary, but ``secrets`` is used anyway since it is no
+    harder to call than ``random`` and never weaker.
+    """
+    return (
+        f"apply-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}-{secrets.token_hex(4)}"
+    )
+
+
+def _apply_one_file(
+    *,
+    root: str,
+    relpath: str,
+    commit_root: Path,
+    restore_dir: Path,
+    deleted_by_root: Dict[str, set],
+    apply_roots: Dict[str, Path],
+    cron_vet: Optional[VetCallable],
+    applied: List[str],
+    not_applied: List[str],
+    needs_credential: List[str],
+    non_portable_paths: List[str],
+    unresolved_references: List[str],
+    applied_files: List[AppliedFile],
+    created_by_root: Dict[str, List[str]],
+    dropped_cron_names: List[str],
+    paused_cron_names: List[str],
+    changed_instance_names: List[str],
+    changed_commands: List[Dict[str, str]],
+) -> None:
+    """Apply (write, restore-placeholder, or delete) exactly one eligible
+
+    (root, relpath) pair, mutating the caller's per-apply accumulator
+    lists in place. Every outcome for this single file is recorded into
+    ``applied``/``not_applied``/``applied_files`` from directly within
+    this function; nothing about a SINGLE file's own decision escapes as
+    a return value, so the caller's per-file ``try/except`` (H3) is the
+    only boundary a genuine bug (a confirmed-backup ``RuntimeError``, a
+    backup ``OSError``, or a sanitize crash on a malformed document) ever
+    crosses.
+    """
+    root_path = _root_path(root)
+
+    # Resolve and check containment ONCE, before any filesystem touch
+    # (exists/read/backup/unlink/write). `live_target` below is the
+    # single resolved path every later operation on this file uses —
+    # there is no second, unchecked `root_path / relpath` derivation
+    # later on. A live-side symlinked directory component (e.g.
+    # `steering/` itself pointing outside the root) is caught HERE,
+    # before the backup step's `exists()`/read or the delete branch's
+    # `unlink()` can ever reach through it.
+    live_target = _resolve_target(root_path, relpath)
+    if live_target is None:
+        not_applied.append(relpath)
+        return
+
+    is_deleted = relpath in deleted_by_root.get(root, set())
+
+    # Step 2: back up before any overwrite/delete. Verified, not just
+    # attempted — a mutation that disables `_backup_file` (dropping the
+    # backup call while keeping the destructive write/delete) must not
+    # be able to slip an unbacked-up file through: confirm the backup
+    # copy actually landed on disk before proceeding. A confirmation
+    # failure here, or an `OSError` from `_backup_file` itself, is caught
+    # by the CALLER's per-file try/except (H3) — never handled here —
+    # so it degrades to a `not_applied` entry for this file alone while
+    # every earlier file's write and the restore dir stay intact.
+    live_existed_before = live_target.exists()
+    if live_existed_before:
+        _backup_file(live_target, restore_dir, root, relpath)
+        backup_copy = restore_dir / root / relpath
+        if not backup_copy.is_file():
+            raise RuntimeError(
+                f"refusing to modify {relpath}: backup was not "
+                f"confirmed on disk before the destructive step"
+            )
+
+    if is_deleted:
+        try:
+            if live_target.exists():
+                live_target.unlink()
+        except OSError:
+            not_applied.append(relpath)
+            return
+        applied.append(relpath)
+        applied_files.append(
+            AppliedFile(root=root, relpath=relpath, kind=ChangeKind.removed)
+        )
+        return
+
+    source = commit_root / relpath
+    if _is_unsafe_source(commit_root, relpath) or not source.exists():
+        not_applied.append(relpath)
+        return
+
+    try:
+        raw_content = source.read_bytes()
+    except OSError:
+        not_applied.append(relpath)
+        return
+
+    existed_live = live_existed_before
+    content_to_write = raw_content
+    frontmatter_changed = False
+
+    if relpath == _CRONS_RELPATH or relpath == _INSTANCES_RELPATH:
+        commit_doc = _load_json_or_none(raw_content)
+        if commit_doc is None:
+            # Fail CLOSED: an unparsable crons.json/instances.json is
+            # refused outright, never written through unvetted. The
+            # vet/sanitizer exists precisely because these two files are
+            # a deliberate, bounded exception (Requirement 6) — a parse
+            # failure must not be treated as "safe to apply verbatim",
+            # which would bypass that boundary entirely.
+            not_applied.append(relpath)
+            return
+        # Step 4 (design.md): expand tokens to this host's roots BEFORE
+        # step 4a's placeholder restore and step 4b's sanitize, so the
+        # vet sees the real, host-resolved command (requirements.md
+        # 4.11; tasks.md 7.4's ordering test).
+        expanded_doc = portable.expand(commit_doc, apply_roots)
+        _walk_json_for_portability(
+            expanded_doc,
+            apply_roots,
+            relpath,
+            [],
+            non_portable_paths,
+            unresolved_references,
+        )
+        live_doc = (
+            _load_json_or_none(live_target.read_bytes()) if existed_live else None
+        )
+        restored_doc = _restore_redacted_values(
+            expanded_doc, live_doc, relpath, needs_credential
+        )
+        # A malformed commit doc (e.g. a top-level LIST instead of the
+        # expected `{"jobs": [...]}` mapping) reaches here as a valid
+        # JSON value that is simply the wrong shape — `sanitize_crons`/
+        # `sanitize_instances` call `.get(...)` on it and raise
+        # `AttributeError`. That is caught by the CALLER's per-file
+        # try/except (H3), never here, so it degrades to a
+        # `not_applied` entry for this file alone.
+        if relpath == _CRONS_RELPATH:
+            cron_result = sanitize.sanitize_crons(restored_doc, vet=cron_vet)
+            dropped_cron_names.extend(cron_result.dropped_job_names)
+            paused_cron_names.extend(cron_result.paused_job_names)
+            final_doc = cron_result.sanitized_store
+        else:
+            instance_result = sanitize.sanitize_instances(restored_doc)
+            changed_instance_names.extend(instance_result.changed_instance_names)
+            final_doc = instance_result.sanitized_store
+        content_to_write = (
+            json.dumps(final_doc, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+    else:
+        commit_doc = _load_json_or_none(raw_content)
+        if commit_doc is not None:
+            # Step 4, mirrored for every other in-scope JSON file
+            # (requirements.md 4.11-4.13): expand before restore, same
+            # as the crons/instances branch above.
+            expanded_doc = portable.expand(commit_doc, apply_roots)
+            _walk_json_for_portability(
+                expanded_doc,
+                apply_roots,
+                relpath,
+                [],
+                non_portable_paths,
+                unresolved_references,
+            )
+            live_doc = (
+                _load_json_or_none(live_target.read_bytes()) if existed_live else None
+            )
+            restored_doc = _restore_redacted_values(
+                expanded_doc, live_doc, relpath, needs_credential
+            )
+            # Operator ruling M5: hooks.json/mcp.json pass the SAME
+            # shell vet crons.json jobs already pass (`cron_vet`, the
+            # identical `VetCallable` seam — not a second, differently-
+            # named parameter), run AFTER step 4's expand + 4.10's
+            # placeholder restore so the vet sees the real, credential-
+            # restored command about to be written. An entry whose vet
+            # rejects — or whose vet raises — is dropped and reported by
+            # name (fail-closed, `sanitize.sanitize_crons`'s own
+            # posture); every other entry in the same file still
+            # applies. Every ADDED or CHANGED surviving command
+            # (compared to the live document) is recorded into
+            # `changed_commands` for operator visibility at approve
+            # time.
+            if relpath == _HOOKS_RELPATH:
+                hook_result = sanitize.sanitize_hooks(restored_doc, vet=cron_vet)
+                dropped_cron_names.extend(hook_result.dropped_names)
+                command_final_doc: Any = hook_result.sanitized_store
+                changed_commands.extend(
+                    _changed_hook_commands(command_final_doc, live_doc, relpath)
+                )
+                restored_doc = command_final_doc
+            elif relpath == _MCP_RELPATH:
+                mcp_result = sanitize.sanitize_mcp_servers(restored_doc, vet=cron_vet)
+                dropped_cron_names.extend(mcp_result.dropped_names)
+                command_final_doc = mcp_result.sanitized_store
+                changed_commands.extend(
+                    _changed_mcp_commands(command_final_doc, live_doc, relpath)
+                )
+                restored_doc = command_final_doc
+            content_to_write = (
+                json.dumps(restored_doc, indent=2, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+        elif relpath.endswith("SKILL.md"):
+            frontmatter_changed = _frontmatter_changed(
+                relpath, raw_content, live_target
+            )
+        elif relpath.endswith(".json"):
+            # H1 (senior review): an allowlisted JSON file — outside the
+            # crons/instances Requirement 6 exception — that fails to
+            # parse must be REFUSED, never written through raw. Writing
+            # it unparsed would skip step 4's placeholder restore
+            # entirely, silently destroying whatever live credential
+            # restore would otherwise have preserved. Refusing this one
+            # file never blocks the rest of the commit's eligible files.
+            not_applied.append(relpath)
+            return
+        # A non-JSON file (e.g. a SKILL.md body, or any other allowlisted
+        # non-JSON asset) is written through as committed — this file
+        # class has no placeholder-restore or vet/sanitizer boundary to
+        # bypass.
+
+    try:
+        _atomic_write_bytes(live_target, content_to_write)
+        applied.append(relpath)
+        applied_files.append(
+            AppliedFile(
+                root=root,
+                relpath=relpath,
+                kind=_classify_kind(existed_live),
+                frontmatter_changed=frontmatter_changed,
+            )
+        )
+        if not existed_live:
+            created_by_root[root].append(relpath)
+    except OSError:
+        not_applied.append(relpath)
 
 
 def apply_commit(
@@ -554,7 +985,7 @@ def apply_commit(
             reason="no matching pending commit for the approved sha",
         )
 
-    apply_id = f"apply-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
+    apply_id = _new_apply_id()
     restore_dir = Path(state_module.get_state_dir()) / "restores" / apply_id
 
     applied: List[str] = []
@@ -564,7 +995,6 @@ def apply_commit(
     non_portable_paths: List[str] = []
     unresolved_references: List[str] = []
     applied_files: List[AppliedFile] = []
-    backup_made = False
     created_by_root: Dict[str, List[str]] = {"A": [], "B": []}
     apply_roots = _roots_mapping()
 
@@ -599,166 +1029,105 @@ def apply_commit(
     dropped_cron_names: List[str] = []
     paused_cron_names: List[str] = []
     changed_instance_names: List[str] = []
+    changed_commands: List[Dict[str, str]] = []
+
+    # H3 (senior review): the restore directory is recorded BEFORE the
+    # first write, not after the whole loop. Recording it only after
+    # every file's write/delete attempt meant that any exception escaping
+    # the per-file loop — including one that legitimately propagated all
+    # the way out of `apply_commit` — left every earlier file's backup in
+    # `restore_dir` with no entry in `store.restore_dirs` pointing at it,
+    # so `routes.restore` could never find it. Recording it up front (it
+    # is a pure bookkeeping write to the app's OWN state, unconditional on
+    # whether any file in this apply actually needs a backup) means a
+    # crash on file 2 still leaves file 1's backup reachable, and a
+    # creation-only apply — where no live file ever existed to back up —
+    # still has a restore dir recorded for its created-manifest.
+    try:
+        store.record_restore_dir(apply_id=apply_id, restore_dir=str(restore_dir))
+    except OSError as exc:
+        # Same rationale as before: if this bookkeeping write itself
+        # cannot be persisted, no file in this apply can be safely
+        # reported as an unqualified success, since restore would have
+        # no way to find any of their backups either.
+        report = propagate.build_report(applied_files)
+        return ApplyResult(
+            outcome=_OUTCOME_PARTIAL,
+            not_applied=sorted({relpath for _root, relpath in eligible} | blocked),
+            ignored_paths=ignored_paths,
+            incomplete_registrations=dict(reg_result.incomplete_agents),
+            propagation_report=dict(reg_result.propagation_report),
+            propagation=report,
+            apply_id=apply_id,
+            reason=f"restore directory was not recorded: {exc}",
+        )
 
     for root, relpath in eligible:
-        root_path = _root_path(root)
-
-        # Resolve and check containment ONCE, before any filesystem touch
-        # (exists/read/backup/unlink/write). `live_target` below is the
-        # single resolved path every later operation on this file uses —
-        # there is no second, unchecked `root_path / relpath` derivation
-        # later in the loop. A live-side symlinked directory component
-        # (e.g. `steering/` itself pointing outside the root) is caught
-        # HERE, before the backup step's `exists()`/read or the delete
-        # branch's `unlink()` can ever reach through it.
-        live_target = _resolve_target(root_path, relpath)
-        if live_target is None:
-            not_applied.append(relpath)
-            continue
-
-        is_deleted = relpath in deleted_by_root.get(root, set())
-
-        # Step 2: back up before any overwrite/delete. Verified, not just
-        # attempted — a mutation that disables `_backup_file` (dropping
-        # the backup call while keeping the destructive write/delete) must
-        # not be able to slip an unbacked-up file through: confirm the
-        # backup copy actually landed on disk before proceeding.
-        live_existed_before = live_target.exists()
-        if live_existed_before:
-            _backup_file(live_target, restore_dir, root, relpath)
-            backup_copy = restore_dir / root / relpath
-            if not backup_copy.is_file():
-                raise RuntimeError(
-                    f"refusing to modify {relpath}: backup was not "
-                    f"confirmed on disk before the destructive step"
-                )
-            backup_made = True
-
-        if is_deleted:
-            try:
-                if live_target.exists():
-                    live_target.unlink()
-            except OSError:
-                not_applied.append(relpath)
-                continue
-            applied.append(relpath)
-            applied_files.append(
-                AppliedFile(root=root, relpath=relpath, kind=ChangeKind.removed)
-            )
-            continue
-
-        source = commit_root / relpath
-        if _is_unsafe_source(commit_root, relpath) or not source.exists():
-            not_applied.append(relpath)
-            continue
-
+        # H3 (senior review): once an earlier file in THIS apply has
+        # already been written or deleted, a failure on a later file must
+        # degrade to a `not_applied` entry rather than raise — the
+        # earlier write's backup is reachable via the restore dir
+        # recorded above, so there is something for the caller to act on
+        # even on partial failure. When NOTHING in this apply has
+        # succeeded yet, there is no such earlier state to preserve, so
+        # the existing "refuse loudly" contract for a first-file failure
+        # (`test_apply.py::test_apply_never_deletes_a_file_that_was_never
+        # _backed_up_first` — a confirmed-backup `RuntimeError` on the
+        # apply's only file must still propagate, proving the delete
+        # never ran ahead of a successful backup) is preserved unchanged.
+        prior_progress = bool(applied or not_applied)
         try:
-            raw_content = source.read_bytes()
-        except OSError:
-            not_applied.append(relpath)
-            continue
-
-        existed_live = live_existed_before
-        content_to_write = raw_content
-        frontmatter_changed = False
-
-        if relpath == _CRONS_RELPATH or relpath == _INSTANCES_RELPATH:
-            commit_doc = _load_json_or_none(raw_content)
-            if commit_doc is None:
-                # Fail CLOSED: an unparsable crons.json/instances.json is
-                # refused outright, never written through unvetted. The
-                # vet/sanitizer exists precisely because these two files
-                # are a deliberate, bounded exception (Requirement 6) —
-                # a parse failure must not be treated as "safe to apply
-                # verbatim", which would bypass that boundary entirely.
+            _apply_one_file(
+                root=root,
+                relpath=relpath,
+                commit_root=commit_root,
+                restore_dir=restore_dir,
+                deleted_by_root=deleted_by_root,
+                apply_roots=apply_roots,
+                cron_vet=cron_vet,
+                applied=applied,
+                not_applied=not_applied,
+                needs_credential=needs_credential,
+                non_portable_paths=non_portable_paths,
+                unresolved_references=unresolved_references,
+                applied_files=applied_files,
+                created_by_root=created_by_root,
+                dropped_cron_names=dropped_cron_names,
+                paused_cron_names=paused_cron_names,
+                changed_instance_names=changed_instance_names,
+                changed_commands=changed_commands,
+            )
+        except Exception:
+            # H3: once an earlier file in this apply has already
+            # succeeded or been refused, NOTHING raised from a later
+            # file's handling may escape this loop — a confirmed-backup
+            # `RuntimeError`, an `OSError` from the backup step, or a
+            # sanitize crash on a malformed/top-level-list `crons.json`
+            # (`sanitize_crons` calls `.get("jobs", [])`, which raises
+            # `AttributeError` on a list) must all be caught per file and
+            # turned into a `not_applied` entry with the earlier files'
+            # writes and the restore dir left intact — never a bare
+            # exception reaching the caller, and never silently
+            # swallowed with no record of which file or why. `Exception`
+            # (not a narrower tuple) is deliberate: this boundary's whole
+            # purpose is that ANY failure in one file's processing
+            # degrades to "this file was not applied", not a curated
+            # subset of exception types.
+            #
+            # When this is the FIRST file to fail in the whole apply
+            # (`prior_progress` is False), the failure is re-raised
+            # instead: this preserves `test_apply.py`'s existing
+            # mutation-proof contract for the backup-before-destructive-
+            # write guard, which asserts that a confirmed-backup
+            # `RuntimeError` on an apply's ONLY file still propagates —
+            # proving the delete never ran ahead of a successful backup.
+            # There is no earlier write to keep reachable in that case,
+            # so nothing is lost by keeping the original "refuse loudly"
+            # behaviour there.
+            if not prior_progress:
+                raise
+            if relpath not in not_applied:
                 not_applied.append(relpath)
-                continue
-            # Step 4 (design.md): expand tokens to this host's roots
-            # BEFORE step 4a's placeholder restore and step 4b's
-            # sanitize, so the vet sees the real, host-resolved command
-            # (requirements.md 4.11; tasks.md 7.4's ordering test).
-            expanded_doc = portable.expand(commit_doc, apply_roots)
-            _walk_json_for_portability(
-                expanded_doc,
-                apply_roots,
-                relpath,
-                [],
-                non_portable_paths,
-                unresolved_references,
-            )
-            live_doc = (
-                _load_json_or_none(live_target.read_bytes()) if existed_live else None
-            )
-            restored_doc = _restore_redacted_values(
-                expanded_doc, live_doc, relpath, needs_credential
-            )
-            if relpath == _CRONS_RELPATH:
-                cron_result = sanitize.sanitize_crons(restored_doc, vet=cron_vet)
-                dropped_cron_names.extend(cron_result.dropped_job_names)
-                paused_cron_names.extend(cron_result.paused_job_names)
-                final_doc = cron_result.sanitized_store
-            else:
-                instance_result = sanitize.sanitize_instances(restored_doc)
-                changed_instance_names.extend(instance_result.changed_instance_names)
-                final_doc = instance_result.sanitized_store
-            content_to_write = (
-                json.dumps(final_doc, indent=2, ensure_ascii=False) + "\n"
-            ).encode("utf-8")
-        else:
-            commit_doc = _load_json_or_none(raw_content)
-            if commit_doc is not None:
-                # Step 4, mirrored for every other in-scope JSON file
-                # (requirements.md 4.11-4.13): expand before restore,
-                # same as the crons/instances branch above.
-                expanded_doc = portable.expand(commit_doc, apply_roots)
-                _walk_json_for_portability(
-                    expanded_doc,
-                    apply_roots,
-                    relpath,
-                    [],
-                    non_portable_paths,
-                    unresolved_references,
-                )
-                live_doc = (
-                    _load_json_or_none(live_target.read_bytes())
-                    if existed_live
-                    else None
-                )
-                restored_doc = _restore_redacted_values(
-                    expanded_doc, live_doc, relpath, needs_credential
-                )
-                content_to_write = (
-                    json.dumps(restored_doc, indent=2, ensure_ascii=False) + "\n"
-                ).encode("utf-8")
-            elif relpath.endswith("SKILL.md"):
-                frontmatter_changed = _frontmatter_changed(
-                    relpath, raw_content, live_target
-                )
-            # A non-cron/instances JSON file that fails to parse is NOT a
-            # placeholder-restore candidate: `commit_doc is None` here
-            # means `_restore_redacted_values` never ran, so no key path
-            # for this file is ever treated as having been restored —
-            # its raw bytes are written through as committed (this file
-            # class has no vet/sanitizer boundary to bypass, unlike
-            # crons.json/instances.json above).
-
-        try:
-            _atomic_write_bytes(live_target, content_to_write)
-            applied.append(relpath)
-            applied_files.append(
-                AppliedFile(
-                    root=root,
-                    relpath=relpath,
-                    kind=_classify_kind(existed_live),
-                    frontmatter_changed=frontmatter_changed,
-                )
-            )
-            if not existed_live:
-                created_by_root[root].append(relpath)
-        except OSError:
-            not_applied.append(relpath)
-
-    reason = ""
 
     # Write the per-root created-file manifest for every root that had at
     # least one eligible write/delete attempt in this apply — even when
@@ -766,9 +1135,8 @@ def apply_commit(
     # "no manifest: an older apply, or a bug" apart from "manifest
     # present, nothing was created" (requirements.md 4.7). Written AFTER
     # every file's own write/delete attempt (so it reflects the final
-    # `created_by_root`), but BEFORE `record_restore_dir`, mirroring that
-    # call's own "must not be silently swallowed" treatment below: a
-    # manifest write failure here is folded into the same guard.
+    # `created_by_root`).
+    reason = ""
     manifest_error: Optional[str] = None
     touched_roots = {root for root, _relpath in eligible}
     for root in sorted(touched_roots):
@@ -779,26 +1147,13 @@ def apply_commit(
             break
 
     if manifest_error is not None:
-        # Same rationale as the `record_restore_dir` failure below: a
-        # restore that cannot tell created files apart from modified ones
-        # cannot safely return the instance to its exact pre-apply state,
-        # so this apply must not be reported as an unqualified success.
+        # A restore that cannot tell created files apart from modified
+        # ones cannot safely return the instance to its exact pre-apply
+        # state, so this apply must not be reported as an unqualified
+        # success.
         reason = manifest_error
         not_applied.extend(p for p in applied if p not in not_applied)
         applied = []
-    elif backup_made:
-        try:
-            store.record_restore_dir(apply_id=apply_id, restore_dir=str(restore_dir))
-        except OSError as exc:
-            # requirements.md 4.7 exists so a restore is always possible
-            # after an apply. If the restore-dir mapping cannot be
-            # persisted, the restore route has no way to find this
-            # apply's backups, so this apply cannot be reported as an
-            # unqualified success even though the files themselves were
-            # already safely written to disk.
-            reason = f"restore directory was not recorded: {exc}"
-            not_applied.extend(p for p in applied if p not in not_applied)
-            applied = []
 
     report = propagate.build_report(applied_files)
 
@@ -812,12 +1167,14 @@ def apply_commit(
         dropped_cron_names=dropped_cron_names,
         paused_cron_names=paused_cron_names,
         changed_instance_names=changed_instance_names,
+        changed_commands=changed_commands,
         incomplete_registrations=dict(reg_result.incomplete_agents),
         needs_credential=needs_credential,
         non_portable_paths=non_portable_paths,
         unresolved_references=unresolved_references,
         untracked_prompt_agents=list(reg_result.untracked_prompt_agents),
+        propagation_report=dict(reg_result.propagation_report),
         propagation=report,
-        apply_id=apply_id if (backup_made or applied or not_applied) else apply_id,
+        apply_id=apply_id,
         reason=reason,
     )

@@ -1135,10 +1135,19 @@ class TestAtomicWrites:
         )
 
         state_dir = Path(state.get_state_dir())
+        # The cross-process lock file (state.json.lock) is a permanent,
+        # intentional sibling of state.json (see state.py's own
+        # cross-process locking section) -- allow exactly that one name
+        # and nothing else, so this test still catches a real stray
+        # temp/partial file left behind by a failed write.
+        allowed_names = {
+            Path(state.get_state_path()).name,
+            Path(state.get_lock_path()).name,
+        }
         leftover_temp_files = [
             p
             for p in state_dir.iterdir()
-            if p.name != Path(state.get_state_path()).name and p.is_file()
+            if p.name not in allowed_names and p.is_file()
         ]
         assert leftover_temp_files == [], (
             "a successful write must not leave a stray temp/partial file "

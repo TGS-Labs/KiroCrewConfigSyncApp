@@ -636,17 +636,31 @@ class TestIncompleteRegistrationDoesNotBlockUnrelatedFiles:
     def test_two_agents_one_complete_one_incomplete_in_same_commit(
         self, tmp_path: Path
     ) -> None:
-        """A commit touching two different agents' registrations, one
-        complete and one missing a part, must report each independently:
-        the complete one applies, the incomplete one is refused, and
-        neither result leaks into the other's report."""
+        """C3 (RATIFIED): 'if config.json/agent_model_state.json is
+
+        blocked because some agent in the commit is incomplete, every
+        agent whose key is in that committed shared file is also
+        blocked; no half-registration.' Two different agents' registration
+        touch the SAME shared ``config.json``: agent-two is missing its
+        model-state pin (incomplete), which blocks its own present
+        ``config.json`` entry from applying. Because agent-one's own key
+        is ALSO present in that same committed ``config.json``,
+        agent-one must be treated as blocked too -- its own
+        ``agents/agent-one.json`` would otherwise apply while the shared
+        config entry it depends on does not, leaving it half-registered.
+        This supersedes the pre-C3 expectation that agent-one's
+        independent completeness let it apply unaffected by agent-two's
+        shared-file block.
+        """
         root, root_a, roots = _prep_roots(tmp_path)
         _write_full_registration(root, root_a, agent_name="agent-one")
         _write_prompt_file(root, agent_name="agent-two")
         _write_agent_def(root, agent_name="agent-two")
         _write_config_json(root, agent_name="agent-two")
-        # agent-two's model-state pin is deliberately omitted (fresh
-        # shared file with no key for it).
+        # agent-two's model-state pin is deliberately omitted, but the
+        # SAME shared config.json also carries agent-one's own entry --
+        # this is what makes the two registrations share a blocked file
+        # rather than being independent.
         (root / MODEL_STATE_RELPATH).write_text(
             json.dumps({"agent-one": {"model_managed": False}}), encoding="utf-8"
         )
@@ -661,10 +675,64 @@ class TestIncompleteRegistrationDoesNotBlockUnrelatedFiles:
 
         result = registration.check_registrations(root, changed, roots)
 
-        assert "agent-one" in result.complete_agents
+        # agent-two is incomplete regardless (missing its own pin).
         assert "agent-two" not in result.complete_agents
         assert "agent-two" in result.incomplete_agents
+
+        # C3: config.json is blocked because agent-two's own present
+        # config.json entry gets blocked for being part of an incomplete
+        # registration, and agent-one -- whose key is also in that same
+        # committed shared file -- is blocked too, never left applying
+        # half a registration.
+        assert CONFIG_RELPATH in result.blocked_paths
+        assert "agent-one" not in result.complete_agents
+        assert "agent-one" in result.incomplete_agents
+        assert "agents/agent-one.json" in result.blocked_paths
+
+    def test_two_agents_sharing_no_blocked_file_are_still_independent(
+        self, tmp_path: Path
+    ) -> None:
+        """C3's own scope: it only propagates a block through a SHARED
+
+        file that is ACTUALLY blocked for the OTHER agent's own present
+        key. Two agents whose registrations both touch
+        config.json/agent_model_state.json but where agent-two's own key
+        is absent from BOTH shared files (so neither file is ever
+        blocked on agent-two's account) must still report independently:
+        agent-one complete, agent-two incomplete, with nothing shared
+        blocking agent-one. This is the property the original (pre-C3)
+        test intended to protect and that C3 must not regress.
+        """
+        root, root_a, roots = _prep_roots(tmp_path)
+        _write_full_registration(root, root_a, agent_name="agent-one")
+
+        # agent-two: agent def + prompt file present, but it has NO entry
+        # in config.json or agent_model_state.json at all -> incomplete,
+        # and since it holds no key in either shared file, neither file
+        # is ever blocked on its account.
+        _write_agent_def(root, agent_name="agent-two")
+        _write_prompt_file(root, agent_name="agent-two")
+
+        changed = _changed_relpaths_for(
+            root,
+            "agents/agent-one.json",
+            "config.json",
+            "agent_model_state.json",
+            "agents/agent-two.json",
+        )
+
+        result = registration.check_registrations(root, changed, roots)
+
+        assert "agent-two" not in result.complete_agents
+        assert "agent-two" in result.incomplete_agents
+        assert CONFIG_RELPATH not in result.blocked_paths
+        assert MODEL_STATE_RELPATH not in result.blocked_paths
+
+        # Neither shared file is blocked, so agent-one's independent
+        # completeness is untouched by agent-two's unrelated incompleteness.
+        assert "agent-one" in result.complete_agents
         assert "agent-one" not in result.incomplete_agents
+        assert "agents/agent-one.json" not in result.blocked_paths
 
     def test_shared_file_present_but_missing_this_agents_key_is_incomplete(
         self, tmp_path: Path
@@ -1553,9 +1621,22 @@ class TestSharedPromptNotBlockedByAnUnrelatedIncompleteAgent:
     when every changed agent definition referencing it belongs to an
     incomplete registration." Two agents changed in the same commit both
     reference the SAME tracked prompt file; one is complete, the other is
-    missing its model-state pin. The shared prompt file must NOT be
-    blocked, because at least one referencing registration (the complete
-    one) is not incomplete.
+    incomplete. The shared prompt file must NOT be blocked, because at
+    least one referencing registration (the complete one) is not
+    incomplete.
+
+    Under C3 (RATIFIED, tests/test_registration.py's
+    TestIncompleteRegistrationDoesNotBlockUnrelatedFiles), an incomplete
+    agent whose OWN key sits in a shared file that ends up blocked drags
+    every OTHER agent sharing that same key-holding file into
+    incompleteness too. To keep this test's actual point -- the shared
+    PROMPT file, not a shared config/model-state file -- isolated from
+    that propagation, ``incomplete_agent`` here is given NO entry in
+    either ``config.json`` or ``agent_model_state.json`` at all (it is
+    incomplete purely for missing both shared parts), so neither shared
+    file is ever blocked and C3 has nothing to propagate through. This is
+    exactly the "give the incomplete agent no shared-file key" fixture
+    shape the ratification calls for.
     """
 
     def test_prompt_shared_with_a_complete_agent_is_not_blocked(
@@ -1583,16 +1664,14 @@ class TestSharedPromptNotBlockedByAnUnrelatedIncompleteAgent:
             root, incomplete_agent, prompt=prompt_value
         )
 
-        # Both agents' config.json entry present; only complete_agent
-        # gets an agent_model_state.json pin.
+        # Only complete_agent's key is present in EITHER shared file --
+        # incomplete_agent has no entry in config.json or
+        # agent_model_state.json at all, so neither shared file is ever
+        # blocked on its account and C3 has no key of incomplete_agent's
+        # own to propagate a shared-file block through.
         (root / "config.json").write_text(
             json.dumps(
-                {
-                    "agents": {
-                        complete_agent: {"source": "local"},
-                        incomplete_agent: {"source": "local"},
-                    }
-                },
+                {"agents": {complete_agent: {"source": "local"}}},
                 indent=2,
             ),
             encoding="utf-8",
@@ -1610,6 +1689,8 @@ class TestSharedPromptNotBlockedByAnUnrelatedIncompleteAgent:
 
         assert complete_agent in result.complete_agents
         assert incomplete_agent in result.incomplete_agents
+        assert CONFIG_RELPATH not in result.blocked_paths
+        assert MODEL_STATE_RELPATH not in result.blocked_paths
         assert shared_prompt_relpath not in result.blocked_paths
 
 
