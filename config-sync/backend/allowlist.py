@@ -178,6 +178,41 @@ _NEVER_TRACKED_BASENAME_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 _NEVER_TRACKED_SEGMENT_NAMES: tuple[str, ...] = ("trust", "scratch", "snapshots")
 
 
+_GLOB_CHARS = frozenset("*?[")
+
+
+def tracked_top_level_names(root: str) -> frozenset[str]:
+    """Top-level path segments under ``root`` that some allowlist entry can
+
+    match — the ONLY directory entries the collector may descend into or
+    read. Derived from ``ALLOWLIST`` so a new entry is honoured without a
+    second list to maintain. Every current pattern starts with a literal
+    segment; a pattern whose first segment carried a glob would make this
+    pruning unsound, so such an entry is refused at import time rather than
+    silently widening the walk to the whole root (the live ``~/.kiro/crew``
+    holds over a million untracked files under ``scratch/`` and
+    ``workspace/`` — walking them made a poll tick take minutes).
+    """
+    names: set[str] = set()
+    for entry in ALLOWLIST:
+        if entry.root != root:
+            continue
+        first = entry.pattern.split("/", 1)[0]
+        if not first or _GLOB_CHARS & set(first):
+            raise ValueError(
+                f"allowlist pattern {entry.pattern!r} has no literal first "
+                "segment; the collector cannot prune its walk"
+            )
+        names.add(first)
+    return frozenset(names)
+
+
+def never_tracked_segment(name: str) -> bool:
+    """Whether a directory named ``name`` can never contain a tracked path
+    (requirements.md 1.4's structural exclusion), so a walk may skip it."""
+    return name in _NEVER_TRACKED_SEGMENT_NAMES
+
+
 def _is_structurally_never_tracked(relpath: str) -> bool:
     """requirements.md 1.4: paths matching this predicate are never tracked,
 
