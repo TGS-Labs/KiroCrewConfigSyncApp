@@ -75,14 +75,20 @@ export function LastPushCard({
 export function FromMainCard({
   lastSeenSha,
   pollFailure,
+  consecutiveFailures,
+  pollPaused,
 }: {
   lastSeenSha: string | null
   pollFailure: FailureRecord | null
+  consecutiveFailures: number
+  pollPaused: boolean
 }) {
   return (
     <div style={cardStyle}>
       <h2 style={{ margin: 0, fontSize: '0.9rem' }}>From main</h2>
-      <p style={{ fontSize: '1.1rem', margin: '0.5rem 0' }}>Up to date</p>
+      <p style={{ fontSize: '1.1rem', margin: '0.5rem 0' }}>
+        {pollPaused ? 'Polling paused' : 'Up to date'}
+      </p>
       <p style={mutedStyle}>
         Last-seen sha: {lastSeenSha ? lastSeenSha.slice(0, 7) : 'none'}
       </p>
@@ -92,22 +98,18 @@ export function FromMainCard({
             {pollFailure.reason}
             {pollFailure.time ? ` (${formatTime(pollFailure.time)})` : null}
           </p>
-          {/* Task 5: the cron runner pauses a job after 5 consecutive
-           * failures (~75 min), but `status()`'s `last_poll_failure` is a
-           * single {reason, time} record with no consecutive-failure
-           * count or paused-state field (see backend/state.py) — there is
-           * nothing in the live payload to derive that count from. Per
-           * task scope, routes.py/state.py are not edited to add one; this
-           * surfaces the best available signal (the poll is actively
-           * failing, with when and why) and names the gap rather than
-           * fabricating a count or a "paused" label the backend never
-           * reports. */}
-          <p style={mutedStyle}>
-            The poll job is failing — see the reason above. Repeated
-            failures may pause the poll job (KiroCrew pauses a cron after
-            5 consecutive failures); the status response has no field
-            reporting a consecutive-failure count or paused state.
-          </p>
+          {consecutiveFailures > 0 ? (
+            <p style={{ margin: '0.25rem 0' }}>
+              {consecutiveFailures} consecutive poll failure
+              {consecutiveFailures === 1 ? '' : 's'}
+            </p>
+          ) : null}
+          {pollPaused ? (
+            <p style={mutedStyle}>
+              Polling is paused after repeated failures; Push now or Undo
+              resumes it.
+            </p>
+          ) : null}
         </div>
       ) : null}
     </div>

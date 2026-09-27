@@ -118,6 +118,47 @@ separate, valid single-commit call: ``git show -s --format=%an%x09%s
 <head_sha>`` (``-s`` alone, no ``--name-only``, so the flag conflict above
 does not apply).
 
+## Poll pause (senior-review round-4 M fix)
+
+There is no pause mechanism in this module before this fix — every tick
+attempts its network work (`git ls-remote`, then, on a changed head, the
+bundle-repo clone/fetch) regardless of how many prior ticks in a row have
+failed. `POLL_PAUSE_AFTER` (5) is the simplest honest implementation of
+one: `state.record_poll_failure` increments `state.poll_consecutive_
+failures` on every failing tick and, once that count reaches
+`POLL_PAUSE_AFTER`, sets `state.poll_paused = True`. `run()` checks
+`store.poll_paused` FIRST, before `_resolve_remote_head`'s own `git
+ls-remote` call: a paused tick skips ALL network work for this tick and
+returns `outcome="paused"` — no git call, no state mutation beyond the
+read, so a paused instance does not keep retrying (and re-failing) the
+same broken network/URL every cycle forever.
+
+**How an operator resumes**: `state.poll_paused` is cleared two ways, and
+only two — there is no automatic timeout or exponential backoff:
+
+1. **A tick that reaches a changed head is not possible while paused** —
+   this is intentional: since a paused tick returns before ever calling
+   `git ls-remote`, it cannot itself observe a changed head to recover
+   from, which is exactly why an EXTERNAL action is required rather than
+   waiting for the poll job to un-pause itself.
+2. **The operator explicitly intervenes**, via either of the two routes
+   `backend/routes.py` already exposes for a stuck sync: **Push now**
+   (`routes.push_now`, which calls `state.resume_polling()` before running
+   the push job) or **Undo** (`routes.restore`, restoring a prior apply —
+   documented here as the second resume path per this fix's own
+   requirement; wiring it is `routes.py`'s own change, outside this
+   module). Both represent the operator actively looking at and acting on
+   this instance's sync state, which is the closest available signal to
+   "an operator has seen the problem and is dealing with it" that this
+   app can observe without a dashboard-side acknowledgement flow of its
+   own.
+
+A successful tick (`clear_poll_failure`) also resets
+`poll_consecutive_failures`/`poll_paused` back to `0`/`False` — but since
+a paused tick never runs far enough to succeed, this path only matters
+for a `POLL_PAUSE_AFTER - 1`-failure streak that recovers before pausing,
+not as a way out of an already-paused state.
+
 ## Concurrent-clone lock (senior review round-2 M-new-2)
 
 ``config-sync-push`` and ``config-sync-poll`` are both declared in
@@ -166,6 +207,15 @@ from backend.safety import git_safety
 #: `TARGET_REPO`/`TARGET_BASE` (`TGS-Labs/Kiro-Config-Bundles`, `main`).
 BUNDLE_REPO_URL = "https://github.com/TGS-Labs/Kiro-Config-Bundles.git"
 BUNDLE_DEFAULT_BRANCH = "main"
+
+#: Consecutive failed poll ticks after which `run()` pauses all further
+#: network work until an operator resumes it (Push now / Undo — see
+#: "Poll pause" above). Chosen to match `ui/src/StatCardsRow.tsx`'s own
+#: existing comment describing KiroCrew's unrelated cron-level auto-pause
+#: ("pauses a cron after 5 consecutive failures") so the two numbers read
+#: consistently to an operator, even though this is this app's OWN pause
+#: mechanism, not that one.
+POLL_PAUSE_AFTER = 5
 
 #: Directory name, under the app's own state directory
 #: (`state.get_state_dir()`), that holds the bundle repo's working clone —
@@ -231,6 +281,7 @@ def notify_operator(
     author: str = "",
     subject: str = "",
     touched_classes: List[str] | None = None,
+    not_applied: Dict[str, str] | None = None,
 ) -> None:
     """Notify the operator that the bundle repo's head has changed.
 
@@ -238,6 +289,14 @@ def notify_operator(
     author, its subject, and which tracked configuration classes the
     change touches" — this prints a one-line summary carrying all four to
     stdout.
+
+    ``not_applied`` (senior-review round-4 H fix) is the ``{relpath:
+    reason}`` mapping for a `"partial"` apply outcome — every not-applied
+    path and its real per-path reason is rendered into the same
+    notification, so a partial apply's operator-facing message names WHAT
+    failed and WHY, not merely that something changed. ``None``/empty for
+    a full apply (the common case), which renders exactly as before this
+    fix.
 
     This job runs as a `command` cron target (never `message`/an agent
     turn — requirements.md 4.1), so there is no agent session to hand a
@@ -261,16 +320,23 @@ def notify_operator(
     per-tick while still surfacing the one outcome that matters
     (requirements.md 4.2's "no notification on unchanged" carries over
     unchanged: silence is enforced by never calling this, not by this
-    function suppressing its own output).
+    function suppressing its own output). A `"partial"` outcome DOES call
+    this function (senior-review round-4 H fix) — see `run()`'s own
+    comment at that call site for why the pre-fix early return there was
+    a defect.
     """
     touched = ", ".join(touched_classes or []) or "(none)"
-    print(
-        f"config-sync: bundle repo head changed to {head_sha}\n"
-        f"  author:  {author}\n"
-        f"  subject: {subject}\n"
+    lines = [
+        f"config-sync: bundle repo head changed to {head_sha}",
+        f"  author:  {author}",
+        f"  subject: {subject}",
         f"  touched: {touched}",
-        flush=True,
-    )
+    ]
+    if not_applied:
+        lines.append("  not applied:")
+        for relpath, reason in sorted(not_applied.items()):
+            lines.append(f"    {relpath}: {reason}")
+    print("\n".join(lines), flush=True)
 
 
 def _resolve_remote_head(state_dir_owner: str) -> str:
@@ -600,6 +666,61 @@ def _root_ancestor_sha(state_dir_owner: str, sha: str) -> str:
         current = parent
 
 
+def _restore_dir_has_backup(apply_id: str) -> bool:
+    """Return whether the restore directory `apply_commit` recorded for
+
+    `apply_id` actually holds a real backup file or a non-empty
+    created-file manifest — the on-disk signal that SOMETHING was
+    genuinely written or created this apply attempt (senior-review
+    round-4 M fix). `apply_commit` records a restore directory
+    unconditionally at the START of every attempt (`backend/apply.py`'s
+    own H3 rationale: recording it up front means a crash on file 2 still
+    leaves file 1's backup reachable), so its mere existence proves
+    nothing about whether this attempt actually wrote anything — only
+    its CONTENTS do.
+
+    Walks the directory tree looking for either: a regular file that is
+    not named `.created-manifest.json` (a genuine pre-existing-file
+    backup, written by `apply._backup_file`), or a
+    `.created-manifest.json` whose JSON array is non-empty (a genuinely
+    NEW file was created this attempt, even though nothing existed to
+    back up). `apply.py`'s own `_CREATED_MANIFEST_NAME` constant is
+    mirrored here rather than imported, since this module does not
+    otherwise depend on `apply.py`'s internals — the filename is a
+    stable, documented on-disk contract (`_write_created_manifest`'s own
+    docstring), not a private implementation detail.
+
+    Returns ``False`` (safe default) when the directory does not exist at
+    all or cannot be read — an apply attempt that never reached the
+    backup step in the first place wrote nothing either.
+    """
+    restore_dir = Path(state.get_state_dir()) / "restores" / apply_id
+    if not restore_dir.is_dir():
+        return False
+
+    created_manifest_name = ".created-manifest.json"
+    try:
+        for candidate in restore_dir.rglob("*"):
+            if not candidate.is_file():
+                continue
+            if candidate.name != created_manifest_name:
+                return True
+            try:
+                import json
+
+                manifest_contents = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # An unreadable/corrupt manifest is treated as "no proof
+                # of a write" rather than raising — this is a best-effort
+                # cleanup signal, not a correctness-critical read.
+                continue
+            if manifest_contents:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _apply_new_head(
     store: state.StateStore,
     head_sha: str,
@@ -708,6 +829,34 @@ def _apply_new_head(
         )
     finally:
         shutil.rmtree(commit_root, ignore_errors=True)
+
+    # M (senior review round 4): `apply_commit` records a restore
+    # directory for every attempt unconditionally, before it knows
+    # whether this attempt will actually write anything — so a retry of
+    # the SAME still-failing partial apply against an unchanged remote
+    # head (every eligible file failing the same way on every tick)
+    # accumulates one new, empty restore directory per tick with nothing
+    # in it to restore.
+    #
+    # `result.applied` is NOT by itself the right signal for "nothing was
+    # written": a delete of a path that no longer exists (e.g. a file
+    # this SAME apply already deleted on an earlier, still-partial tick)
+    # is recorded as `applied` unconditionally by `apply_commit`
+    # (`_apply_one_file`'s delete branch appends to `applied` whether or
+    # not `live_target.exists()` was true) even though nothing on disk
+    # actually changed and no backup was written for it. `_restore_dir_
+    # has_backup` below checks the actual restore directory contents —
+    # the one thing genuinely written to disk only when a real
+    # backup/creation happened — rather than trusting `applied`'s own
+    # bookkeeping. When the restore dir holds no real backup or
+    # created-file record for ANY root, this attempt wrote nothing new,
+    # and the restore dir `apply_commit` just recorded is discarded
+    # immediately, before any other state mutation below. An attempt
+    # that wrote at least one file keeps its restore dir untouched: it
+    # is genuinely load-bearing for `routes.restore` even when OTHER
+    # files in the same attempt failed.
+    if result.apply_id and not _restore_dir_has_backup(result.apply_id):
+        store.discard_restore_dir(apply_id=result.apply_id)
 
     if result.outcome == "applied":
         try:
@@ -822,14 +971,21 @@ def run() -> PollResult:
         failed) or ``outcome="fetch-failed"`` (a later step on an already-
         resolved changed head failed; senior-review round-2 H-new-1) so the
         cron wrapper can turn either into a non-zero process exit without
-        this module owning the exit-code mechanics itself.
+        this module owning the exit-code mechanics itself. Returns
+        ``outcome="paused"`` (senior-review round-4 M fix; see "Poll
+        pause" above) when `state.poll_paused` is already set — no git
+        call is made and no state is mutated on this path, so a paused
+        instance costs nothing per tick until an operator resumes it.
     """
     store = state.load_state()
+
+    if store.poll_paused:
+        return PollResult(outcome="paused")
 
     try:
         head_sha = _resolve_remote_head(str(state.get_state_dir()))
     except (subprocess.CalledProcessError, OSError) as exc:
-        store.record_poll_failure(reason=str(exc))
+        store.record_poll_failure(reason=str(exc), pause_after=POLL_PAUSE_AFTER)
         return PollResult(outcome="ls-remote-failed", reason=str(exc))
 
     if head_sha == store.last_seen_sha:
@@ -845,7 +1001,7 @@ def run() -> PollResult:
         # unchanged`). An empty SHA is never a genuine changed head: it
         # must not be recorded as `last_seen_sha`, classified, or notified
         # on — treat it the same as an unresolved head.
-        store.record_poll_failure(reason="empty head sha")
+        store.record_poll_failure(reason="empty head sha", pause_after=POLL_PAUSE_AFTER)
         return PollResult(outcome="ls-remote-failed", reason="empty head sha")
 
     # NOTE: no separate "already pending for this exact SHA" guard is
@@ -906,7 +1062,7 @@ def run() -> PollResult:
         TimeoutError,
         git_safety.GitSafetyError,
     ) as exc:
-        store.record_poll_failure(reason=str(exc))
+        store.record_poll_failure(reason=str(exc), pause_after=POLL_PAUSE_AFTER)
         return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
     # Captured BEFORE `record_poll_pending` below mutates `base_sha`/
@@ -947,6 +1103,26 @@ def run() -> PollResult:
     # `last_seen_sha` or notify: the next tick re-resolves and retries the
     # SAME head, exactly like the `fetch-failed` degrade-and-retry path
     # above.
+    # C-A (senior review round 4 H fix): capture the LIVE tree's hash
+    # BEFORE this tick's own apply writes anything — the only way to tell
+    # apart "the live tree already matched what was last pushed" (no
+    # unpushed local edit sitting on top of it) from "a local edit exists
+    # right now, before this tick touches anything". Computed via the
+    # SAME `push.current_push_tree_hash()` pipeline the post-apply hash
+    # below uses, so the two are directly comparable. `pre_apply_tree_empty`
+    # additionally records whether EITHER tracked root held any file at
+    # all before this tick — the bootstrap signal the guard below needs
+    # to tell "nothing has ever been pushed AND nothing local exists
+    # either, so there is no baseline this apply could be hiding a local
+    # edit under" apart from "nothing has ever been pushed but a local
+    # edit already exists" (both share `last_pushed_hash is None`, so
+    # that field ALONE cannot distinguish them).
+    from backend import collect as collect_module
+    from backend import push as push_module
+
+    pre_apply_tree_hash = push_module.current_push_tree_hash()
+    pre_apply_tree_empty = not collect_module.collect()
+
     apply_outcome = _apply_new_head(
         store,
         head_sha,
@@ -955,7 +1131,10 @@ def run() -> PollResult:
         pre_tick_pending=pre_tick_pending,
     )
     if apply_outcome is None:
-        store.record_poll_failure(reason=f"could not materialize commit {head_sha}")
+        store.record_poll_failure(
+            reason=f"could not materialize commit {head_sha}",
+            pause_after=POLL_PAUSE_AFTER,
+        )
         return PollResult(
             outcome="apply-error",
             head_sha=head_sha,
@@ -980,37 +1159,84 @@ def run() -> PollResult:
     # never applies here since `last_seen_sha` stays behind `head_sha`,
     # so `run()` re-enters this whole block on the next tick, exactly as
     # H-1 requires).
+    #
+    # H (senior review round 4): a `"partial"` outcome must still reach
+    # the operator exactly once (requirements.md 4.3) — the pre-fix
+    # early-return here skipped `notify_operator` entirely, so a partial
+    # apply's not-applied paths and reasons were visible only through
+    # `status()`'s `last_apply`, never pushed to the operator the way a
+    # full apply's notification already is. Reuses the SAME
+    # `notify_operator` seam; the not-applied paths/reasons come straight
+    # from `store.last_apply` (`_apply_new_head`'s own
+    # `_record_last_apply` call already wrote it for this tick, before
+    # this point), so the message names WHAT failed and WHY, not merely
+    # that something changed.
     if apply_outcome != "applied":
         store.clear_poll_failure()
+        not_applied = (store.last_apply or {}).get("not_applied") or {}
+        notify_operator(
+            head_sha=head_sha,
+            author=author,
+            subject=subject,
+            touched_classes=touched_classes,
+            not_applied=not_applied,
+        )
         return PollResult(outcome="changed", head_sha=head_sha)
 
-    # C-A (senior review round 3): a FULLY-applied tick must record the
-    # just-applied tree's own push hash as `last_pushed_hash`, in the SAME
-    # tick that records the apply — not merely "eventually", since a push
-    # tick can run at any moment after this one returns. The applied tree
-    # IS the live tree right now (apply_commit already wrote every file to
-    # disk), so `push.current_push_tree_hash()` — the exact
+    # C-A (senior review round 3; guarded further in round 4 H fix): a
+    # FULLY-applied tick must record the just-applied tree's own push hash
+    # as `last_pushed_hash`, in the SAME tick that records the apply — not
+    # merely "eventually", since a push tick can run at any moment after
+    # this one returns. The applied tree IS the live tree right now
+    # (apply_commit already wrote every file to disk), so
+    # `push.current_push_tree_hash()` — the exact
     # collect -> redact -> tokenize -> tree_hash pipeline `push.run()`'s
     # own no-op gate reads — computed here and now is the value that
     # gate must see, so the very next push tick recognizes this content as
     # already delivered and short-circuits to `outcome="no-op"` with zero
     # git calls, rather than re-cloning and trying to push the bundle
-    # repo's own content straight back onto itself. Recorded via
-    # `record_push_success` (never the bare in-memory
-    # `last_pushed_hash` setter, which does not persist) — no branch/PR
-    # exists for this "push" since nothing was actually pushed anywhere;
-    # `branch`/`pr_url` are recorded empty/`None` to reflect that plainly,
-    # matching the semantics `push.py`'s own `record_push_success` already
-    # documents (only the hash-gate field is load-bearing for push's
-    # no-op check; `last_push`'s branch/pr_url here just describe how this
-    # particular hash was established).
+    # repo's own content straight back onto itself.
+    #
+    # H (senior review round 4): this update must happen ONLY IF the
+    # PRE-apply live tree already matched `last_pushed_hash` — i.e. there
+    # was no unpushed local edit sitting on top of it BEFORE this tick's
+    # apply ran. The pre-fix shape updated `last_pushed_hash`
+    # unconditionally to the POST-apply tree's hash, which folds any such
+    # local edit into "already pushed" the moment an unrelated bundle
+    # commit auto-applies on top of it — silently hiding that edit from
+    # `drift()`/the next push tick forever, since nothing else will ever
+    # produce a hash that differs from this one again. Comparing against
+    # `pre_apply_tree_hash` (captured above, before `_apply_new_head` ran)
+    # is what tells the two cases apart: when it already equalled
+    # `last_pushed_hash`, the apply's own changes are the ONLY difference
+    # between pre- and post-apply, so advancing the hash is exactly
+    # correct; when it did not, a local edit predates this tick and must
+    # keep showing as drift after the apply too, so `last_pushed_hash` is
+    # left untouched — the local edit is never silently absorbed just
+    # because an unrelated commit happened to auto-apply on top of it.
+    #
+    # `last_pushed_hash is None` (nothing has EVER been recorded as pushed
+    # on this instance — the bootstrap case) alone is NOT sufficient to
+    # trust this first apply: a local edit made before this instance's
+    # very first poll tick also presents with `last_pushed_hash is None`
+    # (nothing to compare against) yet must still be protected exactly
+    # like the general case. `pre_apply_tree_empty` (captured above, from
+    # `collect.collect()` before `_apply_new_head` ran) is the signal that
+    # actually distinguishes them: only when NEITHER tracked root held any
+    # file at all before this tick is there truly no baseline a local
+    # edit could be hiding under, so advancing the hash is safe. A
+    # non-empty pre-apply tree with `last_pushed_hash is None` falls
+    # through to the `pre_apply_tree_hash == store.last_pushed_hash`
+    # comparison below, which correctly evaluates to `False` (a real hash
+    # never equals `None`) and leaves `last_pushed_hash` untouched.
     from backend import push as push_module
 
-    store.record_push_success(
-        tree_hash=push_module.current_push_tree_hash(),
-        branch="",
-        pr_url=None,
-    )
+    if pre_apply_tree_empty or pre_apply_tree_hash == store.last_pushed_hash:
+        store.record_push_success(
+            tree_hash=push_module.current_push_tree_hash(),
+            branch="",
+            pr_url=None,
+        )
 
     # H3 (senior review round 1, still open going into round 2): advance
     # `last_seen_sha` to `head_sha` BEFORE notifying, not after. If

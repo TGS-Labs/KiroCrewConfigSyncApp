@@ -4,7 +4,7 @@
     "applied": [
       "steering/fixture-demo-2.md"
     ],
-    "apply_id": "apply-20260927073610-e54f64d1",
+    "apply_id": "apply-20260927081856-51ba6e08",
     "changed_instance_names": [],
     "dropped_cron_names": [],
     "ignored_paths": [],
@@ -28,7 +28,7 @@
     "root": {
       "mcp.json": "A"
     },
-    "sha": "f99d48863e98d93266df6030d728294986fe37b5",
+    "sha": "e72f168612c951b112988ae478bd8c763c3a9b67",
     "unresolved_references": [],
     "untracked_prompt_agents": []
   },
@@ -36,14 +36,14 @@
   "last_push": {
     "branch": "",
     "pr_url": null,
-    "time": "2026-09-27T07:36:10Z",
+    "time": "2026-09-27T08:18:56Z",
     "tree_hash": "86852bf02dc14f9ddb4e043f9f9036472c93f03e10bad1fff89d6026aeb00f00"
   },
   "last_push_failure": {
     "reason": "secret scan found 1 finding; push refused",
-    "time": "2026-09-27T07:36:10Z"
+    "time": "2026-09-27T08:18:56Z"
   },
-  "last_seen_sha": "7851d09e2e90198f295dd4ca2daeebd8b898166a",
+  "last_seen_sha": "5e021958d332846d912016a440ecec0bdd7d6989",
   "pending": {
     "author": "t",
     "changed_commands": [],
@@ -55,12 +55,14 @@
     "not_applied": {
       "mcp.json": "mcp.json: refused \u2014 could not parse as JSON"
     },
-    "sha": "f99d48863e98d93266df6030d728294986fe37b5",
+    "sha": "e72f168612c951b112988ae478bd8c763c3a9b67",
     "subject": "add another file, break mcp.json",
     "touched_classes": [
       "live_in_new_session",
       "live_on_next_resolution"
     ]
   },
+  "poll_consecutive_failures": 0,
+  "poll_paused": false,
   "status": "ok"
 }

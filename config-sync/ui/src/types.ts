@@ -70,6 +70,14 @@ export interface StatusResponse {
   last_push_failure: FailureRecord | null
   last_seen_sha: string | null
   last_poll_failure: FailureRecord | null
+  /** Consecutive failed poll ticks, reset to 0 on the next success
+   * (senior-review round-4 M fix — `backend/state.py`'s
+   * `poll_consecutive_failures`). */
+  poll_consecutive_failures: number
+  /** Whether polling is currently paused after too many consecutive
+   * failures (`backend/poll.py`'s `POLL_PAUSE_AFTER`). Resumed by an
+   * operator using Push now or Undo. */
+  poll_paused: boolean
   drift: boolean
   last_apply: LastApply | null
 }

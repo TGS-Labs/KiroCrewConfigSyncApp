@@ -7,7 +7,7 @@ rather than a real `backend.routes.status()` response. This test closes
 that gap for the *data* half: it drives a real poll tick (real git repo,
 real commits, real `apply_commit`) through `backend.poll.run()`, then
 calls `backend.routes.status()` on the resulting store — the exact same
-call `backend/server.py` makes for `GET /api/apps/config-sync/status` —
+call `backend/server.py` makes for `GET /api/status` —
 and writes the JSON-serialized result to
 `ui/src/__fixtures__/status.real.json`.
 
@@ -62,12 +62,15 @@ from backend import routes, state
 from test_routes_approve_seam import (
     _bundle_repo_url_env,
     _git,
-    _head_sha,
     _init_origin_repo,
 )
 
 _FIXTURE_PATH = (
-    Path(__file__).resolve().parent.parent / "ui" / "src" / "__fixtures__" / "status.real.json"
+    Path(__file__).resolve().parent.parent
+    / "ui"
+    / "src"
+    / "__fixtures__"
+    / "status.real.json"
 )
 
 
@@ -166,7 +169,9 @@ def test_generate_real_status_fixture_from_a_real_poll_tick(
         encoding="utf-8",
     )
     _git("add", "-A", cwd=work)
-    _git("commit", "-q", "-m", "clean change + paused cron + needs-credential", cwd=work)
+    _git(
+        "commit", "-q", "-m", "clean change + paused cron + needs-credential", cwd=work
+    )
     _git("push", "-q", "-u", "origin", "main", cwd=work)
 
     result1 = poll_module.run()
@@ -191,9 +196,9 @@ def test_generate_real_status_fixture_from_a_real_poll_tick(
     store = _reload_store()
     assert store.last_apply is not None
     assert store.last_apply.get("outcome") == "partial", store.last_apply
-    assert store.last_apply.get("not_applied"), (
-        "the partial tick must record a real not_applied dict"
-    )
+    assert store.last_apply.get(
+        "not_applied"
+    ), "the partial tick must record a real not_applied dict"
 
     # A push failure, recorded directly on the store the same way
     # backend/push.py itself would on a real refusal — status() must

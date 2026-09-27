@@ -98,6 +98,8 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "history": [],
     "restore_dirs": {},
     "last_apply": None,
+    "poll_consecutive_failures": 0,
+    "poll_paused": False,
 }
 
 
@@ -343,6 +345,30 @@ class StateStore:
         return cast("dict[str, Any] | None", self._payload["last_poll_failure"])
 
     @property
+    def poll_consecutive_failures(self) -> int:
+        """Count of consecutive failed poll ticks, reset to 0 on the next
+
+        successful tick (senior-review round-4 M2 follow-up). Incremented
+        by `record_poll_failure`, reset by `clear_poll_failure` — the same
+        pairing that already owns `last_poll_failure`'s own lifecycle, so
+        this count and that record always move together.
+        """
+        return cast("int", self._payload["poll_consecutive_failures"])
+
+    @property
+    def poll_paused(self) -> bool:
+        """Whether polling is currently paused after too many consecutive
+
+        failures (`poll.POLL_PAUSE_AFTER`). Set by `record_poll_failure`
+        once the failure count reaches the threshold; cleared by
+        `clear_poll_failure` on the next successful tick, or by
+        `resume_polling` when the operator explicitly resumes via Push
+        now / Undo (see `poll.py`'s module docstring for the resume
+        contract).
+        """
+        return cast("bool", self._payload["poll_paused"])
+
+    @property
     def base_sha(self) -> str | None:
         """The head commit as of the operator's LAST approve/decline
 
@@ -464,7 +490,7 @@ class StateStore:
 
         self._locked_rmw(_mutate)
 
-    def record_poll_failure(self, *, reason: str) -> None:
+    def record_poll_failure(self, *, reason: str, pause_after: int = 5) -> None:
         """Record a failed poll tick (`outcome="fetch-failed"`), mirroring
 
         `record_push_failure`'s shape for the poll job's own equivalent
@@ -481,11 +507,23 @@ class StateStore:
         it. Never changes `last_seen_sha` (poll's own `run()` already
         leaves that untouched on this path so the next tick retries the
         same head).
+
+        Also increments `poll_consecutive_failures` and, once the count
+        reaches `pause_after`, sets `poll_paused` (senior-review round-4
+        M fix: the failure surface reported no count and no pause state
+        at all before this). `pause_after` defaults to 5 but is always
+        passed explicitly by the caller (`poll.py`'s `POLL_PAUSE_AFTER`)
+        so the threshold has one definition and this module stays
+        agnostic of the specific constant's value.
         """
         entry = {"reason": reason, "time": _now_iso()}
 
         def _mutate(payload: dict[str, Any]) -> None:
             payload["last_poll_failure"] = dict(entry)
+            count = int(payload.get("poll_consecutive_failures", 0)) + 1
+            payload["poll_consecutive_failures"] = count
+            if count >= pause_after:
+                payload["poll_paused"] = True
 
         self._locked_rmw(_mutate)
 
@@ -502,10 +540,39 @@ class StateStore:
         `record_seen_sha` advances), so any tick that resolves the head
         cleanly counts as a recovery regardless of whether it also found a
         new commit.
+
+        Also resets `poll_consecutive_failures` to 0 and clears
+        `poll_paused` back to `False` — a successful tick is the "un-pause
+        by a forced tick at a changed head" path `poll.py`'s module
+        docstring documents alongside the operator-driven Push now / Undo
+        path (`resume_polling`).
         """
 
         def _mutate(payload: dict[str, Any]) -> None:
             payload["last_poll_failure"] = None
+            payload["poll_consecutive_failures"] = 0
+            payload["poll_paused"] = False
+
+        self._locked_rmw(_mutate)
+
+    def resume_polling(self) -> None:
+        """Explicitly resume polling after a pause, without pretending a
+
+        tick actually succeeded (senior-review round-4 M fix). Called by
+        the operator-facing Push now / Undo routes so a paused poll cron
+        does not stay paused forever with no way out short of a
+        successful tick it is no longer even attempting (a paused tick
+        skips its own network work — see `poll.py`'s module docstring).
+        Resets the same two fields `clear_poll_failure` resets, but does
+        NOT touch `last_poll_failure`: the most recent failure record is
+        still true and informative until the next real tick supersedes
+        it; only the pause/counter state that BLOCKS the next tick's
+        network work is what an explicit resume needs to clear.
+        """
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["poll_consecutive_failures"] = 0
+            payload["poll_paused"] = False
 
         self._locked_rmw(_mutate)
 
@@ -1047,6 +1114,29 @@ class StateStore:
 
         def _mutate(fresh: dict[str, Any]) -> None:
             fresh["restore_dirs"][apply_id] = restore_dir
+
+        self._locked_rmw(_mutate)
+
+    def discard_restore_dir(self, *, apply_id: str) -> None:
+        """Remove a previously recorded restore-directory mapping
+
+        (senior-review round-4 M fix): `apply_commit` records a restore
+        dir for every apply attempt unconditionally, before it knows
+        whether anything will actually be written this attempt — a retry
+        of the same still-failing partial apply against an unchanged
+        remote head therefore accumulates one new, empty restore
+        directory per tick with nothing in it to restore. Called by
+        `poll.py`'s `_apply_new_head` right after `apply_commit` returns,
+        ONLY when `result.applied` is empty (nothing was actually written
+        this attempt) — never for an attempt that wrote at least one
+        file, whose restore dir is genuinely load-bearing. A missing
+        ``apply_id`` (already absent, or never recorded) is a no-op —
+        this is a best-effort cleanup, not a mutation the caller depends
+        on succeeding.
+        """
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["restore_dirs"].pop(apply_id, None)
 
         self._locked_rmw(_mutate)
 
