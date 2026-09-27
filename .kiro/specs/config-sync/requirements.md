@@ -10,20 +10,38 @@ agent configuration under git version control in the existing repository
   across two roots (`KIROCREW_HOME` and `KIRO_HOME`'s agents directory), rewrite
   host-specific absolute paths in agent definitions to portable tokens, redact
   credentials, and open a pull request against the bundle repository.
-- **Pull** — poll the bundle repository's default branch, notify the user of a
-  new commit, and — only after explicit approval — apply it to the running
-  instance with the cache-invalidation and propagation semantics each
-  configuration class actually requires.
+- **Pull** — poll the bundle repository's default branch and, on every commit
+  that reaches it, apply it to the running instance automatically, with the
+  cache-invalidation and propagation semantics each configuration class
+  actually requires.
 
 The app's own source lives in `TGS-Labs/KiroCrewConfigSyncApp`; the sync target
 `TGS-Labs/Kiro-Config-Bundles` is unchanged by this work. The app never edits
 the installed `kiro_crew` package.
 
-Six user decisions are ratified inputs, not open questions: notify-and-approve
-pull policy, a 15-minute poll interval, change-hash-gated push cadence,
-PR-only push, a structure-preserving redacted `mcp.json`, and the deliberate
-inclusion of `crons.json` and `instances.json` (Requirement 6, which documents
-the risk that inclusion accepts).
+**OPERATOR RULING (supersedes the original notify-and-approve pull policy).**
+The approval gate for a pulled change is the pull request merge into
+`TGS-Labs/Kiro-Config-Bundles`'s branch-protected `main` — not a box-side
+action. Anything on `main` is production configuration and IS applied to this
+box automatically on the next 15-minute poll. There is no approve or decline
+route on the box: the poll runs the same apply path (materialize the commit
+tree, then `apply_commit` with expand, restore, sanitize, per-file isolation,
+and a restore directory) that a box-side approval used to trigger, without
+waiting for one. Every box-side safety check on the *content* of a commit
+remains in force unchanged — redaction/credential restore (Requirement 4.10),
+command vetting for crons/hooks/mcp with fail-closed drop (Requirement 6),
+crons importing paused rather than live, and no agent ever ending up
+half-registered (Requirement 5.15) — because those checks bound what a
+committed change is allowed to do to this box, independent of who or what
+triggers the apply. Only the human-in-the-loop gate on the box itself is
+removed; the human-in-the-loop gate on `main` (branch protection + required
+review before merge) is what now does that job.
+
+Six user decisions are ratified inputs, not open questions: automatic-apply-
+on-merge pull policy, a 15-minute poll interval, change-hash-gated push
+cadence, PR-only push, a structure-preserving redacted `mcp.json`, and the
+deliberate inclusion of `crons.json` and `instances.json` (Requirement 6,
+which documents the risk that inclusion accepts).
 
 ## Requirements
 
@@ -186,10 +204,10 @@ reviewable in a diff.
 
 ### Requirement 4
 
-**User Story:** As a KiroCrew operator, I want to be told when the bundle
-repository gains a new commit and to decide myself whether it is applied, so
-that a change made on another machine can never mutate this instance's
-behaviour behind my back.
+**User Story:** As a KiroCrew operator, I want every commit that lands on the
+bundle repository's protected `main` applied to this instance automatically
+on the next poll, so that a change I already approved by merging it takes
+effect without a second, redundant approval step on the box.
 
 #### Acceptance Criteria
 
@@ -197,48 +215,51 @@ behaviour behind my back.
    poll itself consumes no LLM tokens.
 2. The poll SHALL determine the current head commit of the bundle repository's
    default branch without a full clone (e.g. `git ls-remote`), and WHEN that
-   commit equals the last-seen commit THEN it SHALL exit having produced no
-   notification.
+   commit equals the last-seen commit THEN it SHALL exit having applied
+   nothing and produced no notification.
 3. WHEN the head commit differs from the last-seen commit THEN the app SHALL
-   notify the user (dashboard notification / `send_message`) identifying the
-   commit, its author, its subject, and which tracked configuration classes the
-   change touches.
-4. The app SHALL NOT apply any pulled change without an explicit user approval
-   action; there SHALL be no configuration option, environment variable, or
-   route that enables automatic application.
-5. WHEN the user approves a specific pending commit THEN the app SHALL apply
-   only the files in that commit that match the Requirement 1 allowlist, and
-   SHALL report any non-allowlisted path in the commit as ignored rather than
+   materialize the commit tree for the range `base_sha..head` and run it
+   through the same apply path that a box-side approval used to trigger —
+   `apply_commit` with expand, restore, sanitize, per-file isolation, and a
+   restore directory — automatically, with no operator action required. The
+   app SHALL notify the user (dashboard notification / `send_message`) of the
+   result identifying the commit, its author, its subject, which tracked
+   configuration classes the change touched, and the outcome (`applied` or
+   `partial`, per Requirement 4.14).
+4. The app SHALL apply every polled commit range on `main` automatically; the
+   approval gate is the pull request merge into `main` (branch-protected in
+   `TGS-Labs/Kiro-Config-Bundles`), not a box-side action. There SHALL be no
+   approve or decline route, UI control, or pending-for-operator-decision
+   state on the box — the poll IS the apply trigger. Every box-side safety
+   check on the CONTENT of a commit (redaction/credential restore, command
+   vetting, paused cron import, no half-registration) SHALL still run
+   unconditionally on every apply, per Requirements 4.10, 5.15, and 6.
+5. WHEN the poll applies a commit range THEN the app SHALL apply only the
+   files in that range that match the Requirement 1 allowlist, and SHALL
+   report any non-allowlisted path in the range as ignored rather than
    applying it.
-6. WHEN the user declines, or takes no action THEN the instance's configuration
-   SHALL remain byte-unchanged, and the pending commit SHALL remain pending
-   (re-notification SHALL NOT repeat on every 15-minute tick for the same
-   commit).
-7. BEFORE applying an approved commit THEN the app SHALL record a restorable
+6. [Reserved — the box-side decline path this criterion described no longer
+   exists under the operator ruling in the Introduction; there is no action
+   the operator takes on the box to leave a polled commit unapplied. Kept
+   reserved rather than renumbered so citations elsewhere are not broken by a
+   shift.]
+7. BEFORE applying a commit range THEN the app SHALL record a restorable
    copy of every file it is about to overwrite or delete, so that an apply can
    be reverted without a second network round trip.
 8. WHEN an apply fails part-way THEN the app SHALL report which files were
    applied and which were not, and SHALL NOT report the apply as successful.
-9. WHEN a poll tick detects a new head commit WHILE an earlier commit is
-   already pending operator approval/decline THEN the app SHALL ACCUMULATE the
-   new commit's changed paths into the existing pending record rather than
-   replacing it, so that the earlier commit's changed files are never dropped
-   from what the operator is shown. The pending record's changed-path range
-   SHALL be computed from a recorded `base_sha` — the head commit that was
-   current the LAST TIME the operator actually approved or declined a pending
-   commit (or, before any decision has ever been made, the first commit this
-   instance ever polled) — and NOT from `last_seen_sha`, which advances on
-   every tick regardless of pending state. `base_sha` SHALL NOT advance while
-   a commit is pending — including at the moment a fresh pending record is
-   first created, where it is initialized to that record's own head rather
-   than "advanced" from a prior value — and SHALL advance ONLY when the
-   operator approves or declines, to the SHA that was just approved or
-   declined. The pending
-   record's `sha` field SHALL always reflect the newest head seen, so the
-   operator is always shown the full accumulated diff since their last actual
-   decision, never a partial view that silently drops an earlier unapplied
-   change.
-10. WHEN an approved commit's file contains the redaction placeholder
+9. WHEN a poll tick detects a new head commit THEN the app SHALL compute the
+   changed-path range from a recorded `base_sha` — the head commit as of the
+   last apply outcome that was fully `applied` (or, before any apply has ever
+   fully succeeded, the first commit this instance ever polled) — and NOT
+   from `last_seen_sha`, which advances on every tick regardless of apply
+   outcome. `base_sha` SHALL NOT advance on a `partial` outcome (Requirement
+   4.14): the next tick SHALL retry the SAME range `base_sha..head` (extended
+   to the new head if one arrived meanwhile), so a not-yet-applied path is
+   never dropped from what the next apply attempt covers. `base_sha` SHALL
+   advance ONLY when an apply outcome is fully `applied`, to the SHA that was
+   just applied.
+10. WHEN an applied commit's file contains the redaction placeholder
     `"<redacted>"` as a `headers` or `env` value THEN the app SHALL write the
     live file's existing value at the same key path in its place, so that an
     apply never replaces a real credential with the placeholder. WHEN no live
@@ -246,7 +267,7 @@ behaviour behind my back.
     app SHALL write the placeholder and SHALL list that key path, by server or
     job name and key, in the apply result as needing a credential. Every other
     value in the file SHALL be applied from the commit unchanged.
-11. WHEN an approved commit's file within the Requirement 2.8 scope is
+11. WHEN an applied commit's file within the Requirement 2.8 scope is
     applied THEN, BEFORE the Requirement 4.10 placeholder restore, every
     string value whose path part (after an optional `file://`/`skill://`
     prefix) equals `${KIROCREW_HOME}` or `${KIRO_HOME}`, or starts with that
@@ -276,18 +297,24 @@ behaviour behind my back.
     reference, and SHALL NOT refuse the file — an agent resource under an
     untracked location such as `config-bundles/skills/` is delivered by that
     location's own mechanism, not by this app.
-14. WHEN an approval's apply outcome is `partial` (Requirement 4.8) THEN the
-    pending record SHALL NOT be resolved and `base_sha` SHALL NOT advance;
-    the pending record SHALL be updated to carry the not-applied paths and
-    their refusal reasons from that apply attempt, and this SHALL be visible
-    in the app's status/pending display (Requirement 7.1). Re-approving the
-    same pending record SHALL be safe — the apply routine SHALL be
-    idempotent, so a file already correctly applied in the failed attempt
-    SHALL NOT be reapplied incorrectly or duplicated — and declining the
-    pending record SHALL still work and SHALL leave the instance
-    byte-unchanged, exactly as Requirement 4.6 specifies for a never-applied
-    commit. `base_sha` SHALL advance, and the pending record SHALL resolve,
-    ONLY WHEN an apply's outcome is fully `applied` — never on `partial`.
+14. WHEN a poll's automatic apply outcome is `partial` (Requirement 4.8) THEN
+    `base_sha` SHALL NOT advance from the range's start; the app SHALL record
+    the not-applied paths and their REAL per-path failure reasons (the actual
+    cause the apply routine encountered for that path — e.g. the specific
+    vet-rejection, the specific missing-parent-directory error, the specific
+    permission error — never a generic "failed to apply" placeholder) against
+    the current state, and this SHALL be visible in the app's status display
+    (Requirement 7.1). The NEXT poll tick SHALL retry applying the SAME
+    unresolved range — the apply routine SHALL be idempotent, so a path
+    already correctly applied in the failed attempt SHALL NOT be reapplied
+    incorrectly or duplicated. WHEN a LATER commit on `main` fixes the
+    condition that caused an earlier path's failure (for example a corrected
+    file, or a dependency that now exists) THEN the retry on or after that
+    later commit's poll SHALL apply that path normally, and the app SHALL
+    NOT require any operator action to trigger the retry — it happens on the
+    next scheduled poll tick, exactly like every other apply. `base_sha`
+    SHALL advance, past the retried range, ONLY WHEN a poll's apply outcome
+    for that range is fully `applied` — never on `partial`.
 
 ### Requirement 5
 
@@ -326,7 +353,7 @@ not really running.
    registration and report it as incomplete rather than leaving a partially
    registered agent. A shared part (the `config.json` entry, the
    `agent_model_state.json` pin) is judged by the CONTENT of that file AS IT
-   EXISTS IN THE APPROVED COMMIT'S TREE — present when that file's copy in the
+   EXISTS IN THE APPLIED COMMIT'S TREE — present when that file's copy in the
    commit carries the agent's own key — regardless of whether that file is
    itself among the commit's changed paths; an agent's registration is
    therefore NOT refused merely because a given apply's commit left the shared
@@ -367,7 +394,7 @@ not really running.
     host's own absolute form (`file://<root A or B>/<rel>`), mapping each to
     `(root, rel)` by the Requirement 2.8 boundary rule. A required prompt
     part SHALL count as present when `<rel>` exists as a regular, non-symlink
-    file in the approved commit's tree. A `<rel>` with an empty or `..`
+    file in the applied commit's tree. A `<rel>` with an empty or `..`
     segment, and an `agents/<name>.json` that does not parse as a JSON
     object, SHALL each make that registration incomplete (fail closed).
 13. A registration candidate SHALL be named only by a changed
@@ -378,7 +405,7 @@ not really running.
     to an incomplete registration.
 14. Shared-part evaluation (Requirement 5.6) SHALL read each shared file
     (`config.json`, `agent_model_state.json`) from its path WITHIN the
-    approved commit's checked-out tree — never from the live host — and
+    applied commit's checked-out tree — never from the live host — and
     SHALL count the part present whenever that file parses as a JSON object
     and carries the agent's own key at the required location (`agents.<name>`
     for `config.json`; top-level `<name>` for `agent_model_state.json`),
@@ -420,21 +447,21 @@ for normal practice.
    `instances.json` can import ssh host aliases, SSM targets, local/remote port
    pairs, and `remote_bin` paths belonging to a different machine, including a
    `was_connected` hint that drives lazy reconnect.
-4. WHEN an approved commit applies `crons.json` THEN every job it introduces or
+4. WHEN an applied commit applies `crons.json` THEN every job it introduces or
    modifies that carries a `command` SHALL be vetted by the same shell-command
    vet used at `cron_add` time, and a job that fails the vet — or whose vet
    raises — SHALL be DROPPED and reported as dropped.
-5. WHEN an approved commit applies `crons.json` THEN every surviving job
+5. WHEN an applied commit applies `crons.json` THEN every surviving job
    carrying a `command`, and every job naming a `script`, SHALL be imported
    PAUSED (user-paused) rather than live, and reported as paused; message-only
    jobs MAY be imported live.
-6. WHEN an approved commit applies `instances.json` THEN no instance SHALL be
+6. WHEN an applied commit applies `instances.json` THEN no instance SHALL be
    auto-connected as a result of the apply, regardless of any `was_connected`
    value in the pulled file.
 7. The apply result SHALL list, by name, every cron job dropped and every cron
    job paused, and every instance record added or changed, so the operator can
    see exactly what the exception admitted onto this host.
-8. WHEN an approved commit applies `hooks.json` or `mcp.json` THEN every
+8. WHEN an applied commit applies `hooks.json` or `mcp.json` THEN every
    command it introduces or changes SHALL be vetted by the same
    shell-command vet used at `cron_add` time (Requirement 6.4). A
    `hooks.json` shell-hook entry has no `args` field — its whole invocation
@@ -449,39 +476,54 @@ for normal practice.
    reported by name (hook name or MCP server name) — fail-closed, the same
    posture as Requirement 6.4's cron drop — and every other entry in that
    file SHALL still apply.
-10. Every hook or MCP server command added or changed by an approved commit
+10. Every hook or MCP server command added or changed by an applied commit
     — whether it survives the vet or is dropped under 6.9 — SHALL be listed
     by name in the apply result's `changed_commands` field (a list of
     `{file, name, command}` — `file` is `hooks.json` or `mcp.json`, `name`
     is the hook or server name, `command` is the vetted command string:
     the bare `command` for `hooks.json`, the joined `command`+`args` line
-    for `mcp.json`), and the SAME `changed_commands` entries SHALL already
-    be listed in the pending summary shown to the operator before they
-    approve, so the command is visible at approve time and not only after
-    the fact. Message-only cron jobs are unaffected by 6.8-6.10 and remain
-    governed solely by Requirement 6.5 (no vet applies to a job with no
-    `command`); this is a ratified non-change, not an oversight.
+    for `mcp.json`). Because there is no box-side approval step, there is no
+    pre-approval summary to populate — `changed_commands` SHALL be surfaced
+    once, in the apply result itself, immediately after the automatic apply
+    that introduced or changed the command runs, so the operator sees the
+    command as soon as it is possible to see it. Message-only cron jobs are
+    unaffected by 6.8-6.10 and remain governed solely by Requirement 6.5 (no
+    vet applies to a job with no `command`); this is a ratified non-change,
+    not an oversight.
 
 ### Requirement 7
 
 **User Story:** As a KiroCrew operator, I want a dashboard page that tells me
-the current sync state at a glance, so that I can see drift, the last push, and
-any pending pull without reading logs.
+the current sync state at a glance — including what the last automatic apply
+did and a way to undo it — so that I can see drift, the last push, and what
+landed from `main` without reading logs.
 
 #### Acceptance Criteria
 
-1. The app SHALL expose a dashboard page showing: the last successful push
-   (time, branch, PR URL), the current local drift state (tracked tree hash
-   differs from last pushed hash: yes/no), the last-seen bundle-repo commit, and
-   any pending unapproved commit.
-2. WHEN a pending commit exists THEN the page SHALL offer an approve action and
-   a decline action, and the approve action SHALL be the only route by which an
-   apply can begin.
-3. The page SHALL display the Requirement 6 exception call-out wherever
-   `crons.json` or `instances.json` appear in a pending change.
-4. WHEN the app is disabled THEN every backend route SHALL refuse the request,
+1. The app SHALL expose a dashboard page showing three status cards: (a) local
+   changes — whether the tracked tree currently differs from the last pushed
+   hash, with a "Push now" action; (b) last push — its time, branch, PR URL,
+   and whether that PR still needs merging (open) or has merged; (c) sync from
+   `main` — whether the instance is up to date with or currently applying the
+   bundle repository's head, the last-seen SHA, and the time of the last check.
+2. The page SHALL show a last-apply card carrying an Undo action, and
+   displaying: the merged PR(s) the applied range corresponds to (by URL/SHA),
+   every cron job imported paused together with its vetted command, every
+   not-applied path from a `partial` outcome together with its real per-path
+   reason, and every key path listed as needing a credential.
+3. The page SHALL show, for the current apply state, the four propagation
+   timing chips from Requirement 5.9: "live now", "live within 60s", "live in
+   a new session", and "live on next resolution" — rendered as distinct chips,
+   not collapsed into one status.
+4. The page SHALL display the Requirement 6 exception call-out wherever
+   `crons.json` or `instances.json` appear in the last-applied range.
+5. WHEN the app is disabled THEN every backend route SHALL refuse the request,
    so the app is inert until explicitly enabled.
-5. No UI field or API response SHALL contain an unredacted credential.
+6. No UI field or API response SHALL contain an unredacted credential.
+7. Every state-mutating POST route (push-now, undo) SHALL require the request
+   header `X-Config-Sync-Request: 1`; a request without it SHALL be refused,
+   so a request from outside the dashboard's own client cannot trigger a
+   mutation.
 
 ### Requirement 8
 

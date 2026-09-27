@@ -4,24 +4,19 @@
 
 This plan implements `config-sync` — the KiroCrew App Kit app that puts an
 instance's allowlisted configuration under git version control in
-`TGS-Labs/Kiro-Config-Bundles`, push (PR-only, redacted) and pull
-(notify-and-approve, per-class propagation): **8 top-level tasks / 35
-sub-tasks**, mapped onto design.md's **4 deployments**, each one PR into
+`TGS-Labs/Kiro-Config-Bundles`, push (PR-only, redacted) and pull (automatic
+apply on every merge to `main`, per-class propagation): **8 top-level tasks /
+35 sub-tasks**, mapped onto design.md's **4 deployments**, each one PR into
 `TGS-Labs/KiroCrewConfigSyncApp` that must merge and verify before the next.
 
-Design.md's two Open Design Decisions are **ratified inputs to this plan, not
-open questions**:
-
-1. **PR route = Buildo MCP.** The app's own context cannot open a PR
-   (`create_pull_request` disabled on the GitHub MCP PAT; no `gh` on host).
-   `push.py` stops at *branch pushed + PR pending*; a KiroCrew agent context
-   completes it via `buildo::create_pull_request`, **never passing
-   `merge_method`** (TGS-Labs repos disallow squash). `last_pushed_hash`
-   advances only once PR creation is confirmed (Requirement 2.6).
-2. **Skill-cache lag accepted.** The gateway's `_invalidate_iter_cache()` is
-   in-process, unreachable from this out-of-process backend; no in-gateway
-   refresh path is built. `propagate.py` reports the bounded staleness window
-   ("skill index visible within 60s") instead.
+Design.md's two Open Design Decisions are **ratified inputs, not open
+questions**: (1) **PR route = Buildo MCP** — `push.py` stops at *branch
+pushed + PR pending*; a KiroCrew agent context completes it via
+`buildo::create_pull_request`, never passing `merge_method`;
+`last_pushed_hash` advances only once PR creation is confirmed (Req 2.6).
+(2) **Skill-cache lag accepted** — the in-process invalidator is
+unreachable from this out-of-process backend; `propagate.py` reports the
+bounded staleness window ("skill index visible within 60s") instead.
 
 Phase 1 spans two top-level tasks and Phase 4 spans four (Tasks 5-8) because
 no top-level task may exceed 5 sub-tasks; their deployment boundary is
@@ -49,22 +44,23 @@ deployment has merged, per the folder-scoped PR-first workflow.
    call.
 3. **Deployment 3 — Pull detection.** Branch `feature/config-sync-poll` (from
    `main` after Deployment 2 merges). Ships `poll.py`, `classify.py`, the
-   pending record, the notification, poll cron wiring. Depends on: Deployment
-   2 (the bundle repo needs a config-sync commit to detect). Verified by: the
-   poll detects Deployment 2's merged commit, notifies once, does not
-   re-notify next tick, applies nothing.
+   `last_seen_sha`/`base_sha` state fields, the notification, poll cron
+   wiring. Depends on: Deployment 2 (the bundle repo needs a config-sync
+   commit to detect). Verified by: the poll detects Deployment 2's merged
+   commit and notifies once, does not re-notify next tick; nothing is
+   applied yet (the apply path is not built until Deployment 4).
 4. **Deployment 4 — Apply, propagation, and UI.** Branch
    `feature/config-sync-apply` (from `main` after Deployment 3 merges). Ships
    `apply.py`, `sanitize.py`, `propagate.py`, `registration.py`, `routes.py`,
    the dashboard page, `portable.py`, push tokenization, and the
-   `config-bundles/agent-prompts/*.md` allowlist entry. Depends on:
-   Deployment 3. Verified by: approving a pending commit touching a steering
-   file, a skill and `crons.json` applies all three, reports "live in a new
-   session" / "live now" / "skill index visible within 60s", lists the imported
-   cron job as paused; declining changes nothing; restore returns prior bytes;
-   the next push carries no absolute root path in any tracked JSON file and
-   includes the tracked prompt files, and applying that commit completes the
-   registration of an agent whose `prompt` is a tracked `file://` reference.
+   `config-bundles/agent-prompts/*.md` allowlist entry. Wires `poll.py` to
+   call `apply.py` automatically on every new head — the gate is the PR
+   merge into `main`; no approve/decline route. Depends on: Deployment 3.
+   Verified by: a merged commit touching steering, a skill and `crons.json`
+   applies automatically next tick, reports the four propagation states,
+   lists the cron paused; Undo restores prior bytes; `partial` leaves
+   `base_sha` unmoved and retries; a subsequent push carries no root path
+   and completes a tracked-prompt registration on apply.
 ## Tasks
 
 - [ ] 1. Tracked-file definition, safe collection, and durable state
@@ -97,12 +93,13 @@ deployment has merged, per the folder-scoped PR-first workflow.
     _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
 
   - [ ] 1.4 `backend/state.py` persists `last_pushed_hash`, `last_push`,
-        `last_seen_sha`, `pending`, bounded `history` and `restore_dirs` in one
-        JSON document under the app's own state directory — never inside either
-        tracked root, so app state cannot be swept into a commit. Writes are
-        atomic and a failed push leaves `last_pushed_hash` untouched.
+        `last_seen_sha`, `base_sha`, `last_apply`, bounded `history` and
+        `restore_dirs` in one JSON document under the app's own state
+        directory — never inside either tracked root, so app state cannot be
+        swept into a commit. Writes are atomic and a failed push leaves
+        `last_pushed_hash` untouched.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 2.2, 2.6, 2.7, 4.6, 4.7_
+    _Requirements: 2.2, 2.6, 2.7, 4.7_
 
   - [ ] 1.5 Checkpoint — Verify collection and state are complete and deployable
     → Agent: test-engineer
@@ -226,35 +223,34 @@ deployment has merged, per the folder-scoped PR-first workflow.
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 1.6, 4.3, 5.1, 6.10_
 
-  - [ ] 4.3 The poll writes a `pending` record (sha, author, subject, classified
-        paths) and notifies once, keyed on the SHA so the same commit does not
-        re-nag on every 15-minute tick; nothing is applied and the instance's
-        configuration stays byte-unchanged while a commit is pending or declined,
-        and no route or setting exists that would apply it automatically.
+  - [ ] 4.3 The poll notifies once per new head SHA (keyed on the SHA, no
+        re-nag before Deployment 4 wires in apply); nothing is applied yet
+        and configuration stays byte-unchanged; no apply route/setting
+        exists until Deployment 4.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.3, 4.4, 4.6, 4.9_
+    _Requirements: 4.3, 4.9_
 
   - [ ] 4.4 Checkpoint — Verify Deployment 3 detects and notifies, and is deployable
     → Agent: test-engineer
-    _Requirements: 4.1, 4.2, 4.6, 8.6_
+    _Requirements: 4.1, 4.2, 8.6_
 
     - Run tests, black, flake8, mypy; coverage ≥95% on the poll path
     - Confirm the poll detects Deployment 2's merged commit and notifies once
     - Confirm the next tick does not re-notify and nothing was applied
-    - Confirm no automatic-apply route, flag or env var exists
+    - Confirm no apply path exists yet (it ships in Deployment 4)
 
-- [ ] 5. Approved apply: backup, allowlist filter, sanitization, honest propagation
+- [ ] 5. Automatic apply: backup, allowlist filter, sanitization, honest propagation
 
-  - [ ] 5.1 `backend/apply.py` applies only on an explicit approval whose SHA
-        matches the pending record: it first records a restorable copy of every
-        file it will overwrite or delete, filters the commit to the allowlist
-        while reporting non-allowlisted paths as ignored, writes each file
-        atomically, and on partial failure reports applied vs not-applied lists
-        rather than success. Every `"<redacted>"` headers/env value in a pulled
-        file is replaced by the live value at the same key path; a key with no
-        live value keeps the placeholder and is listed as needing a credential.
-        A `partial` outcome does NOT resolve pending or advance `base_sha`
-        (re-approve safe, decline still works); only fully `applied` resolves.
+  - [ ] 5.1 `backend/apply.py` applies the changed-path range the poll hands
+        it automatically — no operator approval, no SHA to match: backs up
+        every file about to be overwritten/deleted, filters to the allowlist
+        (non-allowlisted paths reported ignored), writes atomically, and on
+        partial failure reports applied vs not-applied (each with its REAL,
+        specific reason) rather than success. Every `"<redacted>"`
+        headers/env value is replaced by the live value at that key path; a
+        missing live value keeps the placeholder, listed as needing a
+        credential. `partial` does NOT advance `base_sha` — the SAME range
+        retries automatically next tick; only fully `applied` advances it.
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 4.4, 4.5, 4.7, 4.8, 4.10, 4.14_
 
@@ -312,45 +308,53 @@ deployment has merged, per the folder-scoped PR-first workflow.
     - Confirm an apply result carries a distinct propagation state per file
     - Confirm backup exists for every applied file before the write, a bad
       `hooks.json`/`mcp.json` command is dropped and named, `partial` does
-      not resolve pending/advance `base_sha`, and a blocked sibling is named
+      not advance `base_sha` past the range's start, and a blocked sibling
+      is named
 
 - [ ] 6. Backend routes, restore, and the dashboard page
 
   - [ ] 6.1 `backend/routes.py` exposes status (push state, drift flag,
-        last-seen SHA, pending summary), drift (tree hash vs last pushed plus the
-        changed-file list), push-now, approve and decline — approve being the
-        only route from which an apply can begin — with every route refusing
-        while the app is disabled and no response field carrying an unredacted
-        credential. Decline calls `resolve_pending()` unconditionally; approve
-        calls `apply.py` then `resolve_pending()` only on `applied` (4.14
-        leaves `base_sha` unmoved on `partial`). Each route refuses if the
-        pending `sha` no longer matches what the operator saw (#65).
+        last-seen SHA, last-apply summary incl. outcome, not-applied paths
+        with real reasons, `changed_commands`), drift, push-now, and undo —
+        every route refuses while disabled, every mutating POST refuses
+        without header `X-Config-Sync-Request: 1`, no credential leaks. NO
+        approve/decline route: the poll cron alone calls `apply.py`.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.9, 4.14, 7.1, 7.2, 7.4, 7.5_
+    _Requirements: 4.9, 4.14, 7.1, 7.2, 7.4, 7.5, 7.7_
 
-  - [ ] 6.2 The restore route returns the instance to the exact bytes recorded
-        before a chosen apply, using only the local restore directory with no
-        second network round trip, and reports which files it restored.
+  - [ ] 6.2 The restore (Undo) route returns the instance to the exact bytes
+        recorded before a chosen apply, using only the local restore
+        directory (no second network round trip), requires
+        `X-Config-Sync-Request: 1`, and reports which files it restored.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.7, 4.8_
+    _Requirements: 4.7, 4.8, 7.7_
 
-  - [ ] 6.3 `ui/src/App.tsx` replaces the scaffold page with drift / last-push /
-        pending stat cards, a pending-commit card carrying approve and decline,
-        an apply-result panel that renders the four propagation states
-        distinctly, and the Requirement 6 exception call-out shown inline
-        whenever a pending change touches `crons.json` or `instances.json`.
+  - [ ] 6.3 `ui/src/App.tsx` replaces the scaffold page with the operator's
+        "Option A" layout: three stat cards (local changes + "Push now"; last
+        push with time/branch/PR URL + merge status; sync from `main` with
+        up-to-date/applying, last-seen SHA, last-checked time); a last-apply
+        card with Undo showing the merged PR(s), paused cron jobs with their
+        vetted commands, not-applied paths with real reasons (on `partial`),
+        and credential-needed key paths; the four propagation chips ("live
+        now" / "within 60s" / "new session" / "next resolution") rendered
+        distinctly; and the Requirement 6 call-out inline whenever
+        `crons.json`/`instances.json` appear in the last-applied range. No
+        approve/decline control anywhere. Every mutating fetch sends
+        `X-Config-Sync-Request: 1`.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 5.9, 6.2, 7.1, 7.2, 7.3_
+    _Requirements: 5.9, 6.2, 7.1, 7.2, 7.3, 7.7_
 
   - [ ] 6.4 Checkpoint — Verify routes, restore and the dashboard page are complete
     → Agent: test-engineer
-    _Requirements: 7.4, 8.6_
+    _Requirements: 7.4, 7.7, 8.6_
 
     - Run the full test suite, black, flake8, mypy; coverage ≥95%
-    - Confirm every route refuses while the app is disabled
-    - Approve a pending commit touching steering, a skill and `crons.json`;
-      confirm the reported propagation states and the paused cron job
-    - Confirm decline changes nothing and restore returns the prior bytes
+    - Confirm every route refuses while disabled and mutating POSTs refuse
+      without `X-Config-Sync-Request: 1`
+    - Confirm no approve/decline route or control anywhere
+    - Simulate a merged commit touching steering, a skill and `crons.json`
+      applying automatically; confirm propagation states and paused cron
+    - Confirm Undo restores the prior bytes
 
 - [ ] 7. Tracked agent prompts and host-portable agent definitions
 
@@ -484,12 +488,11 @@ wave exceeds 5; none spans a deployment boundary.
   a pair — `test-engineer` writes tests encoding the cited criteria and
   failing for the right reason, `software-engineer` makes them pass. Never
   edit a test to force green; use the `debugging` skill instead.
-- Requirement coverage: all 77 criteria are cited. Added after the original
-  56: 4.9 (Kiro-Config-Bundles#65, cited by 4.3); 4.10 (keep live
-  `headers`/`env` values, cited by 5.1); 1.7-1.8, 2.8-2.11, 4.11-4.13,
-  5.10-5.14 (prompt tracking and portable paths, cited by 5.4, 7.1-8.2);
-  6.8-6.10 (M5 hook/MCP vet, `changed_commands`); 5.15 (C3) and 4.14 (H4).
-  All operator-ratified; rationale lives in requirements.md.
+- Requirement coverage: 77 criteria cited; 4.6 is [Reserved] (box-side
+  decline, removed by the ruling) and deliberately uncited. Rationale for
+  every criterion added after the original 56 is in requirements.md.
+- Operator ruling: the approval gate is the PR merge into `main`; the poll
+  applies automatically. M3 is an out-of-scope follow-up in design.md.
 - Phase 1 spans Tasks 1-2, Phase 4 spans Tasks 5-8: no top-level task exceeds
   5 sub-tasks; the four deployment boundaries are unchanged.
 - Sub-task 3.4 adds `skills/complete-pr-handoff/SKILL.md`, narrowing design.md's

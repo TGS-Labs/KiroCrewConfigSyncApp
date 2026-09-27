@@ -5,10 +5,14 @@
 `config-sync` is a KiroCrew App Kit app with four moving parts and no ambient
 behaviour: a **collector** that reads an allowlisted slice of two configuration
 roots, a **redactor** that makes that slice safe to publish, a **pusher** that
-turns it into a pull request, and an **applier** that takes an approved upstream
-commit and lands it with the right cache invalidation per configuration class.
-Two zero-LLM crons drive it; one backend process serves state and the approval
-action; one dashboard page renders it.
+turns it into a pull request, and an **applier** that takes every commit that
+lands on the bundle repository's protected `main` and lands it on the box
+automatically, with the right cache invalidation per configuration class. Two
+zero-LLM crons drive it; one backend process serves state and the box's own
+mutating routes (push-now, undo); one dashboard page renders it. **The
+approval gate is the PR merge into `main` (branch-protected), not a box-side
+action** — there is no approve/decline route on the box; the poll IS the
+apply trigger.
 
 ```
                       ┌──────────────── PUSH (cron, command, zero LLM) ────────────────┐
@@ -20,19 +24,20 @@ action; one dashboard page renders it.
                        │     PR (never main) ─► record pushed hash ─► state.json        │
                        └───────────────────────────────────────────────────────────────┘
 
-                      ┌──────────────── PULL (cron, command, zero LLM) ────────────────┐
-  TGS-Labs/            │  git ls-remote default branch ─┬─ same head ─► exit 0         │
-  Kiro-Config-Bundles  │                                └─ new head ─► classify ─►     │
-  (target, unchanged)  │     notify (send_message) ─► pending in state.json            │
-                       └───────────────────────────────────────────────────────────────┘
-                                                │
-                       user approves in UI ─────┘
-                                                ▼
-                       ┌──────────────── APPLY (backend route, in request) ────────────┐
-                       │  backup ─► filter to allowlist ─► expand root tokens ─►       │
-                       │  restore redacted values ─► sanitize crons/instances ─►       │
-                       │  write ─► invalidate caches ─► per-class propagation report   │
-                       └──────────────────────────────────────────────────────────────┘
+           ┌────────────── PR MERGE (human review + merge into main; the      ──┐
+           │               approval gate — happens on GitHub, not on the box)   │
+           └─────────────────────────────────┬───────────────────────────────────┘
+                                              ▼
+                      ┌──────────────── POLL + AUTO-APPLY (cron, command, zero LLM, 15 min) ─┐
+  TGS-Labs/            │  git ls-remote default branch ─┬─ same head ─► exit 0                │
+  Kiro-Config-Bundles  │                                └─ new head ─► classify range         │
+  (target, unchanged)  │       base_sha..head ─► APPLY AUTOMATICALLY, no operator action:      │
+                       │       backup ─► filter to allowlist ─► expand root tokens ─►          │
+                       │       restore redacted values ─► sanitize crons/instances/hooks/mcp   │
+                       │       (fail-closed vet+drop) ─► write ─► invalidate caches ─►          │
+                       │       per-class propagation report ─► notify result (send_message) ─► │
+                       │       state.json (base_sha advances only on full `applied`)            │
+                       └───────────────────────────────────────────────────────────────────────┘
 ```
 
 Three invariants shape everything below:
@@ -41,8 +46,11 @@ Three invariants shape everything below:
    memory in the collector's output, before the working copy is written, so
    there is no window in which a live PAT exists inside the target repository's
    working tree or index.
-2. **Nothing enters the running instance without a human action.** The poll
-   notifies; only a backend route reached from the UI applies.
+2. **Nothing on `main` applies to the box without content-level safety
+   checks.** The human-in-the-loop gate is the PR merge into `main`, not a
+   box-side action; the poll applies automatically, but every apply still
+   runs through redaction/credential-restore, command vetting, paused cron
+   import, and no-half-registration unconditionally.
 3. **The app never claims a propagation it has not achieved.** Each
    configuration class has a verified propagation mechanism, and where the
    mechanism is bounded-stale rather than immediate, the apply result says so.
@@ -185,39 +193,38 @@ there is no proposal to score, no candidate to gate, no agent run to ledger.
 
 This flow assumes **one change in flight at a time**. If a new tree hash is
 pushed while an earlier push's PR is still unconfirmed, the earlier attempt's
-pending-PR record is treated as superseded: it is marked stale in state, not
+PR-pending record is treated as superseded: it is marked stale in state, not
 delivered, and not silently discarded. Two truly concurrent unconfirmed pushes
-are an edge case outside the ratified 15-minute notify-and-approve design, not
-the common path this component is built for.
+are an edge case outside the ratified 15-minute poll-and-auto-apply design,
+not the common path this component is built for.
 
-### `backend/poll.py` — the poll job (cron `command` target, 15 min)
+### `backend/poll.py` — the poll job (cron `command` target, 15 min, auto-applies)
 
-`git ls-remote <bundle-repo> <default-branch>` → head SHA. Unchanged → exit.
-Changed → fetch the changed-path list for the range `base_sha..head` (never
-`last_seen_sha..head` — see Data Flow: Pull and apply below), classify each
-path against the allowlist, and either start or ACCUMULATE INTO the `pending`
-record in state (merge, not overwrite, when a commit is already pending), then
-notify once. Re-notification is keyed on the head SHA, so a pending commit does
-not re-nag every 15 minutes. NOTE: as shipped in Deployment 3, an accumulating
-tick's notification carries the same head_sha/author/subject/touched_classes
-shape as a fresh one and does not itself distinguish "this replaces an earlier
-notification for a still-pending commit" from "this is a brand-new pending
-commit" — the operator can tell the two apart only by checking the app's own
-pending-record state (`base_sha` vs `pending.sha`). Making the notification
-text itself say "accumulated N commits since <base_sha>" is not built and is
-tracked as an open enhancement, not a Deployment 3 requirement.
+`git ls-remote <bundle-repo> <default-branch>` → head SHA. Unchanged → exit,
+nothing applied. Changed → fetch the changed-path list for the range
+`base_sha..head` (never `last_seen_sha..head` — see Data Flow: Pull and apply
+below), classify each path against the allowlist, and run `apply.py`
+AUTOMATICALLY over that range — no operator action, no pending-for-decision
+state. **The approval gate is the PR merge into `main`; the poll IS the apply
+trigger.** After the apply outcome is known, notify once with the commit(s)
+covered, the touched configuration classes, and the outcome (`applied` or
+`partial`). Re-notification for a range that is still `partial` is keyed on
+`base_sha` staying put, so an unresolved range does not re-nag with an
+identical message every 15 minutes; a NEW outcome (progress on retry, or a
+newly arrived commit extending the range) does notify again.
 
 Modelled on the polling shape of
 `kiro_crew/apps/builtins/ops_mission_control/backend/providers/github_issues.py`;
 no inbound webhook endpoint is assumed to exist.
 
-### `backend/apply.py` — the applier (backend route, human-triggered only)
+### `backend/apply.py` — the applier (invoked automatically by the poll)
 
-1. Refuse unless a `pending` record exists and the approved SHA matches it.
+1. Take the changed-path range `base_sha..head` computed by `poll.py`; there
+   is no separate approval SHA to match against — the range IS the input.
 2. Back up every file about to be written or deleted into a timestamped
    restore directory.
-3. Filter the commit's files to the allowlist; report non-allowlisted paths as
-   ignored.
+3. Filter the commit range's files to the allowlist; report non-allowlisted
+   paths as ignored.
 4. Expand every applied JSON file in the Requirement 2.8 scope
    (`portable.expand`, Requirement 4.11-4.13): tokens become this host's root
    paths; absolute values under neither local root are written unchanged and
@@ -236,23 +243,28 @@ no inbound webhook endpoint is assumed to exist.
     restored: a placeholder anywhere else (for example a cron `command`) is
     applied as committed. Without this step every apply would replace every
     live token with the placeholder.
-4b. Sanitize `crons.json` / `instances.json` (below), AFTER restore, so the
-    vet sees exactly the content that will be written.
+4b. Sanitize `crons.json` / `instances.json` / `hooks.json` / `mcp.json`
+    (below), AFTER restore, so the vet sees exactly the content that will be
+    written.
 5. Write files atomically (temp + rename) per file.
 6. Invalidate caches and build the per-class propagation report.
-7. On partial failure: report applied vs not-applied; never report success.
-8. **Partial outcome does not resolve pending, RESOLVED (H4).** WHEN the
-   apply outcome is `partial` THEN `state.py` SHALL NOT call
-   `resolve_pending()`: the pending record stays pending, `base_sha` does
-   NOT advance, and the not-applied paths plus their refusal reasons are
-   written back onto the pending record so `GET status`/`pending` shows them
-   immediately. `apply.py` is idempotent per file (a temp+rename write is a
-   no-op to reapply with the same content), so re-approving the same pending
-   record after a `partial` outcome is safe — files already correctly
-   applied are not corrupted by reapplying them — and decline still clears
-   the pending record and leaves the instance byte-unchanged, exactly as an
-   apply that was never attempted. Only an outcome of fully `applied` calls
-   `resolve_pending()`.
+7. On partial failure: report applied vs not-applied, each not-applied path
+   with its REAL, specific failure reason (never a generic placeholder);
+   never report success.
+8. **Partial outcome does not advance `base_sha`, RESOLVED (H4).** WHEN the
+   apply outcome is `partial` THEN `state.py` SHALL NOT advance `base_sha`:
+   the current range stays the retry target, and the not-applied paths plus
+   their real per-path failure reasons are written back onto state so `GET
+   status` shows them immediately. `apply.py` is idempotent per file (a
+   temp+rename write is a no-op to reapply with the same content), so the
+   NEXT scheduled poll tick retrying the same range is safe — files already
+   correctly applied are not corrupted by reapplying them. There is no
+   decline path to clear a range: a range that never fully applies simply
+   stays the retry target of every subsequent poll until either the
+   underlying cause is fixed by a later commit on `main`, or the operator
+   intervenes directly on the box (outside this app, e.g. fixing a local
+   permission issue). `base_sha` advances, past the retried range, ONLY when
+   an outcome is fully `applied`.
 
 ### `backend/propagate.py` — per-class propagation, verified
 
@@ -351,10 +363,12 @@ a hook/server either passes the vet and is written, or it is dropped — so
 the drop is the only bound on this half of the exception. Every added or
 changed hook/MCP command populates a `changed_commands: [{file, name,
 command}]` list — `command` being the bare hooks.json string or the joined
-mcp.json command+args line — surfaced twice: once in the `pending`
-classification the operator sees **before** approving (so the command is
-visible at decision time, not discovered only in the apply result after),
-and again, by the same shape, in the apply result once dropped or applied.
+mcp.json command+args line — surfaced in the apply result once dropped or
+applied, immediately after the automatic apply that introduced or changed
+the command runs. There is no box-side pre-approval step to surface it in a
+second time — the apply result IS the first and only time the operator sees
+it, which is also the earliest possible time now that the box itself never
+gates the change.
 Message-only cron jobs are outside this rule and stay governed solely by
 Requirement 6.5 — ratified as an explicit non-change.
 
@@ -365,34 +379,51 @@ Every drop, pause, and instance change is listed by name in the apply result.
 One JSON document under the app's own state directory (never inside either
 tracked root, so the app's state is not itself swept into a commit):
 `last_pushed_hash`, `last_push` (time/branch/PR URL/outcome), `last_seen_sha`,
-`base_sha` (the head as of the operator's last approve/decline, or the
-instance's first-ever polled commit before any decision — the range boundary
-`poll.py` classifies from; distinct from `last_seen_sha`, which advances every
-tick regardless of pending state), `pending` (sha/author/subject/classified
-paths, accumulated across ticks since `base_sha`), `history` (bounded), and
-`restore_dirs`.
+`base_sha` (the head as of the last apply outcome that was fully `applied`,
+or the instance's first-ever polled commit before any apply has ever fully
+succeeded — the range boundary `poll.py` classifies from; distinct from
+`last_seen_sha`, which advances every tick regardless of apply outcome),
+`last_apply` (sha/author/subject/classified paths/outcome/not-applied paths
+with real reasons — the most recent automatic apply attempt, `partial` or
+`applied`, replacing the old operator-facing `pending` record since there is
+no longer a decision to pend), `history` (bounded), and `restore_dirs`.
 
 ### `backend/routes.py` and the UI
 
 Routes on the scaffolded backend (`backend/server.py`, `port: "auto"`,
 `healthCheck: "/health"`), every one wrapped in an enabled check so the app is
-inert while disabled:
+inert while disabled. Every state-mutating POST additionally requires the
+header `X-Config-Sync-Request: 1` (Requirement 7.7) and is refused without it:
 
 | Route | Purpose |
 |---|---|
 | `GET /health` | Scaffold-provided liveness |
-| `GET /api/apps/config-sync/status` | Push state, drift flag, last-seen SHA, pending summary |
+| `GET /api/apps/config-sync/status` | Push state, drift flag, last-seen SHA, last-apply summary (outcome, not-applied paths + reasons, `changed_commands`) |
 | `GET /api/apps/config-sync/drift` | Collected-tree hash vs last pushed, with per-file changed list |
-| `POST /api/apps/config-sync/push` | Run the push now (same code path as the cron) |
-| `POST /api/apps/config-sync/pending/{sha}/approve` | The **only** path that applies |
-| `POST /api/apps/config-sync/pending/{sha}/decline` | Clear pending, change nothing |
-| `POST /api/apps/config-sync/restore/{id}` | Restore a backup from a previous apply |
+| `POST /api/apps/config-sync/push` | Run the push now (same code path as the cron); requires `X-Config-Sync-Request: 1` |
+| `POST /api/apps/config-sync/undo/{restore_id}` | Restore a backup from a previous apply; requires `X-Config-Sync-Request: 1` |
 
-`ui/src/App.tsx` replaces the scaffold placeholder with: `StatCard`s for drift /
-last push / pending, a pending-commit card carrying approve and decline, an
-apply-result panel that renders the four propagation states distinctly, and the
-Requirement 6 exception call-out rendered inline whenever a pending change
-touches `crons.json` or `instances.json`.
+There is deliberately **no approve or decline route**: the poll cron is the
+only caller of `apply.py`, and it calls it automatically on every new head.
+
+`ui/src/App.tsx` replaces the scaffold placeholder with the operator's chosen
+"Option A" layout:
+
+- **Three stat cards:** (1) local changes — drift flag with a "Push now"
+  button; (2) last push — time, branch, PR URL, and whether that PR still
+  needs merging or has merged; (3) sync from `main` — up-to-date / applying,
+  last-seen SHA, last-checked time.
+- **A last-apply card with Undo:** the merged PR(s) the applied range
+  corresponds to, every cron job imported paused with its vetted command,
+  every not-applied path from a `partial` outcome with its real per-path
+  reason, and every key path listed as needing a credential.
+- **Four propagation-timing chips** ("live now", "live within 60s", "live in
+  a new session", "live on next resolution") rendered distinctly for the
+  current apply state.
+- The Requirement 6 exception call-out rendered inline whenever
+  `crons.json` or `instances.json` appear in the last-applied range.
+
+Every mutating fetch from the UI sends `X-Config-Sync-Request: 1`.
 
 ## Data Flow
 
@@ -420,64 +451,60 @@ cron tick (command, 0 tokens)
 ```
 cron tick (command, 0 tokens, 15 min)
   └─ git ls-remote → head
-      ├─ == last_seen_sha ──► exit 0
-      └─ != ──► changed paths over range base_sha..head
-                  ├─ no existing pending ──► classify ──► state.pending
-                  │                                        (base_sha = head)
-                  └─ existing pending (base_sha unchanged) ──► classify
-                                          ──► ACCUMULATE into state.pending
-                                              (pending.sha = head,
-                                               base_sha still unchanged)
-                     └─► notify once (keyed on head sha)
-                                                              │
-                                        user clicks Approve or Decline (UI → route)
-                                                              │
-                              ┌───────────────── Decline ─────┴───── Approve ─────┐
-                              ▼                                                    ▼
-              base_sha := declined sha                        backup(files) ─► filter(allowlist) ─►
-              pending resolved, instance                       registration check (prompt part derived
-              byte-unchanged                                   from each agents/*.json `prompt`; shared
-                                                                 parts judged by commit-tree content) ─►
-                                                                 portable.expand(every in-scope JSON
-                                                                 file) ─► restore placeholders ─►
-                                                                 sanitize(crons/instances) ─► atomic
-                                                                 write ─► invalidate(skills cache) ─►
-                                                                 propagation report
-                                                                      ├─ partial ──► applied/not-applied
-                                                                      │   reported, NOT success; pending
-                                                                      │   NOT resolved, base_sha NOT
-                                                                      │   advanced (re-approve safe)
-                                                                      └─ fully applied ──► base_sha :=
-                                                                          approved sha, pending resolved;
-                                                                          per-file: live now | after
-                                                                          invalidation | new session |
-                                                                          next resolution
+      ├─ == last_seen_sha ──► exit 0, nothing applied
+      └─ != ──► changed paths over range base_sha..head ──► classify
+                  └─► apply.py AUTOMATICALLY, no operator action:
+                        backup(files) ─► filter(allowlist) ─►
+                        registration check (prompt part derived
+                        from each agents/*.json `prompt`; shared
+                        parts judged by commit-tree content) ─►
+                        portable.expand(every in-scope JSON
+                        file) ─► restore placeholders ─►
+                        sanitize(crons/instances/hooks/mcp,
+                        fail-closed vet+drop) ─► atomic
+                        write ─► invalidate(skills cache) ─►
+                        propagation report
+                             ├─ partial ──► applied/not-applied
+                             │   reported, NOT success; base_sha
+                             │   NOT advanced — the SAME range
+                             │   base_sha..head is retried on the
+                             │   NEXT poll tick automatically
+                             │   (extended to a new head if one
+                             │   arrived meanwhile); a later commit
+                             │   that fixes the failing path lets
+                             │   that retry apply it normally
+                             └─ fully applied ──► base_sha := head;
+                                 per-file: live now | after
+                                 invalidation | new session |
+                                 next resolution
+                        └─► notify once with outcome (keyed on
+                            base_sha staying put for a repeated
+                            `partial`; a changed outcome or a
+                            newly-extended range notifies again)
 ```
 
-**Accumulation, not replacement.** A poll tick's changed-path range is always
-computed from `base_sha` — the head commit as of the operator's LAST actual
-approve/decline decision (or the instance's first-ever polled commit, before
-any decision has been made) — never from `last_seen_sha`, which advances on
-every tick regardless of whether anything is pending. `base_sha` is a
-distinct, durable field in `state.py`, separate from both `last_seen_sha`
-(advances every tick) and `pending.sha` (always the newest head seen). While
-a commit is pending, a new head arriving on a later tick re-classifies the
-range `base_sha..new_head` and **merges** the result into the existing
-pending record (`pending.sha` moves to the new head; `pending.classified_paths`
-/ `pending.ignored_paths` / `pending.touched_classes` are the union over the
-full range, not the new tick's own commits alone) — it does not overwrite the
-record with only the newest tick's own changed paths. `base_sha` itself does
-not move while anything is pending; it only advances, to the SHA just
-decided, when the operator declines, or approves AND the resulting apply
-outcome is fully `applied` — a `partial` apply outcome leaves both `base_sha`
-and the pending record untouched (Requirement 4.14), so an approve that only
-partly lands is never mistaken for a decision made. This guarantees the operator
-is always shown the full accumulated diff since their last real decision,
-never a partial view that silently drops an earlier commit's still-unapplied
-changes — the defect this closes (Kiro-Config-Bundles#65): computing the
-range from `last_seen_sha` and overwriting `pending` on every changed tick
-silently dropped an earlier pending commit's files once a later commit's
-record replaced it.
+**Retry, not accumulate-for-approval.** A poll tick's changed-path range is
+always computed from `base_sha` — the head commit as of the LAST apply
+outcome that was fully `applied` (or the instance's first-ever polled
+commit, before any apply has ever fully succeeded) — never from
+`last_seen_sha`, which advances on every tick regardless of apply outcome.
+`base_sha` is a distinct, durable field in `state.py`, separate from
+`last_seen_sha` (advances every tick). While a range has not yet fully
+applied, a new head arriving on a later tick re-classifies the EXTENDED
+range `base_sha..new_head` and applies it automatically — the range grows to
+cover the new commit rather than being replaced by it, so an earlier
+still-unapplied path is never dropped from what the next automatic apply
+attempt covers. `base_sha` itself does not move on a `partial` outcome; it
+only advances, to the head that was just applied, when an apply outcome is
+fully `applied`. There is no decline path under the operator ruling (the
+approval gate moved to the PR merge into `main`): a range that keeps coming
+back `partial` simply keeps being retried, automatically, every 15 minutes,
+until either a later commit on `main` fixes the underlying cause or the
+operator intervenes directly on the box outside this app. This preserves
+the guarantee the original accumulate-not-overwrite design established
+(Kiro-Config-Bundles#65) — no unapplied path is ever silently dropped when a
+later commit arrives — while removing the box-side decision the original
+design gated that guarantee behind.
 
 ## Correctness and Security Properties
 
@@ -490,8 +517,15 @@ record replaced it.
 4. **PR-only.** `authorize_direct_push` + `is_protected_branch` mean `main` is
    unreachable by construction, matching the bundle repo's Buildo-required-PR
    protection.
-5. **No autonomous mutation of the host.** The only apply entry point requires a
-   matching approved SHA from a UI action.
+5. **The approval gate is the PR merge, and content safety runs
+   unconditionally.** There is no box-side apply entry point gated on a
+   human action — the poll calls `apply.py` automatically on every new head
+   on `main`. What bounds the blast radius is that `main` is itself
+   branch-protected (a human reviews and merges the PR before the change
+   ever reaches this property), and that every apply still runs redaction/
+   credential-restore, command vetting, paused cron import, and
+   no-half-registration unconditionally regardless of who or what triggered
+   it.
 6. **Bounded blast radius on the scope exception.** Imported commands are vetted,
    command/script jobs land paused, instances land disconnected.
 7. **Hardened git.** All git calls carry `GIT_SAFE_CONFIG` via `git_argv`.
@@ -525,7 +559,8 @@ record replaced it.
 | Expanded reference absent on this host | Written; reported as unresolved |
 | Cron `command` fails the vet | Job dropped and reported by name |
 | `hooks.json`/`mcp.json` command fails the vet, or the vet raises | Entry dropped from the applied file and reported by name in `changed_commands`; rest of the file still applies (fail-closed) |
-| Partial apply | Applied / not-applied lists reported; success NOT claimed; restore offered; pending record NOT resolved, `base_sha` NOT advanced (Requirement 4.14) — re-approve safe, decline still works |
+| Partial apply | Applied / not-applied lists reported with each not-applied path's real, specific reason; success NOT claimed; restore (Undo) offered; `base_sha` NOT advanced (Requirement 4.14) — the same range is retried automatically on the NEXT poll tick, no operator action needed |
+| A root path embedded inside a command STRING (e.g. a cron `command` or `script` argument), rather than in a `file://`/`skill://`-prefixed path value | NOT detected as non-portable by `portable.py` (Requirement 2.8 scope is path-shaped values, not arbitrary command text) — tracked as an explicit out-of-scope follow-up, M3, not fixed by this spec |
 | Skill cache invalidation unreachable | Reported as "live within 60s" rather than "live now" |
 | App disabled | Every route refuses |
 
@@ -541,14 +576,14 @@ config-sync/
 ├── assets/icon.png          ← replace placeholder
 ├── backend/
 │   ├── server.py            ← scaffold; extend with routes.py registration
-│   ├── routes.py            ← status / drift / push / approve / decline / restore
+│   ├── routes.py            ← status / drift / push / undo (no approve/decline)
 │   ├── allowlist.py         ← two roots + PropagationClass (data)
 │   ├── collect.py           ├─ walk + match
 │   ├── redact.py            ├─ structure-preserving value redaction
 │   ├── portable.py          ├─ root-path ⇄ token rewrite for agents/*.json
 │   ├── push.py              ├─ the push job
-│   ├── poll.py              ├─ the poll job
-│   ├── apply.py             ├─ approved-commit applier
+│   ├── poll.py              ├─ the poll job (also triggers apply automatically)
+│   ├── apply.py             ├─ applier, invoked by poll.py on every new head
 │   ├── registration.py      ├─ agent-registration transaction check
 │   ├── sanitize.py          ├─ crons/instances import rules
 │   ├── propagate.py         ├─ per-class invalidation + report
@@ -606,23 +641,31 @@ phase and one PR into `TGS-Labs/KiroCrewConfigSyncApp`.
 
 ### Deployment 3: Pull direction — poll and notify
 - Phase 3
-- Ships `poll.py`, the notification, the pending record, and the poll cron.
+- Ships `poll.py`, the notification, the `last_seen_sha`/`base_sha` state
+  fields, and the poll cron. (This phase predates the automatic-apply
+  wiring completed in Deployment 4 — at the end of Deployment 3 the poll
+  detects and notifies but the apply path does not exist yet.)
 - Depends on: Deployment 2 (the bundle repo must have a config-sync commit to
   detect).
 - Verified by: the poll detects the commit merged in Deployment 2, notifies
-  once, and does not re-notify on the following tick; nothing is applied.
+  once, and does not re-notify on the following tick; nothing is applied
+  (there is no apply path yet in this phase).
 
 ### Deployment 4: Apply, propagation, and UI
 - Phase 4
 - Ships `apply.py`, `sanitize.py`, `propagate.py`, `registration.py`,
   `portable.py`, the `config-bundles/agent-prompts/*.md` allowlist entry, push
-  tokenization, the routes, and the dashboard page.
+  tokenization, the routes, and the dashboard page. Wires `poll.py` to call
+  `apply.py` automatically on every new head — there is no approve/decline
+  route; the approval gate is the PR merge into `main`.
 - Depends on: Deployment 3.
-- Verified by: approving a pending commit that touches a steering file, a skill,
-  and `crons.json` applies all three, reports "live in a new session" for the
-  steering file, invalidates the skill cache (or reports the ≤60s window), and
-  lists the imported cron job as paused; declining changes nothing; restore
-  returns the instance to its prior bytes. Additionally: the next push after
+- Verified by: a merged commit that touches a steering file, a skill, and
+  `crons.json` is applied automatically by the next poll tick without any
+  operator action, reports "live in a new session" for the steering file,
+  invalidates the skill cache (or reports the ≤60s window), and lists the
+  imported cron job as paused; restore (Undo) returns the instance to its
+  prior bytes; a `partial` outcome leaves `base_sha` unmoved and is retried
+  automatically on the following tick. Additionally: the next push after
   install carries no absolute root path in any tracked JSON file and includes
   the tracked prompt files; applying that commit resolves every `file://`
   prompt into a tracked path and completes the registration, including when
@@ -631,8 +674,9 @@ phase and one PR into `TGS-Labs/KiroCrewConfigSyncApp`.
 
 ## Open Design Decisions
 
-Decisions 1, 2 and 4 were ratified by the operator and are resolved inputs to
-this plan, not open questions. Decision 3 remains unresolved.
+Decisions 1, 2, 4 and 5 were ratified by the operator and are resolved inputs
+to this plan, not open questions. Decision 3 remains unresolved. Decision 6
+(M3) is an explicit out-of-scope follow-up, not a defect this spec fixes.
 
 1. **Skill-cache invalidation from an out-of-process backend — RESOLVED.**
    The invalidator is an instance method (`_invalidate_iter_cache()`) on the
@@ -668,3 +712,32 @@ this plan, not open questions. Decision 3 remains unresolved.
    untracked (Requirement 1.8). A registration's shared parts are judged by
    the commit tree's content, not by whether the shared file changed in that
    commit (Requirement 5.14).
+5. **Pull approval gate — RESOLVED (operator ruling, supersedes the original
+   notify-and-approve design).** The approval gate for a pulled change is the
+   PR merge into `TGS-Labs/Kiro-Config-Bundles`'s branch-protected `main`,
+   not a box-side action. Anything on `main` is production configuration and
+   is applied to this box automatically on the next 15-minute poll — there is
+   no approve/decline route, UI control, or pending-for-operator-decision
+   state on the box. **Resolution: `poll.py` calls `apply.py` directly on
+   every new head**, running the identical apply path (backup, filter,
+   expand, restore, sanitize with fail-closed vet+drop, atomic write,
+   propagation report) that a box-side approval used to trigger. Every
+   box-side content-safety check remains unconditional. A `partial` outcome
+   does not advance `base_sha` and is retried automatically on the next tick
+   — see Requirement 4.14 and the H4 recast in `backend/apply.py` above.
+6. **Command strings that embed a root path (M3) — explicit out-of-scope
+   follow-up.** `portable.py`'s Requirement 2.8 scope covers path-SHAPED
+   JSON values (`file://`/`skill://`-prefixed strings, or bare absolute
+   paths in a recognized path field) — it does not parse or tokenize a root
+   path that appears embedded INSIDE an arbitrary command string, such as a
+   `crons.json` job's `command` field (e.g.
+   `"python3 /home/alice/.kiro/crew/scripts/foo.py"`) or an `mcp.json`
+   server's `args` entries that are not themselves whole path values. Such a
+   value is pushed and applied unchanged, and is NOT reported as
+   non-portable — this spec's non-portable reporting (Requirement 2.9, 4.12)
+   only fires for a value that IS a recognized path-shaped field. This is a
+   known gap, tracked here as an explicit follow-up (not a defect to fix in
+   this implementation): a future revision could extend `portable.py` to
+   tokenize a root-path substring found inside a larger command string, but
+   doing so correctly (without corrupting an unrelated substring match)
+   needs its own design pass and is out of scope for Deployment 4.
