@@ -14,16 +14,14 @@ open questions**:
 
 1. **PR route = Buildo MCP.** The app's own context cannot open a PR
    (`create_pull_request` disabled on the GitHub MCP PAT; no `gh` on host).
-   `push.py` stops at *branch pushed + PR pending* and hands off; a KiroCrew
-   agent context completes the PR via `buildo::create_pull_request`, **never
-   passing `merge_method`** (TGS-Labs repos disallow squash; passing it
-   silently fails to arm auto-merge). `last_pushed_hash` advances only once
-   PR creation is confirmed, so Requirement 2.6 holds across the handoff.
+   `push.py` stops at *branch pushed + PR pending*; a KiroCrew agent context
+   completes it via `buildo::create_pull_request`, **never passing
+   `merge_method`** (TGS-Labs repos disallow squash). `last_pushed_hash`
+   advances only once PR creation is confirmed (Requirement 2.6).
 2. **Skill-cache lag accepted.** The gateway's `_invalidate_iter_cache()` is
-   in-process, unreachable from the app's out-of-process backend. No
-   in-gateway refresh path is built. `propagate.py` reports the bounded
-   staleness window ("skill index visible within 60s") as its propagation
-   state.
+   in-process, unreachable from this out-of-process backend; no in-gateway
+   refresh path is built. `propagate.py` reports the bounded staleness window
+   ("skill index visible within 60s") instead.
 
 Phase 1 spans two top-level tasks and Phase 4 spans four (Tasks 5-8) because
 no top-level task may exceed 5 sub-tasks; their deployment boundary is
@@ -223,9 +221,10 @@ deployment has merged, per the folder-scoped PR-first workflow.
         Requirement 1 allowlist and each hit's `PropagationClass`, naming the
         tracked configuration classes the change touches and flagging
         non-allowlisted paths as ignorable; a test fails if any allowlist entry
-        is unclassifiable.
+        is unclassifiable. `hooks.json`/`mcp.json` changes populate
+        `changed_commands: [{file, name, command}]`.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 1.6, 4.3, 5.1_
+    _Requirements: 1.6, 4.3, 5.1, 6.10_
 
   - [ ] 4.3 The poll writes a `pending` record (sha, author, subject, classified
         paths) and notifies once, keyed on the SHA so the same commit does not
@@ -254,8 +253,10 @@ deployment has merged, per the folder-scoped PR-first workflow.
         rather than success. Every `"<redacted>"` headers/env value in a pulled
         file is replaced by the live value at the same key path; a key with no
         live value keeps the placeholder and is listed as needing a credential.
+        A `partial` outcome does NOT resolve pending or advance `base_sha`
+        (re-approve safe, decline still works); only fully `applied` resolves.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.4, 4.5, 4.7, 4.8, 4.10_
+    _Requirements: 4.4, 4.5, 4.7, 4.8, 4.10, 4.14_
 
   - [ ] 5.2 `backend/sanitize.py` bounds the Requirement 6 exception: a pulled
         cron job whose `command` fails the `cron_add`-time shell vet — or whose
@@ -263,9 +264,13 @@ deployment has merged, per the folder-scoped PR-first workflow.
         naming a `script` imports user-paused while message-only jobs may import
         live; `instances.json` records import disconnected regardless of
         `was_connected`; and every drop, pause and instance change is listed by
-        name in the result.
+        name in the result. The same vet runs over `hooks.json` (bare
+        `command`) and `mcp.json` (`command`+`args` joined); a failing/raising
+        entry is dropped, rest of the file still applies, and every
+        added/changed command populates `changed_commands: [{file, name,
+        command}]`. Message-only cron jobs are unaffected (ratified non-change).
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 6.4, 6.5, 6.6, 6.7_
+    _Requirements: 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10_
 
   - [ ] 5.3 `backend/propagate.py` reports a propagation state per applied file
         and never collapses them: `steering/**` "live in a new session" with no
@@ -288,21 +293,26 @@ deployment has merged, per the folder-scoped PR-first workflow.
         paths (Requirement 5.14): an already-registered agent's commit that
         touches only its own `agents/<name>.json` is complete when the
         commit tree's shared-file copies already carry its key; a new agent
-        absent from those copies stays incomplete. Also reports that
+        absent from those copies stays incomplete. A blocked shared file also
+        blocks every OTHER agent whose key is in it, named (Requirement
+        5.15) — no agent ends up half-registered. Also reports that
         `spawn_run`'s roster picks up an applied registration without a
-        restart. Tests: agent-JSON-only commit vs. already-carrying shared
-        tree → complete; vs. a tree missing the key → incomplete.
+        restart. Tests: agent-JSON-only commit vs. carrying tree → complete;
+        vs. missing key → incomplete; two sharing a blocked file, one
+        incomplete → other also blocked, named.
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 5.6, 5.7, 5.14_
+    _Requirements: 5.6, 5.7, 5.14, 5.15_
 
   - [ ] 5.5 Checkpoint — Verify the apply path is complete and deployable
     → Agent: test-engineer
-    _Requirements: 4.8, 5.9, 6.7, 8.6_
+    _Requirements: 4.8, 4.14, 5.9, 5.15, 6.7, 6.9, 8.6_
 
     - Run tests, black, flake8, mypy; coverage ≥95% on the apply path
     - Confirm a registration missing its `config.json` entry is refused
     - Confirm an apply result carries a distinct propagation state per file
-    - Confirm a backup directory exists for every applied file before the write
+    - Confirm backup exists for every applied file before the write, a bad
+      `hooks.json`/`mcp.json` command is dropped and named, `partial` does
+      not resolve pending/advance `base_sha`, and a blocked sibling is named
 
 - [ ] 6. Backend routes, restore, and the dashboard page
 
@@ -311,17 +321,12 @@ deployment has merged, per the folder-scoped PR-first workflow.
         changed-file list), push-now, approve and decline — approve being the
         only route from which an apply can begin — with every route refusing
         while the app is disabled and no response field carrying an unredacted
-        credential. Approve and decline call a single `resolve_pending()` in
-        `state.py` that advances `base_sha` to the decided SHA and clears the
-        pending record together (never one without the other), and each route
-        refuses if the pending record's `sha` no longer matches what the
-        operator actually saw (a poll tick accumulated a newer commit into it
-        after the approve/decline UI was rendered) — otherwise the operator's
-        decision would be applied against files they never reviewed, or a
-        declined commit's files would resurface on the next poll tick as if
-        never decided (Kiro-Config-Bundles#65).
+        credential. Decline calls `resolve_pending()` unconditionally; approve
+        calls `apply.py` then `resolve_pending()` only on `applied` (4.14
+        leaves `base_sha` unmoved on `partial`). Each route refuses if the
+        pending `sha` no longer matches what the operator saw (#65).
     → Agent: test-engineer (tests first), then software-engineer
-    _Requirements: 4.9, 7.1, 7.2, 7.4, 7.5_
+    _Requirements: 4.9, 4.14, 7.1, 7.2, 7.4, 7.5_
 
   - [ ] 6.2 The restore route returns the instance to the exact bytes recorded
         before a chosen apply, using only the local restore directory with no
@@ -462,16 +467,15 @@ deployment has merged, per the folder-scoped PR-first workflow.
 ```
 
 Wave 0 is five independent leaf modules (allowlist, redact, state, the two
-ported safety modules — no collisions). Wave 1 adds work needing them: the
-collector needs the allowlist; the manifest and README need the module set.
-Waves 4-5 serialize because 3.1-3.3 touch the push path in order; 3.4 is
-independent, rides in wave 3. Wave 11 serializes `apply.py` behind the
-sanitizer, propagation table and registration transaction it calls. Wave 14
-parallelizes the restore route and the UI. Waves 13-18 re-planned for Tasks
-7-8: 7.1/7.2 ride with 6.1 in wave 13; 7.3/7.5 need 7.2, ride with 6.2/6.3 in
-wave 14; 7.4 needs 7.5's `Result` field, wave 15; checkpoints run alone. 8.1
-is Phase 4's final implementation wave; 8.2 closes it. No wave exceeds 5; none
-spans a deployment boundary.
+ported safety modules). Wave 1 adds work needing them (collector needs the
+allowlist; manifest/README need the module set). Waves 4-5 serialize because
+3.1-3.3 touch the push path in order; 3.4 rides in wave 3 (independent). Wave
+11 serializes `apply.py` behind the sanitizer, propagation table and
+registration transaction it calls. Wave 14 parallelizes the restore route and
+the UI. Waves 13-18 (Tasks 7-8): 7.1/7.2 ride with 6.1 in wave 13; 7.3/7.5
+need 7.2, ride with 6.2/6.3 in wave 14; 7.4 needs 7.5's `Result` field, wave
+15; checkpoints run alone. 8.1 is Phase 4's final wave; 8.2 closes it. No
+wave exceeds 5; none spans a deployment boundary.
 
 ## Notes
 
@@ -480,19 +484,12 @@ spans a deployment boundary.
   a pair — `test-engineer` writes tests encoding the cited criteria and
   failing for the right reason, `software-engineer` makes them pass. Never
   edit a test to force green; use the `debugging` skill instead.
-- Requirement coverage: all 56 original criteria across Requirements 1-8 are
-  cited. Requirement 4.9 was added after Deployment 3's initial merge attempt
-  (Kiro-Config-Bundles#65 — a multi-commit-while-pending data-loss defect 4
-  review rounds missed) and is cited by 4.3's fix. Requirement 4.10 was added
-  when 5.1's tests found redaction covered only push: applying a pulled file
-  would replace every live `headers`/`env` credential with the placeholder.
-  Ratified (keep live values at the same key path); cited by 5.1.
-  Requirements 1.7, 1.8, 2.8-2.11, 4.11-4.13, 5.10-5.13 and 5.14 (14 criteria;
-  72 total) were added in Deployment 4, amending 1.1 and 5.6: registration
-  expected `agent-prompts/<name>.md`, which nothing tracks; pushed JSONs
-  embedded this host's home; and a registration was wrongly refused when its
-  shared files were unchanged in the commit but already key-carrying.
-  Operator-ratified; cited by 5.4, 7.1-8.2. All 72 criteria are cited.
+- Requirement coverage: all 77 criteria are cited. Added after the original
+  56: 4.9 (Kiro-Config-Bundles#65, cited by 4.3); 4.10 (keep live
+  `headers`/`env` values, cited by 5.1); 1.7-1.8, 2.8-2.11, 4.11-4.13,
+  5.10-5.14 (prompt tracking and portable paths, cited by 5.4, 7.1-8.2);
+  6.8-6.10 (M5 hook/MCP vet, `changed_commands`); 5.15 (C3) and 4.14 (H4).
+  All operator-ratified; rationale lives in requirements.md.
 - Phase 1 spans Tasks 1-2, Phase 4 spans Tasks 5-8: no top-level task exceeds
   5 sub-tasks; the four deployment boundaries are unchanged.
 - Sub-task 3.4 adds `skills/complete-pr-handoff/SKILL.md`, narrowing design.md's

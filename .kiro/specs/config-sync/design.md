@@ -241,6 +241,18 @@ no inbound webhook endpoint is assumed to exist.
 5. Write files atomically (temp + rename) per file.
 6. Invalidate caches and build the per-class propagation report.
 7. On partial failure: report applied vs not-applied; never report success.
+8. **Partial outcome does not resolve pending, RESOLVED (H4).** WHEN the
+   apply outcome is `partial` THEN `state.py` SHALL NOT call
+   `resolve_pending()`: the pending record stays pending, `base_sha` does
+   NOT advance, and the not-applied paths plus their refusal reasons are
+   written back onto the pending record so `GET status`/`pending` shows them
+   immediately. `apply.py` is idempotent per file (a temp+rename write is a
+   no-op to reapply with the same content), so re-approving the same pending
+   record after a `partial` outcome is safe — files already correctly
+   applied are not corrupted by reapplying them — and decline still clears
+   the pending record and leaves the instance byte-unchanged, exactly as an
+   apply that was never attempted. Only an outcome of fully `applied` calls
+   `resolve_pending()`.
 
 ### `backend/propagate.py` — per-class propagation, verified
 
@@ -288,6 +300,18 @@ incomplete on that part regardless. An incomplete registration blocks its own
 parts; its prompt only when no complete registration in the commit also
 references it.
 
+**Collateral blocking on a shared file, RESOLVED (C3).** A shared file
+(`config.json`, `agent_model_state.json`) is applied or refused as ONE FILE,
+not per agent key — so when one agent named in the commit is incomplete and
+that blocks the shared file from applying, every OTHER agent whose key is
+also present in that same committed copy is blocked on that shared file too,
+even though its own registration would otherwise be complete. `registration.py`
+reports each such agent explicitly as incomplete, naming the blocking agent
+and the file, rather than silently declining to write its shared entry. This
+is what Requirement 5.15 rules out: no agent ends an apply half-registered —
+`agents/<name>.json` written, `config.json` entry withheld — because a
+sibling agent in the same commit broke the shared file for everyone.
+
 ### `backend/sanitize.py` — the Requirement 6 exception, bounded
 
 `crons.json` and `instances.json` are tracked by explicit user ruling. They are a
@@ -311,6 +335,28 @@ The design bounds that risk by reusing KiroCrew's own import posture from
 - `instances.json` records import **disconnected**, regardless of
   `was_connected`. There is no upstream sanitizer for this file, so this app
   owns the rule.
+
+**`hooks.json` and `mcp.json` commands get the same vet, RESOLVED (M5).** A
+pulled `hooks.json` hook's `command`, and a pulled `mcp.json` server's
+launch `command`+`args` joined into one line, are launchable commands
+exactly like a cron `command` — nothing about them is less dangerous — so
+`sanitize.py` vets both files with the identical `cron_add`-time shell vet,
+not a second bespoke check. `hooks.json` has no `args` field to join: the
+vet runs on the bare `command` string. An entry that fails the vet, or
+whose vet raises, is **dropped** from the applied file (fail-closed, same
+posture as the cron drop) and reported by name (hook name / MCP server
+name); every other entry in that file still applies. Unlike a cron job
+there is no "import paused" state for a hook or MCP entry to fall back to —
+a hook/server either passes the vet and is written, or it is dropped — so
+the drop is the only bound on this half of the exception. Every added or
+changed hook/MCP command populates a `changed_commands: [{file, name,
+command}]` list — `command` being the bare hooks.json string or the joined
+mcp.json command+args line — surfaced twice: once in the `pending`
+classification the operator sees **before** approving (so the command is
+visible at decision time, not discovered only in the apply result after),
+and again, by the same shape, in the apply result once dropped or applied.
+Message-only cron jobs are outside this rule and stay governed solely by
+Requirement 6.5 — ratified as an explicit non-change.
 
 Every drop, pause, and instance change is listed by name in the apply result.
 
@@ -385,18 +431,27 @@ cron tick (command, 0 tokens, 15 min)
                      └─► notify once (keyed on head sha)
                                                               │
                                         user clicks Approve or Decline (UI → route)
-                                                              ▼
-                                        base_sha := the approved/declined sha
                                                               │
-                                              (Approve only, continues:)
-                                                              ▼
-       backup(files) ─► filter(allowlist) ─► registration check (prompt part
-         derived from each agents/*.json `prompt`; shared parts judged by
-         commit-tree content) ─► portable.expand(every in-scope JSON file)
-         ─► restore placeholders ─► sanitize(crons/instances)
-         ─► atomic write ─► invalidate(skills cache) ─► propagation report
-              ├─ partial failure ──► report applied / not-applied, NOT success
-              └─ success ──► per-file: live now | after invalidation | new session | next resolution
+                              ┌───────────────── Decline ─────┴───── Approve ─────┐
+                              ▼                                                    ▼
+              base_sha := declined sha                        backup(files) ─► filter(allowlist) ─►
+              pending resolved, instance                       registration check (prompt part derived
+              byte-unchanged                                   from each agents/*.json `prompt`; shared
+                                                                 parts judged by commit-tree content) ─►
+                                                                 portable.expand(every in-scope JSON
+                                                                 file) ─► restore placeholders ─►
+                                                                 sanitize(crons/instances) ─► atomic
+                                                                 write ─► invalidate(skills cache) ─►
+                                                                 propagation report
+                                                                      ├─ partial ──► applied/not-applied
+                                                                      │   reported, NOT success; pending
+                                                                      │   NOT resolved, base_sha NOT
+                                                                      │   advanced (re-approve safe)
+                                                                      └─ fully applied ──► base_sha :=
+                                                                          approved sha, pending resolved;
+                                                                          per-file: live now | after
+                                                                          invalidation | new session |
+                                                                          next resolution
 ```
 
 **Accumulation, not replacement.** A poll tick's changed-path range is always
@@ -413,7 +468,10 @@ pending record (`pending.sha` moves to the new head; `pending.classified_paths`
 full range, not the new tick's own commits alone) — it does not overwrite the
 record with only the newest tick's own changed paths. `base_sha` itself does
 not move while anything is pending; it only advances, to the SHA just
-decided, when the operator approves or declines. This guarantees the operator
+decided, when the operator declines, or approves AND the resulting apply
+outcome is fully `applied` — a `partial` apply outcome leaves both `base_sha`
+and the pending record untouched (Requirement 4.14), so an approve that only
+partly lands is never mistaken for a decision made. This guarantees the operator
 is always shown the full accumulated diff since their last real decision,
 never a partial view that silently drops an earlier commit's still-unapplied
 changes — the defect this closes (Kiro-Config-Bundles#65): computing the
@@ -461,11 +519,13 @@ record replaced it.
 | Commit contains non-allowlisted paths | Those paths ignored and reported; the rest applies |
 | Incomplete agent registration (a required part missing, unparseable definition, non-string `prompt`, or unsafe prompt path) | That registration refused and reported; other files still apply |
 | Agent registration whose shared file (`config.json`/`agent_model_state.json`) did not change in this commit but already carries the agent's key in the commit tree | Shared part counts present; registration proceeds (Requirement 5.14) |
+| One agent's incomplete registration blocks a shared file (`config.json`/`agent_model_state.json`) that also carries another, otherwise-complete agent's key | That other agent is ALSO blocked on the shared file and reported incomplete, naming the blocking agent and file — never half-registered (Requirement 5.15) |
 | Agent `prompt` references an untracked location | Prompt not required; reported; registration proceeds on its other parts |
 | Absolute path outside both roots in a Requirement 2.8-scoped file | Push: left unchanged, reported as non-portable. Apply: written unchanged, reported as non-portable |
 | Expanded reference absent on this host | Written; reported as unresolved |
 | Cron `command` fails the vet | Job dropped and reported by name |
-| Partial apply | Applied / not-applied lists reported; success NOT claimed; restore offered |
+| `hooks.json`/`mcp.json` command fails the vet, or the vet raises | Entry dropped from the applied file and reported by name in `changed_commands`; rest of the file still applies (fail-closed) |
+| Partial apply | Applied / not-applied lists reported; success NOT claimed; restore offered; pending record NOT resolved, `base_sha` NOT advanced (Requirement 4.14) — re-approve safe, decline still works |
 | Skill cache invalidation unreachable | Reported as "live within 60s" rather than "live now" |
 | App disabled | Every route refuses |
 

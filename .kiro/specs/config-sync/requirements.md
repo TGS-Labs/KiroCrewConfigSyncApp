@@ -276,6 +276,18 @@ behaviour behind my back.
     reference, and SHALL NOT refuse the file — an agent resource under an
     untracked location such as `config-bundles/skills/` is delivered by that
     location's own mechanism, not by this app.
+14. WHEN an approval's apply outcome is `partial` (Requirement 4.8) THEN the
+    pending record SHALL NOT be resolved and `base_sha` SHALL NOT advance;
+    the pending record SHALL be updated to carry the not-applied paths and
+    their refusal reasons from that apply attempt, and this SHALL be visible
+    in the app's status/pending display (Requirement 7.1). Re-approving the
+    same pending record SHALL be safe — the apply routine SHALL be
+    idempotent, so a file already correctly applied in the failed attempt
+    SHALL NOT be reapplied incorrectly or duplicated — and declining the
+    pending record SHALL still work and SHALL leave the instance
+    byte-unchanged, exactly as Requirement 4.6 specifies for a never-applied
+    commit. `base_sha` SHALL advance, and the pending record SHALL resolve,
+    ONLY WHEN an apply's outcome is fully `applied` — never on `partial`.
 
 ### Requirement 5
 
@@ -374,6 +386,17 @@ not really running.
     list. A shared file that does not exist at all in the commit's tree, or
     that does not parse as a JSON object, SHALL make that part absent for
     every agent (fail closed).
+15. WHEN `config.json` or `agent_model_state.json` is blocked from applying
+    because the registration of an agent NAMED IN THE COMMIT is incomplete
+    (Requirement 5.6) THEN EVERY OTHER agent whose key is ALSO present in
+    that same committed shared file SHALL be blocked on that shared file too
+    — its own `agents/<name>.json` in the commit, if any, SHALL NOT be
+    applied — and the apply result SHALL report each such agent as
+    incomplete, naming the blocking agent and the shared file. No agent
+    SHALL ever end an apply half-registered — with, for example, its
+    `agents/<name>.json` written but its `config.json` entry withheld — as a
+    side effect of a DIFFERENT agent's incomplete registration in the same
+    commit.
 
 ### Requirement 6
 
@@ -411,6 +434,33 @@ for normal practice.
 7. The apply result SHALL list, by name, every cron job dropped and every cron
    job paused, and every instance record added or changed, so the operator can
    see exactly what the exception admitted onto this host.
+8. WHEN an approved commit applies `hooks.json` or `mcp.json` THEN every
+   command it introduces or changes SHALL be vetted by the same
+   shell-command vet used at `cron_add` time (Requirement 6.4). A
+   `hooks.json` shell-hook entry has no `args` field — its whole invocation
+   is the single `command` string — so the vet SHALL run over that
+   `command` string alone. An `mcp.json` server entry's launch `command` and
+   `args` SHALL be joined into one command line (`command` followed by each
+   `args` element, shell-quoted) before the vet runs, so the vet sees
+   exactly what the launcher will execute, matching how `cron_add`'s vet is
+   applied to a cron `command`.
+9. WHEN a `hooks.json` or `mcp.json` command fails that vet, or the vet
+   raises, THEN that entry SHALL be DROPPED from the applied file and
+   reported by name (hook name or MCP server name) — fail-closed, the same
+   posture as Requirement 6.4's cron drop — and every other entry in that
+   file SHALL still apply.
+10. Every hook or MCP server command added or changed by an approved commit
+    — whether it survives the vet or is dropped under 6.9 — SHALL be listed
+    by name in the apply result's `changed_commands` field (a list of
+    `{file, name, command}` — `file` is `hooks.json` or `mcp.json`, `name`
+    is the hook or server name, `command` is the vetted command string:
+    the bare `command` for `hooks.json`, the joined `command`+`args` line
+    for `mcp.json`), and the SAME `changed_commands` entries SHALL already
+    be listed in the pending summary shown to the operator before they
+    approve, so the command is visible at approve time and not only after
+    the fact. Message-only cron jobs are unaffected by 6.8-6.10 and remain
+    governed solely by Requirement 6.5 (no vet applies to a job with no
+    `command`); this is a ratified non-change, not an oversight.
 
 ### Requirement 7
 
