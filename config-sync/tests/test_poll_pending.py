@@ -60,8 +60,23 @@ from backend import classify, poll, state
 def isolated_state_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Path]:
+    """Isolates the app's own state dir AND both tracked config roots.
+
+    Every test in this file drives a real `poll.run()` tick on a changed
+    head, and under the auto-apply ruling (requirements.md 4.4) that
+    always materializes and applies the new commit for real — so
+    KIROCREW_HOME/KIRO_HOME must be pinned to a tmp_path-scoped directory
+    here, once, rather than in every individual test, or an unpinned test
+    would let `apply_commit` write into the real host home directory.
+    """
     state_dir = tmp_path / "state"
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    kirocrew_home = tmp_path / "kirocrew_home"
+    kiro_home = tmp_path / "kiro_home"
+    kirocrew_home.mkdir(parents=True, exist_ok=True)
+    kiro_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("KIROCREW_HOME", str(kirocrew_home))
+    monkeypatch.setenv("KIRO_HOME", str(kiro_home))
     yield state_dir
 
 
@@ -223,11 +238,19 @@ def test_changed_head_records_pending_via_state_set_pending(
     bundle_remote: dict,
     notify_spy: MagicMock,
 ) -> None:
-    """WHEN poll detects a new head THEN `state.set_pending` is called with
+    """WHEN poll detects a new head THEN it fetches, classifies, and
 
-    the SHA, author, subject and classified paths of the new commit
-    (requirements.md 4.3, design.md "write a `pending` record (sha,
-    author, subject, classified paths)").
+    notifies with the SHA, author, subject and classified paths of the
+    new commit (requirements.md 4.3, design.md "write a `pending` record
+    (sha, author, subject, classified paths)").
+
+    Under the auto-apply ruling (requirements.md 4.4/4.9) a fully-applied
+    commit resolves its own pending record in the SAME tick, so
+    `state.pending` is `None` again by the time `run()` returns — the
+    record's fields (sha/author/subject/classified paths) are asserted
+    against the notify call instead, which `run()` makes with exactly
+    those values before resolving pending, and against `last_apply`,
+    which records the sha this commit was actually applied under.
     """
     store = state.load_state()
     store.record_seen_sha(bundle_remote["old_sha"])
@@ -241,16 +264,21 @@ def test_changed_head_records_pending_via_state_set_pending(
 
     poll.run()
 
+    notify_spy.assert_called_once()
+    _, notify_kwargs = notify_spy.call_args
+    assert notify_kwargs["head_sha"] == new_sha
+    assert notify_kwargs["author"] == "Alice"
+    assert notify_kwargs["subject"] == "add steering doc"
+
     reloaded = state.load_state()
-    pending = reloaded.pending
-    assert pending is not None, (
-        "poll.run() did not record a pending state via state.set_pending "
-        "on a changed-head tick"
+    assert reloaded.pending is None, (
+        "a fully-applied commit must resolve its own pending record in "
+        "the same tick (requirements.md 4.4) — there is no operator "
+        "decision step left to hold it open for"
     )
-    assert pending["sha"] == new_sha
-    assert pending["author"] == "Alice"
-    assert pending["subject"] == "add steering doc"
-    assert "steering/bar.md" in pending["classified_paths"]
+    assert reloaded.last_apply is not None
+    assert reloaded.last_apply["sha"] == new_sha
+    assert "steering/bar.md" in reloaded.last_apply["applied"]
 
 
 def test_changed_head_notifies_exactly_once(
@@ -358,10 +386,14 @@ def test_second_tick_with_same_pending_head_leaves_pending_record_intact(
     bundle_remote: dict,
     notify_spy: MagicMock,
 ) -> None:
-    """A repeat sighting of the same already-pending SHA must not overwrite
+    """A repeat tick that resolves the SAME already-applied head must be a
 
-    or clear the existing pending record (still keyed on the same SHA)
-    while the operator has neither approved nor declined it.
+    clean no-op — under the auto-apply ruling the first tick both applies
+    and resolves the commit in one step, so there is no pending record
+    left to leave "intact"; instead this asserts the no-op property the
+    original pending-record-stability check was really protecting: a
+    second tick against the identical head neither re-notifies nor
+    changes `last_apply`'s record of the applied commit.
     """
     store = state.load_state()
     store.record_seen_sha(bundle_remote["old_sha"])
@@ -374,58 +406,35 @@ def test_second_tick_with_same_pending_head_leaves_pending_record_intact(
     )
 
     poll.run()
-    pending_after_tick_1 = state.load_state().pending
-    assert pending_after_tick_1 is not None
-    new_sha = pending_after_tick_1["sha"]
+    reloaded_after_tick_1 = state.load_state()
+    assert reloaded_after_tick_1.pending is None
+    last_apply_after_tick_1 = reloaded_after_tick_1.last_apply
+    assert last_apply_after_tick_1 is not None
+    applied_sha = last_apply_after_tick_1["sha"]
 
     poll.run()
 
-    pending_after_tick_2 = state.load_state().pending
-    assert pending_after_tick_2 is not None, (
-        "the pending record must still exist after a repeat sighting of "
-        "the same not-yet-acted-on SHA"
+    reloaded_after_tick_2 = state.load_state()
+    assert reloaded_after_tick_2.pending is None, (
+        "a repeat tick against the same already-applied head must not "
+        "create a new pending record"
     )
-    assert pending_after_tick_2["sha"] == new_sha, (
-        "a repeat sighting of the same pending SHA must not replace the "
-        "pending record with a different identity"
+    assert reloaded_after_tick_2.last_apply == last_apply_after_tick_1, (
+        "a repeat tick against the identical already-applied head must "
+        "not change the recorded last_apply summary"
     )
-    assert pending_after_tick_2["author"] == pending_after_tick_1["author"]
-    assert pending_after_tick_2["subject"] == pending_after_tick_1["subject"]
+    assert reloaded_after_tick_2.last_apply["sha"] == applied_sha
+    assert notify_spy.call_count == 1, (
+        "a repeat tick resolving the same already-seen head must not "
+        f"send a second notification; got {notify_spy.call_count} total"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Requirement 4.6 — while pending (not yet acted on), the instance's own
-# configuration is byte-unchanged and no apply-triggering call exists in
-# this wiring's code path.
+# Requirement 4.4/4.6 — an automatic apply only ever touches the paths the
+# applied commit actually changed; it must never disturb unrelated existing
+# content already living under either tracked root.
 # ---------------------------------------------------------------------------
-
-
-def test_pending_tick_never_imports_or_calls_apply(
-    isolated_state_dir: Path,
-    bundle_remote: dict,
-    notify_spy: MagicMock,
-) -> None:
-    """WHILE a commit is pending (not yet approved/declined) THE poll
-
-    module must contain no call to any apply-triggering function —
-    asserted by confirming `backend.poll` never imports `backend.apply`
-    (which does not exist yet per this deployment's scope, design.md
-    Deployment 3 vs Deployment 4) and exposes no attribute whose name
-    suggests one (requirements.md 4.6: "no route/flag/env var exists that
-    would auto-apply").
-    """
-    import sys
-
-    assert "backend.apply" not in sys.modules or not any(
-        name for name in dir(poll) if "apply" in name.lower()
-    ), "backend/poll.py must not import or reference an apply-triggering call"
-
-    apply_like_names = [name for name in dir(poll) if "apply" in name.lower()]
-    assert apply_like_names == [], (
-        f"backend/poll.py exposes apply-like names {apply_like_names}; "
-        "the pending/notify-once wiring (Deployment 3) must not auto-apply "
-        "anything — apply is Deployment 4's approved-only route"
-    )
 
 
 def test_pending_tick_does_not_write_to_either_tracked_root(
@@ -435,17 +444,17 @@ def test_pending_tick_does_not_write_to_either_tracked_root(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """WHILE a commit is pending THE instance's own configuration roots
+    """An automatic apply must not disturb unrelated, pre-existing content
 
-    (KIROCREW_HOME / KIRO_HOME) must be byte-unchanged by the poll tick —
-    the ONLY things this tick writes are to the app's own state directory
-    (`CONFIG_SYNC_STATE_DIR`), never into either tracked root
-    (requirements.md 4.6).
+    under either tracked root (KIROCREW_HOME / KIRO_HOME) — only the
+    relpaths the applied commit itself changed are touched
+    (requirements.md 4.4/4.14). The sentinel files here are not part of
+    the pushed commit, so they must remain byte-unchanged even though
+    this tick DOES auto-apply the commit's own new file elsewhere under
+    the same roots.
     """
     kirocrew_home = tmp_path / "kirocrew_home"
     kiro_home = tmp_path / "kiro_home"
-    kirocrew_home.mkdir()
-    kiro_home.mkdir()
     sentinel_a = kirocrew_home / "steering" / "untouched.md"
     sentinel_a.parent.mkdir(parents=True)
     sentinel_a.write_bytes(b"original content A")
@@ -462,19 +471,19 @@ def test_pending_tick_does_not_write_to_either_tracked_root(
     _push_new_commit(
         bundle_remote["seed_dir"],
         relpath="steering/x.md",
-        content="pending, not applied\n",
-        subject="pending, not applied",
+        content="applied automatically\n",
+        subject="applied automatically",
     )
 
     poll.run()
 
     assert sentinel_a.read_bytes() == b"original content A", (
-        "poll.run() must not write into the KIROCREW_HOME tracked root "
-        "while a commit is only pending"
+        "an automatic apply must not touch unrelated pre-existing content "
+        "under the KIROCREW_HOME tracked root"
     )
     assert sentinel_b.read_bytes() == b"original content B", (
-        "poll.run() must not write into the KIRO_HOME tracked root while "
-        "a commit is only pending"
+        "an automatic apply must not touch unrelated pre-existing content "
+        "under the KIRO_HOME tracked root"
     )
 
 
@@ -490,14 +499,20 @@ def test_changed_head_that_is_a_merge_commit_still_reports_changed_paths(
     isolated_state_dir: Path,
     bundle_remote: dict,
     notify_spy: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """WHEN the new head is a MERGE commit (parents=[previous-main,
 
-    feature-branch-tip]) THEN the pending record's classified paths still
-    include the file the merge brought in — proving H4's fix against a
-    real merge in the SAME remote a poll tick actually reads, not just
-    the standalone fixture in test_poll_fetch_commit_details.py.
+    feature-branch-tip]) THEN the file the merge brought in is still
+    classified AND automatically applied to the live root — proving H4's
+    fix against a real merge in the SAME remote a poll tick actually
+    reads, not just the standalone fixture in
+    test_poll_fetch_commit_details.py. Checked via `last_apply`/the live
+    root rather than `pending`, since a fully-applied commit resolves its
+    own pending record in the same tick under the auto-apply ruling.
     """
+    kirocrew_home = tmp_path / "kirocrew_home"
     seed_dir = bundle_remote["seed_dir"]
     old_sha = bundle_remote["old_sha"]
 
@@ -526,10 +541,15 @@ def test_changed_head_that_is_a_merge_commit_still_reports_changed_paths(
 
     poll.run()
 
-    pending = state.load_state().pending
-    assert pending is not None
-    assert pending["sha"] == merge_sha
-    assert "steering/merged_in.md" in pending["classified_paths"], (
-        f"a merge commit's incoming file must appear in the classified "
-        f"paths; got {pending['classified_paths']!r}"
+    reloaded = state.load_state()
+    assert reloaded.pending is None
+    last_apply = reloaded.last_apply
+    assert last_apply is not None
+    assert last_apply["sha"] == merge_sha
+    assert "steering/merged_in.md" in last_apply["applied"], (
+        f"a merge commit's incoming file must be applied; got "
+        f"{last_apply['applied']!r}"
     )
+    assert (kirocrew_home / "steering" / "merged_in.md").read_text(
+        encoding="utf-8"
+    ) == "brought in by the merge\n"

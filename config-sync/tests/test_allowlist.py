@@ -156,6 +156,10 @@ EXPECTED_CLASSIFICATION = {
     ("A", "mcp.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
     ("A", "crons.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
     ("A", "instances.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
+    (
+        "A",
+        "config-bundles/agent-prompts/*.md",
+    ): allowlist.PropagationClass.LIVE_IN_NEW_SESSION,
     ("B", "agents/*.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
 }
 
@@ -218,6 +222,7 @@ def test_root_a_entries_cover_every_required_config_class() -> None:
         "mcp.json": True,
         "crons.json": True,
         "instances.json": True,
+        "config-bundles/agent-prompts/senior-reviewer.md": True,
     }
     for relpath in required_hits:
         assert allowlist.is_tracked("A", relpath), (
@@ -389,6 +394,76 @@ def test_root_a_top_level_singleton_files_are_exact_matches_only(relpath: str) -
     """
     assert allowlist.is_tracked("A", relpath)
     assert not allowlist.is_tracked("A", f"nested/dir/{relpath}")
+
+
+# ---------------------------------------------------------------------------
+# tasks.md 7.1 / requirements.md 1.1, 1.6, 1.7, 1.8, 5.10: root A tracks a
+# direct `.md` child of `config-bundles/agent-prompts/` with
+# LIVE_IN_NEW_SESSION, and nothing else under `config-bundles/` is admitted.
+# ---------------------------------------------------------------------------
+
+
+def test_agent_prompt_direct_child_is_tracked_with_live_in_new_session() -> None:
+    """requirements.md 1.1, 1.7: a `.md` file directly inside
+
+    `config-bundles/agent-prompts/` is tracked on root A, and carries the
+    LIVE_IN_NEW_SESSION propagation class (an agent's prompt is read when a
+    session for that agent starts — requirements.md 5.10).
+    """
+    relpath = "config-bundles/agent-prompts/senior-reviewer.md"
+    assert allowlist.is_tracked("A", relpath)
+
+    matching_entries = [
+        entry
+        for entry in _all_entries()
+        if entry.root == "A" and allowlist.entry_matches(entry, relpath)
+    ]
+    assert matching_entries, f"no root-A entry matched {relpath!r}"
+    for entry in matching_entries:
+        assert (
+            entry.propagation_class is allowlist.PropagationClass.LIVE_IN_NEW_SESSION
+        ), (
+            f"entry {entry!r} matched {relpath!r} but is classified "
+            f"{entry.propagation_class!r}, not LIVE_IN_NEW_SESSION"
+        )
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    [
+        # requirements.md 1.7: a nested path under agent-prompts/ is not a
+        # direct child and must not be selected.
+        "config-bundles/agent-prompts/sub/x.md",
+        # requirements.md 1.7: a non-.md file directly in agent-prompts/
+        # must not be selected.
+        "config-bundles/agent-prompts/x.txt",
+        # requirements.md 1.8: nothing under config-bundles/skills/** is
+        # selected, including a nested SKILL.md that would otherwise match
+        # the unrelated skills/**/SKILL.md entry by basename alone.
+        "config-bundles/skills/foo/SKILL.md",
+        "config-bundles/skills/foo/scripts/run.sh",
+        # requirements.md 1.8: config-bundles/sync-bundles.sh is not
+        # selected — it is delivered by its own mechanism.
+        "config-bundles/sync-bundles.sh",
+    ],
+)
+def test_config_bundles_non_agent_prompt_paths_are_not_tracked_on_root_a(
+    relpath: str,
+) -> None:
+    assert not allowlist.is_tracked("A", relpath), (
+        f"path {relpath!r} must NOT be tracked on root A per requirements.md " "1.7/1.8"
+    )
+
+
+def test_agent_prompt_path_is_not_tracked_on_root_b() -> None:
+    """The same prompt-shaped path under root B (KIRO_HOME) is not tracked —
+
+    root B admits only `agents/*.json` (requirements.md 1.2), and this
+    class belongs to root A only.
+    """
+    assert not allowlist.is_tracked(
+        "B", "config-bundles/agent-prompts/senior-reviewer.md"
+    )
 
 
 # ---------------------------------------------------------------------------

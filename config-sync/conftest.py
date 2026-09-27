@@ -3,6 +3,8 @@ import glob
 import os
 import sys
 
+import pytest
+
 # Test-environment wiring, repo-wide: backend/safety/push_policy.py and
 # backend/safety/redact_msg.py both call kiro_crew.security at runtime (see
 # design.md). The deployed app always runs as a subprocess of the KiroCrew
@@ -35,3 +37,28 @@ settings.register_profile(
     deadline=None,
 )
 settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "dev"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_roots(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default every test to disposable config roots and state dir.
+
+    The poll tick now applies and then hashes the live roots, so a test
+    that forgot to isolate them would walk (and could write to) the real
+    host's ~/.kiro. Tests that set their own values override these.
+
+    Also redirects ``HOME`` itself (senior-review round-4 L1): the other
+    three variables cover every path this app's own code resolves
+    relative to a tracked root or its state dir, but any code path that
+    calls ``Path.home()``/``os.path.expanduser("~")`` directly still
+    walks the REAL host home directory unless ``HOME`` is redirected too.
+    Pointed at the same isolated base as the other roots so a test that
+    exercises such a call path never touches the real user's home.
+    """
+    base = tmp_path_factory.mktemp("isolated-roots")
+    monkeypatch.setenv("KIROCREW_HOME", str(base / "root-a"))
+    monkeypatch.setenv("KIRO_HOME", str(base / "root-b"))
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(base / "state"))
+    monkeypatch.setenv("HOME", str(base / "home"))

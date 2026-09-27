@@ -70,12 +70,13 @@ Pipeline (design.md step list):
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Dict, Iterator, List, Mapping, Tuple
 
-from backend import collect, redact, state
+from backend import collect, portable, redact, state
 from backend.safety import git_safety, push_policy
 from backend.safety import redact_msg
 
@@ -97,6 +98,7 @@ class PushResult:
     outcome: str
     tree_hash: str
     reason: str = ""
+    non_portable: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def tree_hash(tree: Mapping[str, bytes]) -> str:
@@ -120,6 +122,131 @@ def tree_hash(tree: Mapping[str, bytes]) -> str:
         digest.update(content_hash.encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _roots_mapping() -> Dict[str, Path]:
+    """Root-id -> resolved `Path` mapping, in `portable.py`'s convention.
+
+    Built from `collect._roots()` (the same resolution collect.py itself
+    used to gather the tree being tokenized), so tokenize is guaranteed to
+    match against the exact root paths the tree was collected under.
+    """
+    return dict(collect._roots())
+
+
+def _find_non_portable(
+    node: Any, roots: Mapping[str, Path], key_path: List[Any]
+) -> Iterator[Dict[str, Any]]:
+    """Yield a report for every string value in scope that is an absolute
+
+    path (after an optional `file://`/`skill://` scheme is stripped) lying
+    under NEITHER root (requirements.md 2.9) — a site-packages path, or
+    another host's home directory. A relative reference and a non-path
+    value (e.g. a URL) are not reported. Dict keys are never inspected as
+    values.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _find_non_portable(value, roots, key_path + [key])
+        return
+    if isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _find_non_portable(item, roots, key_path + [index])
+        return
+    if isinstance(node, str):
+        _, path_part = portable._split_scheme(node)
+        if not path_part.startswith("/"):
+            return
+        if portable.resolve_reference(node, roots) is not None:
+            return
+        yield {"key_path": list(key_path), "value": node}
+
+
+def tokenize_tree(tree: Mapping[str, bytes]) -> Dict[str, bytes]:
+    """Run `portable.tokenize` over every collected, redacted file that
+
+    parses as JSON (requirements.md 2.8-2.10; design.md's push step list —
+    runs AFTER `redact.redact`, BEFORE `tree_hash`). A file whose content is
+    not valid JSON passes through unchanged, matching `redact.redact`'s own
+    JSON-or-passthrough convention. Re-serialization is deterministic
+    (fixed indent, key order preserved), so an unchanged file never produces
+    a spurious diff and tokenizing already-tokenized content is a no-op
+    (portable.tokenize's own idempotence).
+
+    A `headers`/`env` value is already the literal placeholder
+    `"<redacted>"` by the time this runs (redact ran first), so it never
+    matches a root-path prefix and is never rewritten — the ordering
+    requirements.md 2.8's worked example calls for.
+
+    Out-of-root absolute path values found while walking each JSON document
+    are left UNCHANGED in the returned tree and never refuse the push
+    (requirements.md 2.9) — call `_tokenize_tree_with_report` directly to
+    also get that list; this function's own return shape stays a plain
+    `Dict[str, bytes]` to match every existing caller/test that treats a
+    tokenized tree like `redact.redact`'s or `collect.collect()`'s result.
+    """
+    tokenized, _non_portable = _tokenize_tree_with_report(tree)
+    return tokenized
+
+
+def _tokenize_tree_with_report(
+    tree: Mapping[str, bytes]
+) -> Tuple[Dict[str, bytes], List[Dict[str, Any]]]:
+    """`tokenize_tree`'s implementation, additionally returning the
+
+    non-portable report list `run()` needs for `PushResult.non_portable`
+    (requirements.md 2.9) — kept separate from `tokenize_tree` itself so
+    that function's return type stays a plain tree mapping.
+    """
+    roots = _roots_mapping()
+    tokenized: Dict[str, bytes] = {}
+    non_portable: List[Dict[str, Any]] = []
+
+    for relpath, content in tree.items():
+        try:
+            parsed = json.loads(content.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            tokenized[relpath] = content
+            continue
+
+        for report in _find_non_portable(parsed, roots, []):
+            non_portable.append(
+                {
+                    "path": relpath,
+                    "key_path": report["key_path"],
+                    "value": report["value"],
+                }
+            )
+
+        rewritten = portable.tokenize(parsed, roots)
+        serialized = json.dumps(rewritten, indent=2, ensure_ascii=False) + "\n"
+        tokenized[relpath] = serialized.encode("utf-8")
+
+    return tokenized, non_portable
+
+
+def current_push_tree_hash() -> str:
+    """Return the tree hash push's own no-op gate would compute for the
+
+    live tree RIGHT NOW: collect -> redact -> tokenize -> ``tree_hash``
+    (design.md's push step list, steps 1-2). This is the ONE shared
+    pipeline every caller that needs "what would push consider the
+    current pushed state to be" must call — never a re-derivation of the
+    same four steps at a second call site.
+
+    Factored out (senior-review round-3 Medium finding) because
+    ``routes.py``'s ``status``/``drift`` previously hashed the
+    redacted-but-NOT-tokenized tree while this module hashed the
+    redacted-AND-tokenized tree — the two disagreed for any tracked file
+    containing a portable absolute path under a tracked root, so
+    ``drift()`` could report drift immediately after a push that had just
+    recorded that exact (tokenized) tree as pushed. Both callers now share
+    this one function, so they can never diverge again.
+    """
+    collected = collect.collect()
+    redacted = redact.redact(collected)
+    tokenized, _non_portable = _tokenize_tree_with_report(redacted)
+    return tree_hash(tokenized)
 
 
 def _instance_id() -> str:
@@ -197,11 +324,14 @@ def run() -> PushResult:
     """
     collected = collect.collect()
     redacted = redact.redact(collected)
-    current_hash = tree_hash(redacted)
+    tokenized, non_portable = _tokenize_tree_with_report(redacted)
+    current_hash = tree_hash(tokenized)
 
     store = state.load_state()
     if current_hash == store.last_pushed_hash:
-        return PushResult(outcome="no-op", tree_hash=current_hash)
+        return PushResult(
+            outcome="no-op", tree_hash=current_hash, non_portable=non_portable
+        )
 
     # Step 3a: this exact change was already pushed on a prior tick and is
     # still waiting on the out-of-band PR-confirmation call — re-entering
@@ -218,6 +348,7 @@ def run() -> PushResult:
             outcome="awaiting-pr-confirmation",
             tree_hash=current_hash,
             reason=str(pending_pr.get("branch", "")),
+            non_portable=non_portable,
         )
 
     # Step 3b: a prior tick pushed this exact content and handed off to
@@ -255,7 +386,10 @@ def run() -> PushResult:
     ):
         branch = str(last_push.get("branch", ""))
         result = PushResult(
-            outcome="retry-pr-only", tree_hash=current_hash, reason=branch
+            outcome="retry-pr-only",
+            tree_hash=current_hash,
+            reason=branch,
+            non_portable=non_portable,
         )
 
         from backend import pr_handoff
@@ -268,11 +402,14 @@ def run() -> PushResult:
     # call — not even a clone probe. A finding (or an unavailable scanner,
     # which fails closed the same way) refuses the whole push and reports
     # only the code/count push_policy handed back, never matched text.
-    clean, scan_note = _scan_tree_for_secrets(redacted)
+    clean, scan_note = _scan_tree_for_secrets(tokenized)
     if not clean:
         store.record_push_failure(reason=scan_note)
         return PushResult(
-            outcome="refused-secret-scan", tree_hash=current_hash, reason=scan_note
+            outcome="refused-secret-scan",
+            tree_hash=current_hash,
+            reason=scan_note,
+            non_portable=non_portable,
         )
 
     # Step 6 (authorization check ahead of any git call): decide the target
@@ -287,6 +424,7 @@ def run() -> PushResult:
             outcome="refused-branch-authorization",
             tree_hash=current_hash,
             reason=auth_reason,
+            non_portable=non_portable,
         )
 
     # Materialize the redacted tree into a scratch working copy BEFORE any
@@ -309,7 +447,7 @@ def run() -> PushResult:
     scratch_dir = state.get_state_dir() / "push-scratch"
 
     try:
-        _write_working_copy(scratch_dir, redacted)
+        _write_working_copy(scratch_dir, tokenized)
 
         # Steps 5/7: clone/update the bundle repo, write the checked tree
         # into the working copy, commit (redacted message), push the named
@@ -346,7 +484,7 @@ def run() -> PushResult:
             git_safety.git_argv(clone_dir, "checkout", "-B", branch), check=True
         )
 
-        _write_working_copy(clone_dir, redacted)
+        _write_working_copy(clone_dir, tokenized)
 
         subprocess.run(git_safety.git_argv(clone_dir, "add", "-A"), check=True)
 
@@ -370,7 +508,12 @@ def run() -> PushResult:
     # does that; requirement 2.6), then hand off to `pr_handoff` so the
     # pending-PR record and operator notification actually happen.
     store.record_branch_pushed(tree_hash=current_hash, branch=branch)
-    result = PushResult(outcome="pushed", tree_hash=current_hash, reason=branch)
+    result = PushResult(
+        outcome="pushed",
+        tree_hash=current_hash,
+        reason=branch,
+        non_portable=non_portable,
+    )
 
     from backend import pr_handoff
 

@@ -140,6 +140,11 @@ _ROOT_A_ENTRIES: Sequence[AllowlistEntry] = (
     AllowlistEntry("A", "mcp.json", PropagationClass.LIVE_ON_NEXT_RESOLUTION),
     AllowlistEntry("A", "crons.json", PropagationClass.LIVE_ON_NEXT_RESOLUTION),
     AllowlistEntry("A", "instances.json", PropagationClass.LIVE_ON_NEXT_RESOLUTION),
+    AllowlistEntry(
+        "A",
+        "config-bundles/agent-prompts/*.md",
+        PropagationClass.LIVE_IN_NEW_SESSION,
+    ),
 )
 
 # ---------------------------------------------------------------------------

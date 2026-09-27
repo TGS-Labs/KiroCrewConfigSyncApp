@@ -57,8 +57,23 @@ def _run_git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
 def isolated_state_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Path]:
+    """Isolates the app's own state dir AND both tracked config roots.
+
+    Every test in this file drives a real `poll.run()` tick on a changed
+    head, which under the auto-apply ruling (requirements.md 4.4) always
+    materializes and applies the new commit for real — KIROCREW_HOME/
+    KIRO_HOME are pinned here, once, rather than per test, or an unpinned
+    test would let `apply_commit` write into the real host home
+    directory.
+    """
     state_dir = tmp_path / "state"
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    kirocrew_home = tmp_path / "kirocrew_home"
+    kiro_home = tmp_path / "kiro_home"
+    kirocrew_home.mkdir(parents=True, exist_ok=True)
+    kiro_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("KIROCREW_HOME", str(kirocrew_home))
+    monkeypatch.setenv("KIRO_HOME", str(kiro_home))
     yield state_dir
 
 
@@ -195,6 +210,12 @@ def test_last_seen_sha_advances_even_when_notify_operator_raises(
     `record_seen_sha` before `notify_operator` (H3). With the OLD ordering
     a raising notify would leave `last_seen_sha` unchanged and the next
     tick would re-classify/re-notify the same commit forever.
+
+    Under the auto-apply ruling the commit is materialized and applied
+    BEFORE `record_seen_sha`/`notify_operator` run at all, so by the time
+    `notify_operator` raises the commit has already been fully applied
+    and its pending record resolved — `last_apply` (not `pending`) is
+    what proves the apply actually happened for this head.
     """
     store = state.load_state()
     store.record_seen_sha(bundle_remote["old_sha"])
@@ -226,8 +247,12 @@ def test_last_seen_sha_advances_even_when_notify_operator_raises(
         "is called, so a raising notify costs at most one missed "
         "notification rather than a permanent re-nag loop (H3)"
     )
-    assert reloaded.pending is not None
-    assert reloaded.pending["sha"] == new_sha
+    assert reloaded.pending is None, (
+        "the commit must already have been applied and resolved before "
+        "notify_operator ever runs"
+    )
+    assert reloaded.last_apply is not None
+    assert reloaded.last_apply["sha"] == new_sha
 
 
 def test_second_tick_after_a_notify_failure_does_not_reclassify(
@@ -328,10 +353,15 @@ def test_notify_operator_receives_all_four_required_fields_on_a_changed_head(
     )
 
     reloaded = state.load_state()
-    assert reloaded.pending is not None
-    assert reloaded.pending["author"] == kwargs["author"]
-    assert reloaded.pending["subject"] == kwargs["subject"]
-    assert reloaded.pending["touched_classes"] == kwargs["touched_classes"]
+    assert reloaded.pending is None, (
+        "a fully-applied commit resolves its own pending record in the "
+        "same tick under the auto-apply ruling"
+    )
+    assert reloaded.last_apply is not None
+    assert reloaded.last_apply["sha"] == new_sha, (
+        "last_apply must record the applied commit's sha, matching the "
+        "same head_sha notify_operator was called with"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -615,11 +645,13 @@ def test_non_ascii_filename_is_reported_as_real_utf8_not_quoted_octal(
 ) -> None:
     """WHEN a changed commit touches a non-ASCII-named file (e.g.
 
-    ``steering/café.md``) THEN the pending record's classified paths must
-    contain the REAL UTF-8 relpath, not git's default
-    `core.quotePath=true` quoted-octal-escape rendering (M3) — the
-    allowlist is written against the real UTF-8 name, so a quoted escape
-    string would never match it and the file would be silently dropped.
+    ``steering/café.md``) THEN the file must be applied under its REAL
+    UTF-8 relpath, not git's default `core.quotePath=true` quoted-octal-
+    escape rendering (M3) — the allowlist is written against the real
+    UTF-8 name, so a quoted escape string would never match it and the
+    file would be silently dropped. Checked via `last_apply`/the live
+    root rather than `pending`, since a fully-applied commit resolves its
+    own pending record in the same tick under the auto-apply ruling.
     """
     store = state.load_state()
     store.record_seen_sha(bundle_remote["old_sha"])
@@ -634,19 +666,20 @@ def test_non_ascii_filename_is_reported_as_real_utf8_not_quoted_octal(
     poll.run()
 
     reloaded = state.load_state()
-    pending = reloaded.pending
-    assert pending is not None
-    assert pending["sha"] == new_sha
-    assert "steering/café.md" in pending["classified_paths"], (
+    assert reloaded.pending is None
+    last_apply = reloaded.last_apply
+    assert last_apply is not None
+    assert last_apply["sha"] == new_sha
+    assert "steering/café.md" in last_apply["applied"], (
         f"expected the real UTF-8 relpath 'steering/café.md' in "
-        f"classified_paths, got {list(pending['classified_paths'])!r} — "
+        f"last_apply['applied'], got {last_apply['applied']!r} — "
         f"a quoted-octal-escape string here means core.quotePath=false "
         f"was not applied"
     )
 
 
 # ---------------------------------------------------------------------------
-# M2 — ignored / touched_classes carried into the pending record.
+# M2 — ignored / touched_classes carried through the automatic apply.
 # ---------------------------------------------------------------------------
 
 
@@ -657,15 +690,17 @@ def test_pending_record_carries_ignored_paths(
 ) -> None:
     """WHEN a changed commit touches a path that matches NO allowlist
 
-    entry on either root THEN it appears in the pending record's
-    `ignored_paths`, not silently dropped without a trace (M2) — a later
-    consumer (Deployment 4) should be able to see what a commit deliberately
-    skipped without re-fetching and re-classifying it.
+    entry on either root THEN it appears in `last_apply`'s
+    `ignored_paths`, not silently dropped without a trace (M2) — a
+    consumer should be able to see what a commit deliberately skipped
+    without re-fetching and re-classifying it. Checked via `last_apply`
+    rather than `pending`, since a fully-applied commit resolves its own
+    pending record in the same tick under the auto-apply ruling.
     """
     store = state.load_state()
     store.record_seen_sha(bundle_remote["old_sha"])
 
-    _push_new_commit(
+    new_sha = _push_new_commit(
         bundle_remote["seed_dir"],
         relpath="not-tracked-by-any-allowlist-entry.bin",
         content="opaque\n",
@@ -674,10 +709,13 @@ def test_pending_record_carries_ignored_paths(
 
     poll.run()
 
-    pending = state.load_state().pending
-    assert pending is not None
-    assert "ignored_paths" in pending
-    assert "not-tracked-by-any-allowlist-entry.bin" in pending["ignored_paths"]
+    reloaded = state.load_state()
+    assert reloaded.pending is None
+    last_apply = reloaded.last_apply
+    assert last_apply is not None
+    assert last_apply["sha"] == new_sha
+    assert "ignored_paths" in last_apply
+    assert "not-tracked-by-any-allowlist-entry.bin" in last_apply["ignored_paths"]
 
 
 def test_pending_record_carries_touched_classes(
@@ -687,15 +725,18 @@ def test_pending_record_carries_touched_classes(
 ) -> None:
     """WHEN a changed commit's paths classify to at least one propagation
 
-    class THEN that class's value string appears in the pending record's
-    `touched_classes` (M2) — carried straight from
+    class THEN that class's value string is carried through to the
+    `notify_operator` call's `touched_classes` kwarg (M2), straight from
     `classify.classify_paths`'s own `Result.touched_classes`, not
-    recomputed ad hoc.
+    recomputed ad hoc. Checked via the notify call rather than `pending`,
+    since a fully-applied commit resolves its own pending record in the
+    same tick under the auto-apply ruling — `touched_classes` itself is
+    not carried into `last_apply`'s summary.
     """
     store = state.load_state()
     store.record_seen_sha(bundle_remote["old_sha"])
 
-    _push_new_commit(
+    new_sha = _push_new_commit(
         bundle_remote["seed_dir"],
         relpath="steering/touched-classes.md",
         content="touched classes regression guard\n",
@@ -704,10 +745,14 @@ def test_pending_record_carries_touched_classes(
 
     poll.run()
 
-    pending = state.load_state().pending
-    assert pending is not None
-    assert "touched_classes" in pending
-    assert pending["touched_classes"], (
+    reloaded = state.load_state()
+    assert reloaded.pending is None
+    assert reloaded.last_apply is not None
+    assert reloaded.last_apply["sha"] == new_sha
+
+    notify_spy.assert_called_once()
+    _, notify_kwargs = notify_spy.call_args
+    assert notify_kwargs["touched_classes"], (
         "expected at least one propagation class recorded for a path "
         "that classified successfully under the steering/ allowlist entry"
     )

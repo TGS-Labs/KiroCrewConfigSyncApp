@@ -1,0 +1,67 @@
+{
+  "drift": true,
+  "last_apply": {
+    "applied": [
+      "steering/fixture-demo-2.md"
+    ],
+    "apply_id": "apply-20260927084446-cf6c4a85",
+    "changed_instance_names": [],
+    "dropped_cron_names": [],
+    "ignored_paths": [],
+    "incomplete_registrations": {},
+    "needs_credential": [],
+    "non_portable_paths": [],
+    "not_applied": {
+      "mcp.json": "mcp.json: refused \u2014 could not parse as JSON"
+    },
+    "outcome": "partial",
+    "paused_cron_names": [],
+    "propagation": {
+      "steering/fixture-demo-2.md": {
+        "message": "Live in a new session \u2014 steering loads at session start (or a post-compaction warm reinjection); it is not live in an already-running session, and nothing else needs to happen for steering alone.",
+        "propagation_class": "live_in_new_session",
+        "requires_restart": false
+      }
+    },
+    "propagation_report": {},
+    "reason": "",
+    "root": {
+      "mcp.json": "A"
+    },
+    "sha": "ea85a7ca01a34bf8d4f35c8e1f394f807914e46d",
+    "unresolved_references": [],
+    "untracked_prompt_agents": []
+  },
+  "last_poll_failure": null,
+  "last_push": {
+    "branch": "",
+    "pr_url": null,
+    "time": "2026-09-27T08:44:45Z",
+    "tree_hash": "86852bf02dc14f9ddb4e043f9f9036472c93f03e10bad1fff89d6026aeb00f00"
+  },
+  "last_push_failure": {
+    "reason": "secret scan found 1 finding; push refused",
+    "time": "2026-09-27T08:44:46Z"
+  },
+  "last_seen_sha": "78e64e1ebb385d14d8644b4916f22aa872bed9bb",
+  "pending": {
+    "author": "t",
+    "changed_commands": [],
+    "classified_paths": {
+      "mcp.json": "live_on_next_resolution",
+      "steering/fixture-demo-2.md": "live_in_new_session"
+    },
+    "ignored_paths": [],
+    "not_applied": {
+      "mcp.json": "mcp.json: refused \u2014 could not parse as JSON"
+    },
+    "sha": "ea85a7ca01a34bf8d4f35c8e1f394f807914e46d",
+    "subject": "add another file, break mcp.json",
+    "touched_classes": [
+      "live_in_new_session",
+      "live_on_next_resolution"
+    ]
+  },
+  "poll_consecutive_failures": 0,
+  "status": "ok"
+}
