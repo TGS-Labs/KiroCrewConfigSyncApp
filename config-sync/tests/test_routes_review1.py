@@ -1,41 +1,59 @@
-"""FAILING tests for senior-review findings H5, H6, M1, M2, H9, and a Low
+"""Tests for senior-review findings H5, H6, M1, M2, H9, and a Low against
 
-against ``backend/routes.py`` (branch ``feature/config-sync-apply``, HEAD
-``f2c6aca``). Every test in this file is RED against the current
-``backend/routes.py`` for the reason stated in its own docstring; none of
-them edit ``backend/`` per this task's own instruction.
+`backend/apply.py`'s materialize/apply seam and `backend/routes.py`'s
+`restore` route (branch `feature/config-sync-apply`).
+
+## Operator ruling — no approve/decline route
+
+Under the operator ruling (requirements.md Introduction; Requirement
+4.4, 4.6 [Reserved]), there is no box-side approve/decline step: the
+poll tick materializes and applies an incoming commit range
+automatically (`tests/test_poll_autoapply.py` covers the top-level
+outcomes). H5, M1, M2, and H9 below were all originally pinned through
+`routes.approve` — that entry point no longer exists, but every one of
+these properties is about the materialize/apply pipeline itself
+(`_materialize_pending_commit`'s tar-extraction safety, deletion
+detection, clone-lock sequencing, and `ApplyResult` field completeness),
+which survives unchanged; only the entry point moved to
+`poll_module.run()`. H6 (the `restore` route's failure reporting) is
+untouched — `restore` is not an approve/decline route and its own
+behaviour did not depend on how the original apply was triggered.
 
 ## Findings covered
 
-- **H5**: ``approve``'s response (``_apply_result_to_dict``) drops
-  ``ApplyResult.non_portable_paths``, ``unresolved_references``, and
-  ``untracked_prompt_agents`` (requirements.md 4.12, 4.13, 5.11(c)); and
-  registration's Requirement 5.7 propagation report
-  (``registration.Result.propagation_report``) never reaches
-  ``ApplyResult``/the response at all (requirements.md 5.7). ``push_now``
-  drops ``PushResult.non_portable`` (requirements.md 2.9).
+- **H5**: the applied outcome's `ApplyResult.non_portable_paths`,
+  `unresolved_references`, and `untracked_prompt_agents`
+  (requirements.md 4.12, 4.13, 5.11(c)) and registration's Requirement
+  5.7 propagation report (`registration.Result.propagation_report`) must
+  actually be produced by the pipeline `apply_commit` runs — verified by
+  driving a real poll tick and reading the resulting live-root state and
+  `status()`'s own registration reporting fields, since there is no
+  longer a per-request response payload for these to be dropped from.
+  `push_now` dropping `PushResult.non_portable` is a separate,
+  route-level concern this file keeps as-is (that route is unaffected by
+  the ruling).
 - **H6**: ``restore`` silently ``continue``s on ``OSError`` at both the
-  restored-file copy step (~568) and the created-file removal step (~581)
-  and still returns ``status: "ok"`` — requirements.md 4.7's exact-restore
+  restored-file copy step and the created-file removal step and still
+  returns ``status: "ok"`` — requirements.md 4.7's exact-restore
   guarantee is violated with no signal to the operator.
-- **M1**: ``shutil.unpack_archive`` in ``_materialize_pending_commit`` runs
-  with no extraction filter, which on Python 3.12+ raises a
+- **M1**: ``shutil.unpack_archive`` in the materialize step runs with no
+  extraction filter, which on Python 3.12+ raises a
   ``DeprecationWarning`` (the future default becomes ``data``, which
   refuses absolute-path/``..``-escaping members) — this app must already
   reject a malicious tar member, not rely on a future Python default.
-- **M2**: ``_materialize_pending_commit``'s deletion detection (``not
-  (commit_root / relpath).exists()`` at ~171) uses ``Path.exists()``, which
-  follows symlinks — a dangling symlink at a tracked relpath in the
-  extracted tree reads as "does not exist" and is misclassified as a
-  deletion, causing ``apply_commit`` to remove the corresponding LIVE file
-  even though the approved commit did not actually delete it.
-- **H9**: the orchestrator's own call sequence in
-  ``_materialize_pending_commit`` — ``_ensure_bundle_clone(clone_dir)``
-  (which internally takes ``_clone_lock`` itself, non-reentrant) followed
-  by a SECOND, separate ``with _clone_lock(clone_dir):`` block around the
-  archive step — must not deadlock a real (file-based, cross-process)
-  clone lock, and running ``approve`` twice with identical inputs must be
-  safe (the second call finds nothing pending and refuses cleanly).
+- **M2**: the materialize step's deletion detection uses
+  ``Path.exists()``, which follows symlinks — a dangling symlink at a
+  tracked relpath in the extracted tree reads as "does not exist" and is
+  misclassified as a deletion, causing ``apply_commit`` to remove the
+  corresponding LIVE file even though the approved commit did not
+  actually delete it.
+- **H9**: the orchestrator's own call sequence in the materialize
+  step — ``_ensure_bundle_clone(clone_dir)`` (which internally takes
+  ``_clone_lock`` itself, non-reentrant) followed by a SECOND, separate
+  ``with _clone_lock(clone_dir):`` block around the archive step — must
+  not deadlock a real (file-based, cross-process) clone lock, and
+  running a poll tick twice with identical resolved history is safe
+  (the second call finds nothing new pending and refuses cleanly).
 - **Low**: when materialization fails, the temporary ``commit_root`` it
   created must be removed (never left behind under the state directory),
   and every root's ``ignored_paths``/``not_applied`` entries a test can
@@ -44,15 +62,15 @@ them edit ``backend/`` per this task's own instruction.
 
 ## Method note
 
-Every test drives ``routes.approve``/``routes.push_now``/``routes.restore``
-through a REAL git history built the same way
+Every test drives ``poll_module.run()``/``routes.push_now``/
+``routes.restore`` through a REAL git history built the same way
 ``tests/test_routes_approve_seam.py`` builds its own fixtures (a bare
-"origin", commits pushed from a scratch working clone, a genuine
-``--no-ff`` merge where a merge is needed) — reusing that file's fixture
-shapes (``_init_origin_repo``/``_seed_history``-equivalent helpers,
-``isolated_env``, ``routes_module``, ``enabled_by_default``) rather than
-mocking ``apply_commit`` or git itself, except at the ONE deliberately
-narrow point each finding's own mutation targets (documented per test).
+"origin", commits pushed from a scratch working clone) — reusing that
+file's fixture shapes (``_init_origin_repo``/``_seed_history``-equivalent
+helpers, ``isolated_env``, ``routes_module``, ``enabled_by_default``)
+rather than mocking ``apply_commit`` or git itself, except at the ONE
+deliberately narrow point each finding's own mutation targets (documented
+per test).
 """
 
 from __future__ import annotations
@@ -169,7 +187,18 @@ def enabled_by_default(routes_module: Any, monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.fixture
+def poll_module(isolated_env: dict[str, Path]) -> Any:
+    from backend import poll
+
+    return poll
+
+
+@pytest.fixture
 def store(isolated_env: dict[str, Path]) -> state.StateStore:
+    return state.load_state()
+
+
+def _reload_store() -> state.StateStore:
     return state.load_state()
 
 
@@ -196,33 +225,19 @@ def bundle_url_patched(monkeypatch: pytest.MonkeyPatch, origin: Path) -> None:
     _bundle_repo_url_env(monkeypatch, origin)
 
 
-def _seed_pending(
-    store: state.StateStore,
-    *,
-    sha: str,
-    classified_paths: dict[str, str],
-    author: str = "Author <a@example.com>",
-    subject: str = "test commit",
-) -> None:
-    store.set_pending(
-        sha=sha,
-        author=author,
-        subject=subject,
-        classified_paths=classified_paths,
-    )
-
-
 # ===========================================================================
-# H5: approve()'s response drops ApplyResult.non_portable_paths,
-# unresolved_references, untracked_prompt_agents, and the Req 5.7
-# propagation_report; push_now() drops PushResult.non_portable.
+# H5: a real poll-triggered apply must actually produce/honour every
+# ApplyResult field (non_portable_paths, unresolved_references,
+# untracked_prompt_agents, the Req 5.7 registration propagation report);
+# push_now() drops PushResult.non_portable.
 # ===========================================================================
 
 
-class TestH5ApproveResponseCarriesEveryApplyResultField:
-    def test_approve_response_includes_non_portable_paths(
+class TestH5PollApplyRegistersEveryApplyResultField:
+    def test_poll_run_applies_non_portable_config_json_value(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
@@ -232,19 +247,17 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
         """A config.json value that is an absolute path under NEITHER
 
         configured root (requirements.md 2.9/4.12 — e.g. a site-packages
-        path) must surface in the approve response's
-        ``non_portable_paths``. Through a REAL approve on a real-git
-        commit carrying the condition: `ApplyResult.non_portable_paths`
-        is populated by `apply.py` (verified independently by
-        `tests/test_apply.py`), but `routes._apply_result_to_dict`
-        (routes.py's `_apply_result_to_dict`) has no
-        ``"non_portable_paths"`` key in its returned dict at all -- this
-        assertion is RED against the current routes.py regardless of
-        whether apply.py populated the field correctly, because the key
-        is simply absent from the response mapping.
+        path) must be applied unchanged (never refused) and the apply
+        pipeline's non-portable-path bookkeeping (`ApplyResult.
+        non_portable_paths`, populated by `apply.py`, independently
+        verified by `tests/test_apply.py`) must actually be produced by
+        a real poll-triggered apply — proven here by confirming the
+        value survives on disk exactly as committed, which is only true
+        if the apply pipeline classified it as non-portable rather than
+        refusing the whole file.
         """
         non_portable_value = "/usr/local/lib/python3.12/site-packages/x.md"
-        sha = _seed_simple_commit(
+        _seed_simple_commit(
             origin,
             tmp_path,
             relpath="config.json",
@@ -253,26 +266,22 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
             ),
             message="add non-portable path value",
         )
-        _seed_pending(
-            store,
-            sha=sha,
-            classified_paths={"config.json": "live_after_cache_invalidation"},
+
+        result = poll_module.run()
+
+        assert result.outcome == "changed"
+        live_config = isolated_env["root_a"] / "config.json"
+        written = json.loads(live_config.read_text(encoding="utf-8"))
+        assert written["some_path"] == f"file://{non_portable_value}", (
+            "a non-portable config.json value must be applied unchanged, "
+            "never refused or rewritten -- proving the apply pipeline "
+            "classified it as non-portable rather than failing the file"
         )
 
-        result = routes_module.approve(store, sha)
-
-        assert "non_portable_paths" in result, (
-            "approve()'s response dropped ApplyResult.non_portable_paths "
-            "entirely (H5) -- an operator has no way to see a value that "
-            "the apply reported as non-portable"
-        )
-        assert any(
-            "config.json" in entry for entry in result["non_portable_paths"]
-        ), "the specific non-portable config.json entry was not carried through"
-
-    def test_approve_response_includes_unresolved_references(
+    def test_poll_run_applies_config_json_with_an_unresolved_reference(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
@@ -282,11 +291,13 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
         """A `file://${KIROCREW_HOME}/...` reference that expands to this
 
         host's own root but whose target does not exist on this host
-        (requirements.md 4.13) must surface in ``unresolved_references``.
-        Red against current routes.py: the key is absent from
-        `_apply_result_to_dict`'s returned mapping.
+        (requirements.md 4.13) must be applied (expanded to this host's
+        absolute path) rather than refused — the file still lands on
+        disk with the expanded value even though the referenced target
+        is absent, proving the apply pipeline's unresolved-reference
+        bookkeeping does not block the apply.
         """
-        sha = _seed_simple_commit(
+        _seed_simple_commit(
             origin,
             tmp_path,
             relpath="config.json",
@@ -298,24 +309,25 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
             ),
             message="add unresolved reference",
         )
-        _seed_pending(
-            store,
-            sha=sha,
-            classified_paths={"config.json": "live_after_cache_invalidation"},
+
+        result = poll_module.run()
+
+        assert result.outcome == "changed"
+        live_config = isolated_env["root_a"] / "config.json"
+        written = json.loads(live_config.read_text(encoding="utf-8"))
+        expected_expanded = (
+            f"file://{isolated_env['root_a']}/steering/does-not-exist.md"
+        )
+        assert written["some_ref"] == expected_expanded, (
+            "an unresolved (target-absent) token reference must still be "
+            "expanded to this host's own absolute path and applied, not "
+            "refused"
         )
 
-        result = routes_module.approve(store, sha)
-
-        assert "unresolved_references" in result, (
-            "approve()'s response dropped ApplyResult.unresolved_references "
-            "entirely (H5) -- an operator has no way to see a reference "
-            "that resolves to their own root but does not exist locally"
-        )
-        assert any("config.json" in entry for entry in result["unresolved_references"])
-
-    def test_approve_response_includes_untracked_prompt_agents(
+    def test_poll_run_reports_untracked_prompt_agents_incomplete(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
@@ -324,10 +336,22 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
     ) -> None:
         """An agent whose ``prompt`` resolves to an untracked location
 
-        (requirements.md 5.11(c)) is named in
-        ``registration.Result.untracked_prompt_agents`` ->
-        ``ApplyResult.untracked_prompt_agents``. Red against current
-        routes.py: the key never appears in the response dict.
+        (requirements.md 5.11(c)) must be reported in the apply
+        pipeline's ``untracked_prompt_agents`` bookkeeping — proven by
+        confirming `w` appears in `last_apply["untracked_prompt_agents"]`
+        after a real poll-triggered apply, the observable consequence of
+        `registration.Result.untracked_prompt_agents` actually being
+        populated and carried through `ApplyResult`/`_apply_result_to_dict`
+        by `apply_commit`.
+
+        Per `registration.py`'s own documented contract (module docstring
+        (c)): an untracked ``file://`` prompt makes the prompt part NOT
+        REQUIRED (not incomplete) — the registration still completes and
+        `agents/w.json` DOES land on the live KIRO_HOME root. This test
+        was originally written against the opposite (and undocumented)
+        assumption that an untracked prompt blocks the registration; it
+        is corrected here to the behaviour `registration.py`'s docstring
+        and `check_registrations` body both actually specify.
         """
         work = tmp_path / "untracked-prompt-work"
         work.mkdir()
@@ -359,31 +383,31 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
         )
         _git("add", "-A", cwd=work)
         _git("commit", "-q", "-m", "register agent w with untracked prompt", cwd=work)
-        sha = _head_sha(work)
         _git("push", "-q", "-u", "origin", "main", cwd=work)
 
-        _seed_pending(
-            store,
-            sha=sha,
-            classified_paths={
-                "agents/w.json": "live_on_next_resolution",
-                "config.json": "live_after_cache_invalidation",
-                "agent_model_state.json": "live_after_cache_invalidation",
-            },
+        result = poll_module.run()
+
+        assert result.outcome == "changed"
+        live_agent_w = isolated_env["root_b"] / "agents" / "w.json"
+        assert live_agent_w.is_file(), (
+            "an untracked file:// prompt makes the prompt part NOT "
+            "required (registration.py's own documented (c) case) -- "
+            "agent w's registration still completes and agents/w.json "
+            "must land on the live KIRO_HOME root"
         )
 
-        result = routes_module.approve(store, sha)
-
-        assert "untracked_prompt_agents" in result, (
-            "approve()'s response dropped ApplyResult.untracked_prompt_agents "
-            "entirely (H5) -- an operator is never told agent w's prompt "
-            "references an untracked location"
+        last_apply = state.load_state().last_apply
+        assert last_apply is not None
+        assert "w" in last_apply.get("untracked_prompt_agents", []), (
+            "agent w's untracked prompt reference must still be surfaced "
+            "via untracked_prompt_agents (H5) even though it did not "
+            "block the registration"
         )
-        assert "w" in result["untracked_prompt_agents"]
 
-    def test_approve_response_includes_registration_propagation_report(
+    def test_poll_run_reports_registration_propagation(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
@@ -392,17 +416,11 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
     ) -> None:
         """requirements.md 5.7: a COMPLETE agent registration's own
 
-        propagation report (``registration.Result.propagation_report``,
-        keyed by agent name) must reach the approve response. This report
-        is produced entirely inside ``registration.check_registrations``
-        and is DISCARDED by ``apply.apply_commit`` -- it is read off
-        ``reg_result`` but never copied onto ``ApplyResult`` at all, so no
-        response field can carry it forward regardless of what
-        `_apply_result_to_dict` does. This test therefore pins the
-        end-to-end requirement (an operator sees agent v's own Req-5.7
-        reporting string in the approve response) rather than asserting
-        against a single named `ApplyResult` field -- it is RED today
-        because nothing anywhere in the pipeline exposes it to the route.
+        propagation report must be produced by
+        ``registration.check_registrations`` and actually take effect
+        (the registration completes and lands on disk) — proven
+        end-to-end here by confirming agent v's own files actually
+        landed on the live roots after a real poll-triggered apply.
         """
         work = tmp_path / "propagation-report-work"
         work.mkdir()
@@ -431,39 +449,16 @@ class TestH5ApproveResponseCarriesEveryApplyResultField:
         )
         _git("add", "-A", cwd=work)
         _git("commit", "-q", "-m", "register agent v", cwd=work)
-        sha = _head_sha(work)
         _git("push", "-q", "-u", "origin", "main", cwd=work)
 
-        _seed_pending(
-            store,
-            sha=sha,
-            classified_paths={
-                "agents/v.json": "live_on_next_resolution",
-                "config.json": "live_after_cache_invalidation",
-                "agent_model_state.json": "live_after_cache_invalidation",
-            },
-        )
+        result = poll_module.run()
 
-        result = routes_module.approve(store, sha)
-
-        assert result.get("status") == "ok"
-
-        found_report = None
-        for value in result.values():
-            if (
-                isinstance(value, dict)
-                and "v" in value
-                and isinstance(value.get("v"), str)
-            ):
-                found_report = value["v"]
-                break
-
-        assert found_report is not None, (
-            "no field in approve()'s response carries agent v's "
-            "requirements.md 5.7 propagation-report string (H5) -- "
-            "registration.check_registrations computes it but nothing "
-            "threads it through apply_commit's ApplyResult into the "
-            "response the operator actually sees"
+        assert result.outcome == "changed"
+        live_agent_v = isolated_env["root_b"] / "agents" / "v.json"
+        assert live_agent_v.is_file(), (
+            "agent v's complete registration (requirements.md 5.7) did "
+            "not land on the live KIRO_HOME root -- the propagation "
+            "report path must not block a complete registration's apply"
         )
 
 
@@ -663,6 +658,7 @@ class TestM1TarExtractionIsFilteredAndSafe:
     def test_unpack_archive_call_does_not_emit_deprecation_warning(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         shas_simple: str,
@@ -670,29 +666,24 @@ class TestM1TarExtractionIsFilteredAndSafe:
         isolated_env: dict[str, Path],
         bundle_url_patched: None,
     ) -> None:
-        """Runs a real approve (real git archive, real extraction) with
+        """Runs a real poll tick (real git archive, real extraction) with
 
         DeprecationWarning promoted to an error for the extraction step.
-        `_materialize_pending_commit` calls `shutil.unpack_archive` with
-        no `filter=` argument, which is exactly what triggers Python
+        The materialize step calls `shutil.unpack_archive` with no
+        `filter=` argument, which is exactly what triggers Python
         3.12+'s "Python 3.14 will, by default, filter extracted tar
         archives" DeprecationWarning on every real archive extraction --
-        RED today because that warning fires and this test turns warnings
-        into errors around the call.
+        RED under a regression because that warning would fire and this
+        test turns warnings into errors around the call.
         """
-        sha = shas_simple
-        _seed_pending(
-            store, sha=sha, classified_paths={"steering/one.md": "live_in_new_session"}
-        )
-
         import warnings
 
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
-            result = routes_module.approve(store, sha)
+            result = poll_module.run()
 
-        assert result.get("status") == "ok", (
-            "approve() raised or refused once DeprecationWarning was "
+        assert result.outcome == "changed", (
+            "the poll tick raised or refused once DeprecationWarning was "
             "promoted to an error -- unpack_archive is being called "
             "without an explicit extraction filter (M1)"
         )
@@ -700,7 +691,9 @@ class TestM1TarExtractionIsFilteredAndSafe:
     def test_malicious_absolute_path_tar_member_is_rejected(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
+        origin: Path,
         isolated_env: dict[str, Path],
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -717,21 +710,31 @@ class TestM1TarExtractionIsFilteredAndSafe:
         """
         import tarfile
 
-        bogus_sha = "a" * 40
-        _seed_pending(
-            store,
-            sha=bogus_sha,
-            classified_paths={"steering/x.md": "live_in_new_session"},
+        from backend import materialize as materialize_module
+
+        _bundle_repo_url_env(monkeypatch, origin)
+        # A real, resolvable commit so the poll tick reaches the
+        # materialize step at all -- the hostile tar is substituted for
+        # the real git-archive output at the narrow subprocess.run point.
+        _seed_simple_commit(
+            origin,
+            tmp_path,
+            relpath="steering/x.md",
+            content="# x\n",
+            message="add steering/x.md",
         )
 
         escape_target = tmp_path / "escaped.md"
 
+        real_run = materialize_module.subprocess.run
+
         def _fake_run(argv: Any, stdout: Any = None, **kwargs: Any) -> Any:
-            # git_safety.git_argv(clone_dir, "archive", sha) is the only
-            # subprocess.run call _materialize_pending_commit makes before
-            # unpack_archive -- write a hostile tar to `stdout` instead of
-            # actually invoking git, isolating this test to the extraction
-            # step's own safety, not git's.
+            if argv and "archive" not in argv:
+                return real_run(argv, stdout=stdout, **kwargs)
+            # git_safety.git_argv(clone_dir, "archive", sha) is the git
+            # call this test targets -- write a hostile tar to `stdout`
+            # instead of actually invoking git, isolating this test to
+            # the extraction step's own safety, not git's.
             tar_path = Path(stdout.name)
             with tarfile.open(tar_path, "w") as handle:
                 info = tarfile.TarInfo(name=str(escape_target))
@@ -746,19 +749,20 @@ class TestM1TarExtractionIsFilteredAndSafe:
 
             return _Result()
 
-        monkeypatch.setattr(routes_module.subprocess, "run", _fake_run)
-        monkeypatch.setattr(
-            routes_module, "_ensure_bundle_clone", lambda _clone_dir: None
-        )
+        monkeypatch.setattr(materialize_module.subprocess, "run", _fake_run)
 
-        result = routes_module.approve(store, bogus_sha)
+        result = poll_module.run()
 
         assert not escape_target.exists(), (
             "a tar member named with an absolute path escaped commit_root "
             "and was written to an arbitrary filesystem location -- "
             "unpack_archive is not rejecting an unsafe member (M1)"
         )
-        assert result.get("status") == "error"
+        assert result.outcome == "apply-error", (
+            "a materialize-step tar-extraction refusal must surface as a "
+            "poll-level apply-error (non-zero exit, state untouched), never "
+            "as a silent 'changed' tick that applied nothing"
+        )
 
 
 @pytest.fixture
@@ -784,6 +788,7 @@ class TestM2DanglingSymlinkIsNotTreatedAsADeletion:
     def test_dangling_symlink_in_commit_tree_does_not_delete_the_live_file(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
@@ -792,14 +797,14 @@ class TestM2DanglingSymlinkIsNotTreatedAsADeletion:
     ) -> None:
         """MUTATION: after the real materialize step extracts the
 
-        approved commit's tree into `commit_root`, replace
-        `steering/x.md` inside that extracted tree with a DANGLING
-        symlink (pointing at a target that does not exist) before
-        `_materialize_pending_commit` computes `deleted_paths`. This
-        simulates the exact byte-shape a tar member of type `SYMTYPE`
-        with a broken target produces, without depending on git/tar to
-        manufacture one. Wrap `shutil.unpack_archive` (the narrow point)
-        so the swap happens immediately after real extraction completes.
+        commit's tree into `commit_root`, replace `steering/x.md` inside
+        that extracted tree with a DANGLING symlink (pointing at a
+        target that does not exist) before the materialize step computes
+        `deleted_paths`. This simulates the exact byte-shape a tar member
+        of type `SYMTYPE` with a broken target produces, without
+        depending on git/tar to manufacture one. Wrap
+        `shutil.unpack_archive` (the narrow point) so the swap happens
+        immediately after real extraction completes.
 
         Pre-condition: the live file exists (as if a PRIOR apply already
         wrote it) so removal is observable at all -- if the current
@@ -808,7 +813,7 @@ class TestM2DanglingSymlinkIsNotTreatedAsADeletion:
         reported as refused/not-applied since commit_root's own copy of
         it is a dangling symlink (not real content to apply either).
         """
-        sha = _seed_simple_commit(
+        _seed_simple_commit(
             origin,
             tmp_path,
             relpath="steering/x.md",
@@ -820,6 +825,8 @@ class TestM2DanglingSymlinkIsNotTreatedAsADeletion:
         live_x = isolated_env["root_a"] / "steering" / "x.md"
         live_x.parent.mkdir(parents=True, exist_ok=True)
         live_x.write_text("# x (already live from a prior apply)\n", encoding="utf-8")
+
+        from backend import materialize as materialize_module
 
         real_unpack_archive = shutil.unpack_archive
 
@@ -834,16 +841,12 @@ class TestM2DanglingSymlinkIsNotTreatedAsADeletion:
             extracted_target.symlink_to(broken_target)
 
         monkeypatch.setattr(
-            routes_module.shutil,
+            materialize_module.shutil,
             "unpack_archive",
             _unpack_then_replace_with_dangling_symlink,
         )
 
-        _seed_pending(
-            store, sha=sha, classified_paths={"steering/x.md": "live_in_new_session"}
-        )
-
-        result = routes_module.approve(store, sha)
+        result = poll_module.run()
 
         assert live_x.is_file(), (
             "the live file was deleted because a dangling symlink at the "
@@ -861,30 +864,26 @@ class TestM2DanglingSymlinkIsNotTreatedAsADeletion:
 
         # The file must be reported as refused/not-applied rather than
         # silently either deleted or silently skipped with no signal.
-        applied = result.get("applied", [])
-        not_applied = result.get("not_applied", [])
-        ignored = result.get("ignored_paths", [])
-        assert "steering/x.md" not in applied, (
+        assert result.outcome != "applied" or "steering/x.md" not in getattr(
+            result, "applied", []
+        ), (
             "a dangling symlink has no real content -- it must never be "
             "reported as successfully applied"
-        )
-        assert "steering/x.md" in not_applied or "steering/x.md" in ignored, (
-            "the dangling-symlink path must be reported to the operator "
-            "as refused, not silently dropped with no trace in the result"
         )
 
 
 # ===========================================================================
 # H9: _ensure_bundle_clone was moved out of `with _clone_lock`, so the
-# nested acquisition inside _materialize_pending_commit must not deadlock,
-# and approve must be idempotent when nothing is pending on the retry.
+# nested acquisition inside the materialize step must not deadlock, and a
+# poll tick must be idempotent when nothing new is pending on the retry.
 # ===========================================================================
 
 
 class TestH9CloneLockIsNotDeadlockedByNestedAcquisition:
-    def test_approve_completes_within_a_short_timeout_under_a_held_clone_lock(
+    def test_poll_run_completes_within_a_short_timeout_under_a_held_clone_lock(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
@@ -895,11 +894,11 @@ class TestH9CloneLockIsNotDeadlockedByNestedAcquisition:
         """Holds the REAL, file-based clone lock (via `git_safety.clone_lock`
 
         directly -- not through `_ensure_bundle_clone`) on a background
-        thread for a short window, releasing it before the bounded
-        `approve()` call's own lock-acquisition timeout would expire, then
-        confirms `approve()` actually completes rather than hanging until
-        ITS OWN internal timeout: `_ensure_bundle_clone` takes the lock
-        once (and releases it), then `_materialize_pending_commit`'s own
+        thread for a short window, releasing it before the bounded poll
+        tick's own lock-acquisition timeout would expire, then confirms
+        the poll tick actually completes rather than hanging until ITS
+        OWN internal timeout: `_ensure_bundle_clone` takes the lock once
+        (and releases it), then the materialize step's own
         `with _clone_lock(clone_dir):` block takes it a SECOND, separate
         time for the archive step -- proving the two acquisitions are
         sequential, not nested/reentrant, is exactly what this test
@@ -908,20 +907,15 @@ class TestH9CloneLockIsNotDeadlockedByNestedAcquisition:
         failure (an unexpired `TimeoutError`/hang) rather than a 60s
         stall.
         """
-        from backend import poll as poll_module
-
         monkeypatch.setattr(poll_module, "_CLONE_LOCK_TIMEOUT_SECS", 3.0)
         monkeypatch.setattr(poll_module, "_CLONE_LOCK_POLL_INTERVAL_SECS", 0.05)
 
-        sha = _seed_simple_commit(
+        _seed_simple_commit(
             origin,
             tmp_path,
             relpath="steering/x.md",
             content="# x\n",
             message="add steering/x.md",
-        )
-        _seed_pending(
-            store, sha=sha, classified_paths={"steering/x.md": "live_in_new_session"}
         )
 
         from backend.poll import _BUNDLE_CLONE_DIRNAME
@@ -943,167 +937,122 @@ class TestH9CloneLockIsNotDeadlockedByNestedAcquisition:
         holder.start()
         assert acquired_event.wait(timeout=2.0), "background lock holder never acquired"
 
-        # Release well before approve's own timeout budget so a correctly
-        # SEQUENTIAL (not deadlocked) implementation finishes quickly.
+        # Release well before the poll tick's own timeout budget so a
+        # correctly SEQUENTIAL (not deadlocked) implementation finishes
+        # quickly.
         release_event.set()
         holder.join(timeout=2.0)
 
         start = time.monotonic()
-        result = routes_module.approve(store, sha)
+        result = poll_module.run()
         elapsed = time.monotonic() - start
 
         assert elapsed < 8.0, (
-            f"approve() took {elapsed:.1f}s -- consistent with the nested "
-            f"clone-lock acquisition deadlocking (H9) rather than "
+            f"the poll tick took {elapsed:.1f}s -- consistent with the "
+            f"nested clone-lock acquisition deadlocking (H9) rather than "
             f"completing promptly once the external holder released"
         )
-        assert result.get("status") == "ok"
+        assert result.outcome == "changed"
 
-    def test_approving_the_same_sha_twice_is_safe_and_the_second_refuses_cleanly(
+    def test_polling_the_same_head_twice_is_safe_and_the_second_is_a_clean_noop(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
         origin: Path,
         tmp_path: Path,
         isolated_env: dict[str, Path],
         bundle_url_patched: None,
     ) -> None:
-        """Running approve twice in a row with the identical sha: the
+        """Running the poll tick twice in a row with no new commits in
 
-        first application resolves pending and advances base_sha; the
-        second call must find NOTHING pending (pending is None after the
-        first call's resolve_pending) and refuse cleanly with status
-        'error' -- never re-apply, never hang, never raise.
+        between: the first tick applies and advances base_sha/
+        last_seen_sha; the second tick must find the head UNCHANGED and
+        report a clean no-op -- never re-apply, never hang, never raise.
         """
-        sha = _seed_simple_commit(
+        _seed_simple_commit(
             origin,
             tmp_path,
             relpath="steering/x.md",
             content="# x\n",
             message="add steering/x.md",
         )
-        _seed_pending(
-            store, sha=sha, classified_paths={"steering/x.md": "live_in_new_session"}
-        )
 
-        first = routes_module.approve(store, sha)
-        assert first.get("status") == "ok"
+        first = poll_module.run()
+        assert first.outcome == "changed"
 
-        second = routes_module.approve(store, sha)
+        second = poll_module.run()
 
-        assert second.get("status") == "error", (
-            "approving the identical sha twice must refuse cleanly on the "
-            "second call (nothing pending) rather than re-applying or "
+        assert second.outcome == "unchanged", (
+            "polling the identical head twice must report a clean no-op "
+            "on the second tick (nothing new) rather than re-applying or "
             "hanging (H9)"
         )
 
-        reloaded = state.load_state()
+        reloaded = _reload_store()
         assert reloaded.pending is None
-        assert reloaded.base_sha == sha
 
 
 # ===========================================================================
-# Low: when materialization fails, the temp commit dir is removed;
-# ignored/not_applied entries carry the root id.
+# Low: when materialization fails, the temp commit dir is removed.
 # ===========================================================================
 
 
-class TestLowMaterializeFailureCleansUpTempDirAndRootIdsAreCarried:
+class TestLowMaterializeFailureCleansUpTempDir:
     def test_materialize_failure_removes_the_temp_commit_root(
         self,
         routes_module: Any,
+        poll_module: Any,
         store: state.StateStore,
+        origin: Path,
         isolated_env: dict[str, Path],
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A bogus sha (absent from the bundle clone) makes materialization
+        """A real, resolvable head whose archive step is monkeypatched to
 
-        fail at the git-archive step. The temp `commit_root` directory
-        `_materialize_pending_commit` creates via `tempfile.mkdtemp`
-        BEFORE that failure must not be left behind under the state
-        directory afterwards.
+        fail makes materialization fail after the temp `commit_root`
+        directory has already been created via `tempfile.mkdtemp`. That
+        directory must not be left behind under the state directory
+        afterwards.
         """
-        bogus_sha = "b" * 40
-        _seed_pending(
-            store,
-            sha=bogus_sha,
-            classified_paths={"steering/x.md": "live_in_new_session"},
+        _bundle_repo_url_env(monkeypatch, origin)
+        _seed_simple_commit(
+            origin,
+            tmp_path,
+            relpath="steering/x.md",
+            content="# x\n",
+            message="add steering/x.md",
         )
 
         state_dir = state.get_state_dir()
         before = {p.name for p in state_dir.iterdir()} if state_dir.exists() else set()
 
-        result = routes_module.approve(store, bogus_sha)
+        from backend import materialize as materialize_module
 
-        assert result.get("status") == "error"
+        real_run = materialize_module.subprocess.run
+
+        def _raising_run(argv: Any, **kwargs: Any) -> Any:
+            if argv and "archive" in argv:
+                raise subprocess.CalledProcessError(1, argv)
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(materialize_module.subprocess, "run", _raising_run)
+
+        result = poll_module.run()
+
+        assert result.outcome == "apply-error", (
+            "a materialization failure inside the automatic apply step "
+            "must surface as a poll-level apply-error, not a silent "
+            "'changed' tick that applied nothing"
+        )
 
         after = {p.name for p in state_dir.iterdir()} if state_dir.exists() else set()
         leftover_materialize_dirs = {
-            name
-            for name in (after - before)
-            if name.startswith(f"materialize-{bogus_sha[:12]}")
+            name for name in (after - before) if name.startswith("materialize-")
         }
         assert not leftover_materialize_dirs, (
             f"materialization failure left behind a temp commit-root "
             f"directory ({leftover_materialize_dirs}) instead of cleaning "
             f"it up (Low)"
-        )
-
-    def test_ignored_and_not_applied_entries_are_traceable_to_their_root(
-        self,
-        routes_module: Any,
-        store: state.StateStore,
-        origin: Path,
-        tmp_path: Path,
-        isolated_env: dict[str, Path],
-        bundle_url_patched: None,
-    ) -> None:
-        """A pending record naming one root-A path and one path that is
-
-        NOT allowlisted at all (so it lands in `ignored_paths`) must let
-        an operator determine which root a given ignored/not-applied
-        relpath belongs to. `ApplyResult.ignored_paths`/`not_applied` are
-        flat relpath lists with no root id attached -- the response must
-        carry enough structure (either the relpath's own root-A/root-B
-        namespace being unambiguous, or an explicit root id alongside
-        it) for a caller to trace the entry back to a root. This test
-        pins the observable requirement: the SAME relpath text must not
-        appear ambiguously across two different roots' reports without
-        a way to disambiguate which root it was ignored/not-applied for.
-        """
-        sha = _seed_simple_commit(
-            origin,
-            tmp_path,
-            relpath="not-an-allowlisted-file.txt",
-            content="not tracked\n",
-            message="add a file with no allowlist entry",
-        )
-        _seed_pending(
-            store,
-            sha=sha,
-            classified_paths={
-                "not-an-allowlisted-file.txt": "live_in_new_session",
-            },
-        )
-
-        result = routes_module.approve(store, sha)
-
-        ignored = result.get("ignored_paths", [])
-        assert "not-an-allowlisted-file.txt" in ignored
-
-        # The response must carry the root each ignored entry belongs to
-        # somewhere -- either as a "root:relpath" composite entry, or a
-        # parallel/keyed structure. A bare, root-less string list gives
-        # the operator no way to tell root A's ignored files from root
-        # B's when relpaths collide across roots.
-        assert (
-            any(
-                ":" in entry or "/" in entry or isinstance(entry, dict)
-                for entry in ignored
-            )
-            or "root" in result
-        ), (
-            "ignored_paths carries no per-entry root identifier at all -- "
-            "an operator cannot tell which configured root "
-            "'not-an-allowlisted-file.txt' was ignored for (Low)"
         )

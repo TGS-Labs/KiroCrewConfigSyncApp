@@ -257,22 +257,27 @@ def _assert_no_network_or_git(
 
     `subprocess.run` — armed inside each test, AFTER its fixture setup
     (which runs real git directly via the bare `subprocess` module) has
-    already completed, rather than as an autouse fixture. `routes.py`
-    does `import subprocess` (a shared reference to the one stdlib
-    module object), so patching `subprocess.run` globally would also
-    break every fixture helper in this file that still needs real git —
-    arming it only around the `restore(...)` call itself avoids that
-    collision while still catching a mutation that adds a git/network
-    call inside `restore` (which would call the same, now-patched,
-    `subprocess.run`).
+    already completed, rather than as an autouse fixture. The one git
+    call site reachable from a materialize/apply path
+    (`backend.materialize`'s `git archive` call, per that module's own
+    docstring: "the one additional git call this function needs") is
+    what this guard patches — `backend/routes.py` itself no longer
+    imports `subprocess` at all (the git call moved out of `routes.py`
+    into `backend/materialize.py` under the auto-apply ruling), so
+    patching `routes_module.subprocess` is no longer meaningful; patching
+    `backend.materialize`'s own `subprocess.run` still catches a
+    mutation that adds a git/network call inside `restore`, since that
+    is the only module in this app's materialize/apply seam that ever
+    shells out to git.
     """
+    from backend import materialize as materialize_module
 
     def _boom(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError(
             "restore must not invoke subprocess.run (no network/git call)"
         )
 
-    monkeypatch.setattr(routes_module.subprocess, "run", _boom)
+    monkeypatch.setattr(materialize_module.subprocess, "run", _boom)
 
 
 # ---------------------------------------------------------------------------

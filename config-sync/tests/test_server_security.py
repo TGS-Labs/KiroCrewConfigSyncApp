@@ -1,11 +1,17 @@
 """FAILING tests for senior-review H7: `backend/server.py`'s mutating
 
-POST routes (`push`, `pending/{sha}/approve`, `pending/{sha}/decline`,
-`restore/{id}`) have no CSRF/Host protection at all. Because the server
-binds loopback-only (`127.0.0.1`) but is a plain, unauthenticated HTTP
-server, ANY web page open in a browser on the same machine can POST to
-it via `fetch`/a form submit — the loopback bind stops a remote
-attacker, not a malicious page the operator merely has open in a tab.
+POST routes (`push`, `restore/{id}`) have no CSRF/Host protection at all.
+Because the server binds loopback-only (`127.0.0.1`) but is a plain,
+unauthenticated HTTP server, ANY web page open in a browser on the same
+machine can POST to it via `fetch`/a form submit — the loopback bind
+stops a remote attacker, not a malicious page the operator merely has
+open in a tab.
+
+**Operator ruling (requirements.md Introduction; Requirement 4.4, 4.6
+[Reserved]): there is no `pending/{sha}/approve`/`.../decline` route —
+the poll tick applies automatically with no box-side decision step.
+`push` and `restore` remain as the two mutation-capable POST targets
+this guard is proven against.**
 
 ## Pinned interfaces this file requires `backend/server.py` to implement
 
@@ -53,8 +59,6 @@ _REQUIRED_HEADER_VALUE = "1"
 
 _MUTATING_REQUESTS: List[Tuple[str, str]] = [
     ("POST", "/api/apps/config-sync/push"),
-    ("POST", "/api/apps/config-sync/pending/abc123/approve"),
-    ("POST", "/api/apps/config-sync/pending/abc123/decline"),
     ("POST", "/api/apps/config-sync/restore/apply-1"),
 ]
 
@@ -91,8 +95,6 @@ def route_calls(monkeypatch: pytest.MonkeyPatch) -> Dict[str, int]:
         "status": 0,
         "drift": 0,
         "push_now": 0,
-        "approve": 0,
-        "decline": 0,
         "restore": 0,
     }
 

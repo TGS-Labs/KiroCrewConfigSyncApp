@@ -636,6 +636,19 @@ def test_main_guard_exits_zero_on_a_changed_head(
     store = state.load_state()
     store.record_seen_sha(old_sha)
 
+    # The changed-head tick now applies automatically; this test only pins
+    # the exit code, so hand the apply an empty commit tree rather than
+    # driving a real git archive through the subprocess mock above.
+    from backend import materialize
+
+    commit_root = isolated_state_dir.parent / "main-guard-commit-tree"
+    commit_root.mkdir()
+    monkeypatch.setattr(
+        materialize,
+        "_materialize_pending_commit",
+        lambda _store, _sha: (commit_root, {"A": [], "B": []}, {"A": [], "B": []}),
+    )
+
     monkeypatch.delitem(sys.modules, "backend.poll", raising=False)
     try:
         with pytest.raises(SystemExit) as exc_info:

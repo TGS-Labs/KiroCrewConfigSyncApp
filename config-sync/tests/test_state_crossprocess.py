@@ -247,172 +247,19 @@ def test_status_sees_pending_written_by_second_process_after_server_start(
 
 
 # ---------------------------------------------------------------------------
-# C1.ii — the #65 stale-sha check must run against the newest on-disk sha
-# ---------------------------------------------------------------------------
-
-
-def test_approve_with_sha_written_by_second_process_is_accepted(
-    running_server: Tuple[str, int], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A pending record written by the second process AFTER the server's
-
-    store was already cached must still be approvable by ITS sha — the
-    #65 staleness check must consult the newest on-disk `pending`, not
-    the server's stale in-memory one. Approve is routed through
-    `routes.approve`, which calls `apply_commit`; stub that out so this
-    test isolates the STALENESS CHECK (state visibility) from the apply
-    pipeline itself, which is covered elsewhere.
-    """
-    from backend import routes as routes_module
-
-    def _fake_apply_commit(**kwargs: Any) -> Any:
-        class _Result:
-            outcome = "applied"
-            applied: list[str] = []
-            not_applied: list[str] = []
-            ignored_paths: list[str] = []
-            dropped_cron_names: list[str] = []
-            paused_cron_names: list[str] = []
-            changed_instance_names: list[str] = []
-            incomplete_registrations: dict[str, Any] = {}
-            needs_credential: list[str] = []
-            propagation = None
-            apply_id = "apply-test"
-            reason = ""
-
-        return _Result()
-
-    monkeypatch.setattr(routes_module, "apply_commit", _fake_apply_commit)
-    monkeypatch.setattr(
-        routes_module,
-        "_materialize_pending_commit",
-        lambda store, sha: (Path("/nonexistent"), {}, {}),
-    )
-
-    host, port = running_server
-
-    # Warm the server's cache with an EMPTY store first.
-    _request(host, port, "GET", "/api/apps/config-sync/status")
-
-    fresh_sha = "cafef00d" * 5
-    poll_store = _second_process_store()
-    poll_store.set_pending(
-        sha=fresh_sha,
-        author="poller",
-        subject="fresh commit",
-        classified_paths={"a.md": "instant"},
-    )
-
-    status_code, _headers, body = _request(
-        host, port, "POST", f"/api/apps/config-sync/pending/{fresh_sha}/approve"
-    )
-    assert status_code == 200
-    parsed = json.loads(body)
-    assert parsed["status"] == "ok", parsed
-
-
-def test_approve_with_stale_sha_after_second_process_advanced_pending_is_refused(
-    running_server: Tuple[str, int],
-) -> None:
-    """The mirror case: the server's cache holds an OLDER pending sha; a
-
-    second process (poll) has since accumulated a NEWER commit into
-    pending. Approving the OLD sha must be refused — never silently
-    accepted against memory that no longer matches what the operator
-    would actually be shown if they reloaded the UI.
-    """
-    host, port = running_server
-
-    old_sha = "111111111111111111111111111111111111ab"
-    poll_store = _second_process_store()
-    poll_store.set_pending(
-        sha=old_sha,
-        author="poller",
-        subject="first commit",
-        classified_paths={"a.md": "instant"},
-    )
-
-    # Server observes the old pending sha (populating whatever cache it
-    # keeps) via a status read.
-    status_code, _headers, body = _request(
-        host, port, "GET", "/api/apps/config-sync/status"
-    )
-    assert json.loads(body)["pending"]["sha"] == old_sha
-
-    # A second process tick advances pending to a NEWER commit.
-    new_sha = "222222222222222222222222222222222222cd"
-    poll_store2 = _second_process_store()
-    poll_store2.accumulate_pending(
-        sha=new_sha,
-        author="poller",
-        subject="second commit",
-        classified_paths={"b.md": "instant"},
-    )
-
-    # Approving the now-stale OLD sha must be refused, not accepted
-    # against the server's outdated cache.
-    status_code, _headers, body = _request(
-        host, port, "POST", f"/api/apps/config-sync/pending/{old_sha}/approve"
-    )
-    parsed = json.loads(body)
-    assert parsed.get("status") == "error", parsed
-
-
-# ---------------------------------------------------------------------------
 # C1.iii — approve/decline must not clobber a concurrent writer's fields
+#
+# NOTE: three tests formerly in this section
+# (test_approve_with_sha_written_by_second_process_is_accepted,
+# test_approve_with_stale_sha_after_second_process_advanced_pending_is_
+# refused, and test_decline_does_not_clobber_fields_a_concurrent_process_
+# wrote_meanwhile) were removed — they asserted approve/decline
+# themselves, which no longer exist under the operator's auto-apply
+# ruling (there is no box-side approve/decline route;
+# tests/test_poll_autoapply.py). The no-clobber property they were
+# protecting is covered by tests/test_state_rmw_clears.py and
+# test_interleaved_state_store_saves_never_lose_an_update below.
 # ---------------------------------------------------------------------------
-
-
-def test_decline_does_not_clobber_fields_a_concurrent_process_wrote_meanwhile(
-    running_server: Tuple[str, int],
-) -> None:
-    """Sequence: server reads state (pending present, `last_pushed_hash`
-
-    is None) -> a second process (push) records a successful push,
-    setting `last_pushed_hash` -> the operator declines the pending
-    commit. The decline's read-modify-write must NOT revert
-    `last_pushed_hash` back to `None` — it must only ever touch
-    `pending`/`base_sha`, the fields `resolve_pending` actually owns.
-
-    This is the concrete shape of "approve/decline save the whole stale
-    document back" from the finding: a naive implementation that reads
-    once into a long-lived in-memory `_payload` and later writes that
-    WHOLE dict back overwrites every field a concurrent process changed
-    in between, not just the two fields this call means to change.
-    """
-    host, port = running_server
-
-    sha = "3333333333333333333333333333333333333e"
-    poll_store = _second_process_store()
-    poll_store.set_pending(
-        sha=sha,
-        author="poller",
-        subject="a change",
-        classified_paths={"a.md": "instant"},
-    )
-
-    # Server observes pending, populating its own cache/copy.
-    _request(host, port, "GET", "/api/apps/config-sync/status")
-
-    # Concurrent push process (a THIRD store instance — push.py's own
-    # separate cron invocation) records a successful push in between.
-    push_store = _second_process_store()
-    push_store.record_push_success(
-        tree_hash="pushedhash123",
-        branch="config-sync/push",
-        pr_url="https://example.invalid/pr/1",
-    )
-
-    status_code, _headers, body = _request(
-        host, port, "POST", f"/api/apps/config-sync/pending/{sha}/decline"
-    )
-    assert json.loads(body).get("status") == "ok"
-
-    # Re-read from disk directly (ground truth, bypassing the server's
-    # own possibly-stale cache) to confirm the push process's write
-    # survived the server's decline write.
-    verify_store = _second_process_store()
-    assert verify_store.last_pushed_hash == "pushedhash123"
 
 
 # ---------------------------------------------------------------------------

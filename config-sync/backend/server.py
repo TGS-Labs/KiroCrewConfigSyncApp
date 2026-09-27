@@ -63,7 +63,7 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 from backend import routes, state
@@ -204,18 +204,6 @@ class Handler(BaseHTTPRequestHandler):
             result = routes.drift(_get_store())
         elif method == "POST" and rest == ("push",):
             result = routes.push_now(_get_store())
-        elif (
-            method == "POST"
-            and len(rest) == 3
-            and rest[0] == "pending"
-            and rest[2] in ("approve", "decline")
-            and _is_safe_param_segment(rest[1])
-        ):
-            sha = rest[1]
-            handler: Callable[["state.StateStore", str], Dict[str, Any]] = (
-                routes.approve if rest[2] == "approve" else routes.decline
-            )
-            result = handler(_get_store(), sha)
         elif (
             method == "POST"
             and len(rest) == 2

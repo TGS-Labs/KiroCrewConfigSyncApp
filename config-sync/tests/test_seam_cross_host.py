@@ -12,11 +12,14 @@ by a REAL local git bundle repo (bare origin + clone, merged via a genuine
 Only the Buildo/network edge is stubbed (there is none here -- push never
 opens a PR in this test, it stops at ``push.tokenize_tree`` over an
 in-memory tree) and the bundle-repo remote is a local ``file://`` bare repo,
-exactly as ``tests/test_push.py``/``tests/test_routes_approve_seam.py`` stub
+exactly as ``tests/test_push.py``/``tests/test_poll_autoapply.py`` stub
 it. Every other step runs through the REAL modules: ``push.tokenize_tree``,
 ``apply.apply_commit`` (which internally calls ``portable.expand`` and
-``registration.check_registrations``), and ``routes.approve``'s real
-``_materialize_pending_commit`` + ``state.resolve_pending`` path.
+``registration.check_registrations``), and ``poll.run()``'s real
+``_materialize_pending_commit`` + auto-apply path (there is no box-side
+approve/decline route under the operator's auto-apply ruling -- the PR
+merge into ``Kiro-Config-Bundles`` main IS the approval gate;
+``tests/test_poll_autoapply.py``).
 
 Interface pinned by this file (host-1 root pair, host-2 root pair):
 
@@ -37,25 +40,27 @@ stubbed by never calling them -- the captured tree is what push.py would
 hand to ``tree_hash``/the working-copy writer). That tokenized tree is
 committed directly into a real bundle-repo clone via a real
 ``--no-ff`` merge (mirroring the org's disallow-squash policy), then
-``routes.approve`` is run against a REAL host-2 clone/materialize path with
+host 2's own ``poll.run()`` tick is run for real, with
 ``KIROCREW_HOME``/``KIRO_HOME`` repointed at host 2's own roots, so
 ``apply.apply_commit`` and ``registration.check_registrations`` run for
-real against host 2's live filesystem.
+real against host 2's live filesystem -- with no operator approve/decline
+step anywhere in the path.
 
 Assertions (a)-(e), matching tasks.md 8.1 verbatim:
     (a) tree layout matches what ``apply_commit``/
-        ``routes._materialize_pending_commit`` consume (relpaths per root,
+        ``poll._materialize_pending_commit`` consume (relpaths per root,
         no extra prefix).
     (b) on host 2, ``registration.check_registrations`` (invoked inside
         ``apply.apply_commit``) resolves the push-emitted prompt relpath
         and ``rev`` is a complete registration.
-    (c) after ``routes.approve`` on host 2, the live ``agents/rev.json``
-        prompt and ``mcp.json`` path values expand to HOST 2's roots, the
-        prompt file holds host 1's bytes, and the ``mcp.json`` header value
-        is host 2's own live credential -- never ``"<redacted>"``
-        (requirements.md 4.10); no ``${KIROCREW_HOME}``/``${KIRO_HOME}``
-        token and no host-1 path survives in ANY applied JSON file
-        (iterated per file, per member).
+    (c) after host 2's automatic poll-tick apply, the live
+        ``agents/rev.json`` prompt and ``mcp.json`` path values expand to
+        HOST 2's roots, the prompt file holds host 1's bytes, and the
+        ``mcp.json`` header value is host 2's own live credential --
+        never ``"<redacted>"`` (requirements.md 4.10); no
+        ``${KIROCREW_HOME}``/``${KIRO_HOME}`` token and no host-1 path
+        survives in ANY applied JSON file (iterated per file, per
+        member).
     (d) re-running the push collector+tokenizer on host 2 yields host 1's
         ``tree_hash`` (requirements.md 2.11's cross-host byte-identity
         property).
@@ -434,37 +439,50 @@ class TestPortabilitySeamCrossHost:
             origin, tmp_path, "config-sync-h1-initial", tokenized_h1
         )
 
-        # --- Seed a pending record on host 2 naming this commit, then
-        # approve it through the REAL routes.approve path. Re-point
-        # KIROCREW_HOME/KIRO_HOME back at host 2's roots first --
-        # `_collect_redact_tokenize_h1` above pointed them at host 1 for
-        # the collection phase, and `apply.py`/`collect.py` resolve these
-        # env vars at CALL time, so every host-2 operation from here on
-        # must re-assert host 2's own roots immediately before it runs. ---
+        # --- Under the auto-apply ruling the PR merge into main IS the
+        # approval gate (no box-side approve/decline route exists --
+        # tests/test_poll_autoapply.py). Host 2's own poll tick must pick
+        # up merge_sha and apply it automatically: seed base_sha to the
+        # commit BEFORE merge_sha (the pre-merge origin/main tip) so
+        # poll's range-fetch (`base_sha..head`) covers exactly this
+        # commit, re-assert host 2's own KIROCREW_HOME/KIRO_HOME
+        # immediately before running it (`_collect_redact_tokenize_h1`
+        # above pointed them at host 1 for the collection phase, and
+        # `apply.py`/`collect.py`/`poll.py` resolve these env vars at
+        # CALL time), and run poll.run() for real. ---
         monkeypatch.setenv("KIROCREW_HOME", str(h2_root_a))
         monkeypatch.setenv("KIRO_HOME", str(h2_root_b))
 
+        from backend import poll as poll_module
         from backend import state as state_module
 
+        pre_merge_sha = _git(
+            "rev-parse", f"{merge_sha}^1", cwd=tmp_path / "config-sync-h1-initial"
+        ).stdout.strip()
         store = state_module.load_state()
-        classified_paths = {
-            relpath: "live_on_next_resolution" for relpath in tokenized_h1
-        }
-        classified_paths["config-bundles/agent-prompts/rev.md"] = "live_in_new_session"
-        store.set_pending(
-            sha=merge_sha,
-            author="Author <a@example.com>",
-            subject="config-sync-h1-initial",
-            classified_paths=classified_paths,
-        )
+        store.record_seen_sha(pre_merge_sha)
+        store.advance_base_sha(pre_merge_sha)
 
-        approve_result = routes_module_h2.approve(store, merge_sha)
+        poll_result = poll_module.run()
+        assert poll_result.outcome == "changed", (
+            f"host 2's poll tick did not report a changed head: " f"{poll_result!r}"
+        )
+        assert poll_result.head_sha == merge_sha
+
+        reloaded_store = state_module.load_state()
+        last_apply = reloaded_store.last_apply
+        assert last_apply is not None, (
+            "host 2's poll tick must record an automatic apply result "
+            "(requirements.md 4.4) -- last_apply is still empty"
+        )
+        assert last_apply.get("sha") == merge_sha
+        approve_result = last_apply
 
         # --- (b) registration resolves the push-emitted prompt relpath
         # and rev is complete. ---
         assert (
-            approve_result.get("status") == "ok"
-        ), f"approve on host 2 did not report ok: {approve_result!r}"
+            approve_result.get("outcome") == "applied"
+        ), f"host 2's automatic apply did not report ok: {approve_result!r}"
         incomplete = approve_result.get("incomplete_registrations", {})
         assert "rev" not in incomplete, (
             "rev's registration was reported incomplete on host 2's "
@@ -555,19 +573,15 @@ class TestPortabilitySeamCrossHost:
         second_merge_sha = _commit_tree_via_merge(
             origin, tmp_path, "config-sync-h1-v2", second_commit_tree
         )
-        store2 = state_module.load_state()
-        store2.set_pending(
-            sha=second_merge_sha,
-            author="Author <a@example.com>",
-            subject="config-sync-h1-v2",
-            classified_paths={
-                "config-bundles/agent-prompts/rev.md": "live_in_new_session"
-            },
-        )
-        second_approve_result = routes_module_h2.approve(store2, second_merge_sha)
+        second_poll_result = poll_module.run()
+        assert second_poll_result.outcome == "changed"
+        assert second_poll_result.head_sha == second_merge_sha
+        second_approve_result = state_module.load_state().last_apply
+        assert second_approve_result is not None
+        assert second_approve_result.get("sha") == second_merge_sha
         assert (
-            second_approve_result.get("status") == "ok"
-        ), f"second approve did not report ok: {second_approve_result!r}"
+            second_approve_result.get("outcome") == "applied"
+        ), f"second automatic apply did not report ok: {second_approve_result!r}"
 
         live_mcp_after_second = json.loads(
             (h2_root_a / "mcp.json").read_text(encoding="utf-8")
@@ -620,6 +634,12 @@ class TestPortabilitySeamCrossHost:
         host2_tree_hash = push_module.tree_hash(host2_tokenized)
 
         expected_tree_hash = push_module.tree_hash(second_commit_tree)
+        if host2_tree_hash != expected_tree_hash:
+            for k in sorted(set(host2_tokenized) | set(second_commit_tree)):
+                a = host2_tokenized.get(k)
+                b = second_commit_tree.get(k)
+                if a != b:
+                    print("DIFF", k, "GOT:", a, "WANT:", b)
         assert host2_tree_hash == expected_tree_hash, (
             "re-collecting and re-tokenizing host 2's now-applied "
             "configuration did not reproduce the exact tree hash of the "
@@ -646,16 +666,13 @@ class TestPortabilitySeamCrossHost:
         third_merge_sha = _commit_tree_via_merge(
             origin, tmp_path, "config-sync-h1-v3", third_commit_tree
         )
-        store3 = state_module.load_state()
-        store3.set_pending(
-            sha=third_merge_sha,
-            author="Author <a@example.com>",
-            subject="config-sync-h1-v3",
-            classified_paths={"agents/rev.json": "live_on_next_resolution"},
-        )
-        third_approve_result = routes_module_h2.approve(store3, third_merge_sha)
+        third_poll_result = poll_module.run()
+        third_approve_result = state_module.load_state().last_apply
 
-        assert third_approve_result.get("status") == "ok", (
+        assert third_poll_result.outcome == "changed"
+        assert third_approve_result is not None
+        assert third_approve_result.get("sha") == third_merge_sha
+        assert third_approve_result.get("outcome") == "applied", (
             "follow-up commit touching only agents/rev.json (with shared "
             "files absent from changed_paths but already key-carrying in "
             f"the commit tree) did not apply: {third_approve_result!r}"

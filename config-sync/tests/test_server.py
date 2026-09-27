@@ -1,20 +1,14 @@
-"""FAILING tests for the HTTP wiring of `backend/server.py` (tasks.md 6.2's
+"""Tests for the HTTP wiring of `backend/server.py` (tasks.md 6.2's
 
-"missing HTTP wiring"; design.md's routes table, ~lines 331-345: "every
-route is served by backend/server.py").
+"missing HTTP wiring"; design.md's routes table).
 
-## The gap
+## Operator ruling — no approve/decline route
 
-`backend/server.py` today (37 lines) only implements `GET /health` and
-`GET /api/apps/config-sync/status` (the latter as a hand-rolled stub — an
-`{"app": ..., "version": ...}` body that does NOT dispatch to
-`backend.routes.status`). It has no dispatch at all for `GET drift`,
-`POST push`, `POST pending/{sha}/approve`, `POST pending/{sha}/decline`,
-or `POST restore/{id}`, and no `StateStore` wiring to give `routes.*` its
-required argument. This file drives the REAL server process over a REAL
-HTTP socket (`127.0.0.1`, ephemeral port, in a background thread) and
-proves each design-table route dispatches to its matching
-`backend.routes.*` function.
+Under the operator ruling (requirements.md Introduction; Requirement
+4.4, 4.6 [Reserved]), there is no box-side approve/decline step: the
+poll tick applies an incoming commit automatically (see
+`tests/test_poll_autoapply.py`). This file therefore only wires and
+tests the routes that remain: `status`, `drift`, `push`, and `restore`.
 
 ## Interface this file assumes for `server.py`
 
@@ -24,8 +18,8 @@ hard-code or fight over a port number, and to route each design-table
 path/verb pair to the matching `backend.routes` function, passing it a
 `StateStore` the server holds (module-level or per-request — this file
 does not care which, only that the SAME store object the test seeded
-pending/state into is the one `routes.*` sees, and that the route
-functions themselves are not re-implemented inline in `server.py`).
+state into is the one `routes.*` sees, and that the route functions
+themselves are not re-implemented inline in `server.py`).
 
 This file SPIES on `backend.routes.*` (patching each function on the
 `backend.routes` module before starting the server) rather than
@@ -85,8 +79,6 @@ def route_calls(monkeypatch: pytest.MonkeyPatch) -> Dict[str, List[Tuple[Any, ..
         "status": [],
         "drift": [],
         "push_now": [],
-        "approve": [],
-        "decline": [],
         "restore": [],
     }
 
@@ -100,10 +92,8 @@ def route_calls(monkeypatch: pytest.MonkeyPatch) -> Dict[str, List[Tuple[Any, ..
     monkeypatch.setattr(routes_module, "status", _make("status", 0))
     monkeypatch.setattr(routes_module, "drift", _make("drift", 0))
     monkeypatch.setattr(routes_module, "push_now", _make("push_now", 0))
-    monkeypatch.setattr(routes_module, "approve", _make("approve", 1))
-    monkeypatch.setattr(routes_module, "decline", _make("decline", 1))
     # restore(store, apply_id) — tasks.md 6.2's own route, same shape as
-    # approve/decline (store + one path-parameter).
+    # push_now (store + one path-parameter).
     monkeypatch.setattr(
         routes_module,
         "restore",
@@ -264,44 +254,6 @@ def test_post_push_dispatches_to_routes_push_now(
     assert len(route_calls["push_now"]) == 1
 
 
-def test_post_pending_approve_dispatches_to_routes_approve_with_sha(
-    running_server: Tuple[str, int],
-    route_calls: Dict[str, List[Tuple[Any, ...]]],
-) -> None:
-    host, port = running_server
-    sha = "abc123def456"
-    status_code, headers, body = _request(
-        host, port, "POST", f"/api/apps/config-sync/pending/{sha}/approve"
-    )
-
-    assert status_code == 200
-    assert headers.get("content-type", "").startswith("application/json")
-    parsed = json.loads(body)
-    assert parsed["spy"] == "approve"
-    assert len(route_calls["approve"]) == 1
-    # The sha the client sent must be the exact value routes.approve saw —
-    # never dropped, truncated, or hard-coded server-side.
-    assert route_calls["approve"][0] == (sha,)
-
-
-def test_post_pending_decline_dispatches_to_routes_decline_with_sha(
-    running_server: Tuple[str, int],
-    route_calls: Dict[str, List[Tuple[Any, ...]]],
-) -> None:
-    host, port = running_server
-    sha = "fedcba098765"
-    status_code, headers, body = _request(
-        host, port, "POST", f"/api/apps/config-sync/pending/{sha}/decline"
-    )
-
-    assert status_code == 200
-    assert headers.get("content-type", "").startswith("application/json")
-    parsed = json.loads(body)
-    assert parsed["spy"] == "decline"
-    assert len(route_calls["decline"]) == 1
-    assert route_calls["decline"][0] == (sha,)
-
-
 def test_post_restore_dispatches_to_routes_restore_with_id(
     running_server: Tuple[str, int],
     route_calls: Dict[str, List[Tuple[Any, ...]]],
@@ -329,8 +281,6 @@ def test_post_restore_dispatches_to_routes_restore_with_id(
     "path",
     [
         "/api/apps/config-sync/push",
-        "/api/apps/config-sync/pending/abc/approve",
-        "/api/apps/config-sync/pending/abc/decline",
         "/api/apps/config-sync/restore/apply-1",
     ],
 )
@@ -393,38 +343,6 @@ def test_unknown_path_is_404(
 
 
 @pytest.mark.parametrize(
-    "sha",
-    ["a/b", "..", "..%2Fetc", "a%2F..%2F..%2Fb"],
-)
-def test_approve_path_parameter_containing_slash_or_traversal_never_reaches_routes(
-    running_server: Tuple[str, int],
-    route_calls: Dict[str, List[Tuple[Any, ...]]],
-    sha: str,
-) -> None:
-    """A sha/id segment containing a literal or percent-encoded `/` or
-
-    `..` must never reach `routes.approve` as a single opaque path
-    parameter — the request either 404s (parsed as more/fewer path
-    segments than the route pattern expects) or is refused outright, but
-    `routes.approve` is never called with a value that could let a
-    crafted sha escape its single-segment slot. Mutation this catches:
-    an implementation that does `path.split('/')[-2]` with no segment-
-    count check would happily hand `".."` or a slash-bearing decoded
-    value through as `sha`.
-    """
-    host, port = running_server
-    status_code, _headers, _body = _request(
-        host, port, "POST", f"/api/apps/config-sync/pending/{sha}/approve"
-    )
-
-    # 501 is BaseHTTPRequestHandler's own default for an unimplemented
-    # do_POST — a legitimate "not wired yet" refusal shape alongside the
-    # more specific 400/404/405 a real router might choose.
-    assert status_code in (400, 404, 405, 501)
-    assert len(route_calls["approve"]) == 0
-
-
-@pytest.mark.parametrize(
     "apply_id",
     ["a/b", "..", "..%2Fetc"],
 )
@@ -450,8 +368,6 @@ def test_response_body_is_valid_json_with_json_content_type_on_every_route(
         ("GET", "/api/apps/config-sync/status"),
         ("GET", "/api/apps/config-sync/drift"),
         ("POST", "/api/apps/config-sync/push"),
-        ("POST", "/api/apps/config-sync/pending/sha1/approve"),
-        ("POST", "/api/apps/config-sync/pending/sha1/decline"),
         ("POST", "/api/apps/config-sync/restore/apply-1"),
     ]
     for method, path in requests:

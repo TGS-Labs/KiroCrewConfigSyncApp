@@ -1,18 +1,22 @@
 """Apply an approved bundle-repo commit to this instance (tasks.md 5.1).
 
-Covers design.md's ``backend/apply.py — the applier (backend route,
-human-triggered only)`` component and requirements.md 4.4, 4.5, 4.7, 4.8,
-4.10, Requirement 5, Requirement 6.
+Covers design.md's ``backend/apply.py`` component and requirements.md
+4.4, 4.5, 4.7, 4.8, 4.10, Requirement 5, Requirement 6.
 
-This is called ONLY from an approve route, never from a poll tick
-(requirements.md 4.4 — "no automatic application"): the caller supplies
-``approved_sha`` explicitly and this module refuses unless it matches
-``store.pending``. This module never calls ``store.clear_pending()`` or
-``store.advance_base_sha()`` — those two mutations belong exclusively to
-``backend/routes.py``'s approve/decline handlers via a single
-``state.resolve_pending()`` (tasks.md 6.1). ``apply_commit`` only READS
-``store.pending``/``store.base_sha`` for the approval-SHA gate and only
-WRITES ``store.restore_dirs`` for the backup directory it creates.
+Under the operator ruling (the PR merge into ``Kiro-Config-Bundles``
+main IS the approval gate — there is no box-side approve/decline step),
+``apply_commit`` is called by ``backend/poll.py`` itself, once per poll
+tick that finds a new head, immediately after materializing that head's
+tree — never from an HTTP route. The caller supplies ``approved_sha``
+explicitly and this module refuses unless it matches ``store.pending``.
+This module never calls ``store.clear_pending()`` or
+``store.advance_base_sha()`` directly — those mutations are owned by
+``poll.py`` (via ``state.resolve_pending`` on a full "applied" outcome)
+or ``state.record_partial_apply`` (on a "partial" outcome), following
+the exact same outcome-driven split the former approve route used.
+``apply_commit`` only READS ``store.pending``/``store.base_sha`` for the
+approval-SHA gate and only WRITES ``store.restore_dirs`` for the backup
+directory it creates.
 
 Step order (design.md apply step-by-step, commit a06f117):
 
@@ -85,8 +89,14 @@ class ApplyResult:
             ``"partial"`` (at least one file failed — never reported as
             ``"applied"``, per requirements.md 4.8).
         applied: Relpaths successfully written or deleted.
-        not_applied: Relpaths that were allowlisted and eligible but
-            failed to write/delete.
+        not_applied: ``{relpath: reason}`` for every path that was
+            allowlisted and eligible but failed to write/delete — the
+            REAL per-path cause (requirements.md 4.14): a malformed-JSON
+            parse failure, the specific vet-rejection, the specific
+            registration-block reason, a missing-parent-directory or
+            permission ``OSError`` string, or a symlink/path-containment
+            refusal. Never a generic placeholder — a caller (e.g.
+            ``poll.py``'s status summary) surfaces this string verbatim.
         ignored_paths: Relpaths present in the commit but not allowlisted
             (requirements.md 4.5) — refused before any write attempt,
             including a path-traversal or symlink-shaped relpath.
@@ -139,7 +149,7 @@ class ApplyResult:
 
     outcome: str
     applied: List[str] = field(default_factory=list)
-    not_applied: List[str] = field(default_factory=list)
+    not_applied: Dict[str, str] = field(default_factory=dict)
     ignored_paths: List[str] = field(default_factory=list)
     dropped_cron_names: List[str] = field(default_factory=list)
     paused_cron_names: List[str] = field(default_factory=list)
@@ -785,7 +795,7 @@ def _apply_one_file(
     apply_roots: Dict[str, Path],
     cron_vet: Optional[VetCallable],
     applied: List[str],
-    not_applied: List[str],
+    not_applied: Dict[str, str],
     needs_credential: List[str],
     non_portable_paths: List[str],
     unresolved_references: List[str],
@@ -806,6 +816,9 @@ def _apply_one_file(
     only boundary a genuine bug (a confirmed-backup ``RuntimeError``, a
     backup ``OSError``, or a sanitize crash on a malformed document) ever
     crosses.
+
+    ``not_applied`` is ``{relpath: reason}`` — every refusal below records
+    the REAL cause (requirements.md 4.14), never a generic placeholder.
     """
     root_path = _root_path(root)
 
@@ -819,7 +832,10 @@ def _apply_one_file(
     # `unlink()` can ever reach through it.
     live_target = _resolve_target(root_path, relpath)
     if live_target is None:
-        not_applied.append(relpath)
+        not_applied[relpath] = (
+            f"{relpath}: refused — the live path escapes root {root}'s "
+            "directory (symlink or path-traversal containment check)"
+        )
         return
 
     is_deleted = relpath in deleted_by_root.get(root, set())
@@ -847,8 +863,8 @@ def _apply_one_file(
         try:
             if live_target.exists():
                 live_target.unlink()
-        except OSError:
-            not_applied.append(relpath)
+        except OSError as exc:
+            not_applied[relpath] = f"{relpath}: delete failed — {exc}"
             return
         applied.append(relpath)
         applied_files.append(
@@ -857,14 +873,20 @@ def _apply_one_file(
         return
 
     source = commit_root / relpath
-    if _is_unsafe_source(commit_root, relpath) or not source.exists():
-        not_applied.append(relpath)
+    if _is_unsafe_source(commit_root, relpath):
+        not_applied[relpath] = (
+            f"{relpath}: refused — the commit's own tree entry escapes "
+            "the materialized commit root (path-traversal check)"
+        )
+        return
+    if not source.exists():
+        not_applied[relpath] = f"{relpath}: not found in the materialized commit tree"
         return
 
     try:
         raw_content = source.read_bytes()
-    except OSError:
-        not_applied.append(relpath)
+    except OSError as exc:
+        not_applied[relpath] = f"{relpath}: could not read from the commit tree — {exc}"
         return
 
     existed_live = live_existed_before
@@ -880,7 +902,11 @@ def _apply_one_file(
             # a deliberate, bounded exception (Requirement 6) — a parse
             # failure must not be treated as "safe to apply verbatim",
             # which would bypass that boundary entirely.
-            not_applied.append(relpath)
+            not_applied[relpath] = (
+                f"{relpath}: refused — could not parse as JSON (a "
+                "crons.json/instances.json file must be valid JSON to "
+                "pass the Requirement 6 vet)"
+            )
             return
         # Step 4 (design.md): expand tokens to this host's roots BEFORE
         # step 4a's placeholder restore and step 4b's sanitize, so the
@@ -995,7 +1021,7 @@ def _apply_one_file(
             # entirely, silently destroying whatever live credential
             # restore would otherwise have preserved. Refusing this one
             # file never blocks the rest of the commit's eligible files.
-            not_applied.append(relpath)
+            not_applied[relpath] = f"{relpath}: refused — could not parse as JSON"
             return
         # A non-JSON file (e.g. a SKILL.md body, or any other allowlisted
         # non-JSON asset) is written through as committed — this file
@@ -1015,8 +1041,8 @@ def _apply_one_file(
         )
         if not existed_live:
             created_by_root[root].append(relpath)
-    except OSError:
-        not_applied.append(relpath)
+    except OSError as exc:
+        not_applied[relpath] = f"{relpath}: write failed — {exc}"
 
 
 def apply_commit(
@@ -1070,7 +1096,7 @@ def apply_commit(
     restore_dir = Path(state_module.get_state_dir()) / "restores" / apply_id
 
     applied: List[str] = []
-    not_applied: List[str] = []
+    not_applied: Dict[str, str] = {}
     ignored_paths: List[str] = []
     needs_credential: List[str] = []
     non_portable_paths: List[str] = []
@@ -1101,7 +1127,16 @@ def apply_commit(
         eligible = [
             (root, relpath) for root, relpath in eligible if relpath not in blocked
         ]
-        not_applied.extend(sorted(blocked))
+        for blocked_relpath in sorted(blocked):
+            reasons = [
+                f"{agent}: {'; '.join(agent_reasons)}"
+                for agent, agent_reasons in sorted(reg_result.incomplete_agents.items())
+            ]
+            detail = "; ".join(reasons) if reasons else "incomplete agent registration"
+            not_applied[blocked_relpath] = (
+                f"{blocked_relpath}: refused — part of an incomplete "
+                f"agent registration ({detail})"
+            )
 
     # --- Sanitize crons.json / instances.json (Requirement 6) -----------
     # Restoration (step 4) must run before sanitize (step 4a), so this is
@@ -1132,15 +1167,21 @@ def apply_commit(
         # reported as an unqualified success, since restore would have
         # no way to find any of their backups either.
         report = propagate.build_report(applied_files)
+        restore_dir_reason = f"restore directory was not recorded: {exc}"
         return ApplyResult(
             outcome=_OUTCOME_PARTIAL,
-            not_applied=sorted({relpath for _root, relpath in eligible} | blocked),
+            not_applied={
+                relpath: restore_dir_reason
+                for relpath in sorted(
+                    {relpath for _root, relpath in eligible} | blocked
+                )
+            },
             ignored_paths=ignored_paths,
             incomplete_registrations=dict(reg_result.incomplete_agents),
             propagation_report=dict(reg_result.propagation_report),
             propagation=report,
             apply_id=apply_id,
-            reason=f"restore directory was not recorded: {exc}",
+            reason=restore_dir_reason,
         )
 
     for root, relpath in eligible:
@@ -1178,7 +1219,7 @@ def apply_commit(
                 changed_instance_names=changed_instance_names,
                 changed_commands=changed_commands,
             )
-        except Exception:
+        except Exception as exc:
             # H3: once an earlier file in this apply has already
             # succeeded or been refused, NOTHING raised from a later
             # file's handling may escape this loop — a confirmed-backup
@@ -1208,7 +1249,7 @@ def apply_commit(
             if not prior_progress:
                 raise
             if relpath not in not_applied:
-                not_applied.append(relpath)
+                not_applied[relpath] = f"{relpath}: unexpected error — {exc}"
 
     # Write the per-root created-file manifest for every root that had at
     # least one eligible write/delete attempt in this apply — even when
@@ -1233,7 +1274,9 @@ def apply_commit(
         # state, so this apply must not be reported as an unqualified
         # success.
         reason = manifest_error
-        not_applied.extend(p for p in applied if p not in not_applied)
+        for p in applied:
+            if p not in not_applied:
+                not_applied[p] = f"{p}: {manifest_error}"
         applied = []
 
     report = propagate.build_report(applied_files)

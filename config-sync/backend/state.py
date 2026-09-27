@@ -97,6 +97,7 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "pending_pr_stale": None,
     "history": [],
     "restore_dirs": {},
+    "last_apply": None,
 }
 
 
@@ -386,6 +387,18 @@ class StateStore:
     @property
     def restore_dirs(self) -> dict[str, str]:
         return cast("dict[str, str]", self._payload["restore_dirs"])
+
+    @property
+    def last_apply(self) -> dict[str, Any] | None:
+        """The dashboard-facing summary of the most recent automatic
+
+        apply — applied sha, not-applied paths with real reasons, paused
+        cron names, needs-credential entries, and the other
+        ``ApplyResult`` fields ``backend.materialize._apply_result_to_dict``
+        renders. ``None`` before this instance's first-ever poll-driven
+        apply attempt.
+        """
+        return cast("dict[str, Any] | None", self._payload["last_apply"])
 
     # -- mutations --------------------------------------------------------
 
@@ -894,6 +907,37 @@ class StateStore:
 
         self._locked_rmw(_mutate)
 
+    def revert_pending(
+        self, *, base_sha: str | None, pending: dict[str, Any] | None
+    ) -> None:
+        """Restore ``base_sha``/``pending`` to explicit prior values, in
+
+        ONE persisted write — the undo counterpart to
+        ``record_poll_pending`` for a tick whose auto-apply step never
+        got the chance to run at all (the commit could not even be
+        materialized from the bundle repo). ``record_poll_pending``
+        already durably wrote a fresh/accumulated pending record and
+        (on a fresh record) advanced ``base_sha`` to the new head BEFORE
+        the materialize/apply step runs; when that step then fails with
+        no eligible commit ever applied, the tick must leave state
+        byte-for-byte as it was before this tick ran, not with a pending
+        record for a commit nothing was ever attempted against.
+
+        Args:
+            base_sha: the exact ``base_sha`` value to restore (typically
+                captured by the caller before ``record_poll_pending`` ran
+                this tick).
+            pending: the exact ``pending`` value to restore (a deep-ish
+                copy is made so a later in-place mutation of the caller's
+                own dict cannot corrupt the persisted payload).
+        """
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["base_sha"] = base_sha
+            fresh["pending"] = dict(pending) if pending is not None else None
+
+        self._locked_rmw(_mutate)
+
     def resolve_pending(self, sha: str) -> None:
         """Resolve the pending record against an operator decision — the
 
@@ -940,22 +984,28 @@ class StateStore:
     def record_partial_apply(self, *, sha: str, not_applied: dict[str, str]) -> None:
         """Record a PARTIAL apply's not-applied paths/reasons onto the
 
-        pending record WITHOUT resolving it (H4, ratified): a partial
-        apply must leave ``pending``/``base_sha`` untouched — the operator
-        still needs to see this commit as pending — while the not-applied
-        paths and their reasons become visible via ``status()``.
+        pending record WITHOUT resolving it: under the auto-apply ruling
+        (requirements.md 4.4/4.9/4.14), a partial apply must leave
+        ``base_sha`` at the last FULLY-applied commit — NEVER reset to
+        ``None`` and NEVER advanced to the broken head — while the
+        not-applied paths and their real per-path reasons become visible
+        via ``status()`` and the SAME range is retried on the next poll
+        tick (Kiro-Config-Bundles#65's skip-intervening-commits class:
+        resetting ``base_sha`` to ``None`` would make the next tick's
+        range start over from "no prior boundary", silently re-widening
+        past commits that already fully applied on an earlier tick).
 
         Args:
-            sha: the sha the caller (``approve``) just ran ``apply_commit``
-                against. Applied only when it still matches
-                ``pending["sha"]`` — the same staleness guard
+            sha: the sha the caller (``poll.run()``) just ran
+                ``apply_commit`` against. Applied only when it still
+                matches ``pending["sha"]`` — the same staleness guard
                 ``resolve_pending`` enforces, so a partial-apply record
-                for a sha that is no longer the pending one (a poll tick
-                accumulated a newer commit mid-apply) is silently a
+                for a sha that is no longer the pending one (a later poll
+                tick accumulated a newer commit mid-apply) is silently a
                 no-op rather than attaching stale data to a different
                 commit's pending record.
             not_applied: ``{relpath: reason}`` for every path that failed
-                to apply.
+                to apply, with the REAL per-path cause.
 
         Raises:
             ValueError: when there is no pending record at all, mirroring
@@ -979,24 +1029,16 @@ class StateStore:
             updated = dict(pending)
             updated["not_applied"] = dict(not_applied)
             fresh["pending"] = updated
-            # H4: "base_sha not advanced" on a partial apply. base_sha
-            # only ever moves via set_pending (bootstrapping the very
-            # first-ever pending record to that commit's own sha) or a
-            # genuine operator decision (resolve_pending/
-            # advance_base_sha) -- accumulate_pending never touches it.
-            # When base_sha still equals THIS pending commit's own sha,
-            # no operator decision has actually happened yet: the only
-            # thing that ever set it was set_pending's bootstrap side
-            # effect for this exact cycle, which a partial apply must
-            # not leave standing as if a decision boundary had moved.
-            # Revert it to "no decision yet" (None) in that case; if
-            # base_sha instead names an EARLIER, already-decided commit
-            # (a later accumulate_pending moved pending.sha forward
-            # while base_sha stayed at that prior decision), it is left
-            # untouched -- there is a real decision boundary there to
-            # preserve.
-            if fresh.get("base_sha") == sha:
-                fresh["base_sha"] = None
+            # base_sha is deliberately left UNTOUCHED here: it already
+            # names the last FULLY-applied commit (either a genuine prior
+            # decision boundary, or set_pending's first-ever-poll
+            # bootstrap, which a partial outcome on THIS commit means was
+            # never actually fully applied — but base_sha must still not
+            # regress to None, since that would re-widen the next poll's
+            # range past commits already fully applied earlier). The
+            # caller (poll.run()) is responsible for not calling
+            # resolve_pending on a partial outcome, which is what would
+            # otherwise incorrectly advance base_sha to this broken head.
 
         self._locked_rmw(_mutate)
 
@@ -1005,6 +1047,21 @@ class StateStore:
 
         def _mutate(fresh: dict[str, Any]) -> None:
             fresh["restore_dirs"][apply_id] = restore_dir
+
+        self._locked_rmw(_mutate)
+
+    def record_last_apply(self, summary: dict[str, Any]) -> None:
+        """Overwrite the dashboard-facing last-apply summary.
+
+        Called once per poll tick that actually ran ``apply_commit``
+        (``poll.py``'s ``_apply_new_head``), regardless of outcome —
+        ``"applied"``, ``"partial"``, or ``"refused-sha-mismatch"`` all
+        overwrite the previous summary, so ``status()`` always reflects
+        the most recent apply ATTEMPT, not only the most recent success.
+        """
+
+        def _mutate(fresh: dict[str, Any]) -> None:
+            fresh["last_apply"] = dict(summary)
 
         self._locked_rmw(_mutate)
 

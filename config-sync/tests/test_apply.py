@@ -1716,7 +1716,7 @@ def test_apply_with_no_changed_paths_is_a_clean_no_op_success(
 
     assert result.outcome == "applied"
     assert result.applied == []
-    assert result.not_applied == []
+    assert result.not_applied == {}
 
 
 def test_apply_deleting_a_path_absent_on_disk_locally_is_not_an_error(

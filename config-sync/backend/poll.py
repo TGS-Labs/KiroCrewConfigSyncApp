@@ -146,12 +146,19 @@ the gap where only `poll.py`'s call site held it).
 from __future__ import annotations
 
 import contextlib
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
+from backend import apply as apply_module
 from backend import classify, state
+from backend.materialize import (
+    _apply_result_to_dict,
+    _materialize_pending_commit,
+    _MaterializeError,
+)
 from backend.safety import git_safety
 
 #: Name/URL of the bundle repo every poll tick checks, matching
@@ -190,14 +197,19 @@ _ROOT_IDS: Tuple[str, ...] = ("A", "B")
 class PollResult:
     """Outcome of a single poll-job tick.
 
-    ``outcome`` distinguishes the four cases this module reports:
+    ``outcome`` distinguishes the five cases this module reports:
     ``"unchanged"`` (head matches `state.last_seen_sha`), ``"changed"``
     (head differs — the signal task 4.2/4.3 consumes), ``"ls-remote-failed"``
-    (the head resolution itself failed), and ``"fetch-failed"`` (the head
+    (the head resolution itself failed), ``"fetch-failed"`` (the head
     resolved as changed, but a LATER step — the bundle-repo clone/fetch, the
     commit-metadata/changed-path git calls, or classification — raised;
-    senior-review round-2 H-new-1). ``head_sha`` is the newly resolved head
-    SHA on ``"changed"`` or ``"fetch-failed"``; ``None`` otherwise.
+    senior-review round-2 H-new-1), and ``"apply-error"`` (the head resolved
+    and classified, but the resolved commit could not be materialized from
+    the bundle repo — the `git archive` step itself failed; `base_sha`/
+    `pending` are reverted to their pre-tick values in this case, not left
+    at whatever `record_poll_pending` wrote for this tick). ``head_sha`` is
+    the newly resolved head SHA on ``"changed"``, ``"fetch-failed"``, or
+    ``"apply-error"``; ``None`` otherwise.
     """
 
     outcome: str
@@ -210,7 +222,7 @@ class PollResult:
 #: non-zero"). Kept as one named set rather than a per-call-site string
 #: comparison so a THIRD failure outcome added later cannot be missed at
 #: the single exit-code call-site (the ``__main__`` guard below).
-_FAILURE_OUTCOMES = frozenset({"ls-remote-failed", "fetch-failed"})
+_FAILURE_OUTCOMES = frozenset({"ls-remote-failed", "fetch-failed", "apply-error"})
 
 
 def notify_operator(
@@ -525,6 +537,204 @@ def _classify_changed_paths(
     return merged, ignored, sorted(touched)
 
 
+def _first_parent_parent_sha(state_dir_owner: str, sha: str) -> str | None:
+    """Resolve ``sha``'s first-parent parent commit, or ``None`` if
+
+    ``sha`` has no parent (the repository's very first commit).
+
+    Used ONLY by ``_apply_new_head`` for the bootstrap case: the very
+    first-ever poll tick has no ``base_sha`` yet (nothing has EVER fully
+    applied on this instance), so there is no "last fully applied commit"
+    to fall back to on a partial outcome. Falling back to the commit
+    right before ``sha`` — rather than leaving ``base_sha`` at ``None``
+    or advancing it to the broken ``sha`` itself — is what keeps the next
+    tick's retry range correctly bounded (Kiro-Config-Bundles#65's
+    skip-intervening-commits class: a ``None`` boundary would make the
+    NEXT tick single-commit-log only its own new head, silently never
+    retrying whatever of THIS commit's files never applied).
+
+    Raises nothing: a resolution failure (e.g. a shallow clone missing
+    the parent object) is treated as "no parent" — ``base_sha`` staying
+    ``None`` in that rare case is a safe degradation, not a crash.
+    """
+    clone_dir = Path(state_dir_owner) / _BUNDLE_CLONE_DIRNAME
+    try:
+        completed = subprocess.run(
+            git_safety.git_argv(clone_dir, "rev-parse", f"{sha}^"),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError, git_safety.GitSafetyError):
+        return None
+    parent = (completed.stdout or "").strip()
+    return parent or None
+
+
+def _apply_new_head(
+    store: state.StateStore,
+    head_sha: str,
+    poll_ignored_paths: List[str],
+    *,
+    pre_tick_base_sha: str | None,
+    pre_tick_pending: Dict[str, Any] | None,
+) -> bool:
+    """Materialize and apply ``head_sha`` automatically — the auto-apply
+
+    step every "changed" poll tick runs with NO operator action
+    (requirements.md 4.4). Reuses ``backend.materialize._materialize_
+    pending_commit`` (the SAME helper the former approve route used) so
+    the tree this apply runs against is built identically; the
+    materialized temp tree is ALWAYS removed via ``finally``, including
+    when ``apply_commit`` itself raises.
+
+    Outcome handling (requirements.md 4.9/4.14):
+
+    - ``"applied"``: every eligible file succeeded. Resolves the pending
+      record via ``state.resolve_pending`` — the SAME call the former
+      approve route used — advancing ``base_sha`` to ``head_sha`` and
+      clearing ``pending``.
+    - ``"partial"``: at least one eligible file failed. ``pending`` is
+      annotated (real per-path reasons, never a placeholder) via
+      ``state.record_partial_apply`` rather than resolved, so the SAME
+      range is retried on the next tick. ``base_sha`` must land on the
+      last FULLY-applied commit, never ``None`` and never ``head_sha``
+      itself: when a prior ``base_sha`` already exists (a genuine earlier
+      full-apply boundary), it is left untouched by
+      ``record_partial_apply``; on the very first-ever tick (no prior
+      ``base_sha`` at all — ``set_pending``'s own bootstrap set it to
+      ``head_sha``, which this partial outcome now proves was never
+      actually fully applied), it is corrected back to ``head_sha``'s own
+      parent via ``_first_parent_parent_sha``.
+    - ``"refused-sha-mismatch"``: a later tick already accumulated a
+      newer commit into ``pending`` before this apply ran (the same #65
+      staleness race the old approve route guarded). Nothing to do here —
+      state was never mutated by ``apply_commit``, and the newer pending
+      record is untouched.
+
+    A ``_MaterializeError`` (the commit could not be fetched/extracted)
+    reverts ``base_sha``/``pending`` to exactly what they were BEFORE this
+    tick's own ``record_poll_pending`` call (via ``state.revert_pending``)
+    and reports failure to the caller — nothing was ever eligible for
+    apply, so a pending record naming a commit this instance never even
+    materialized must not survive the tick. Returns ``False`` in this
+    case; the caller (``run()``) turns that into an error outcome and
+    skips ``record_seen_sha``/``notify_operator`` for this tick, so the
+    SAME head is re-resolved and retried on the next poll.
+
+    Args:
+        store: the loaded state store for this tick.
+        head_sha: the newly resolved head commit being applied.
+        poll_ignored_paths: the classifier's ``ignored_paths`` for this
+            tick's range (`_classify_changed_paths`'s own ``ignored``
+            result) — carried into `_record_last_apply` so `last_apply`
+            reports every path the classifier matched against NO
+            allowlist, not just whatever `apply_commit`'s narrower
+            allowlist gate happens to also flag.
+        pre_tick_base_sha: ``store.base_sha`` as it was captured by the
+            caller BEFORE this tick's `record_poll_pending` call — restored
+            verbatim on a `_MaterializeError`.
+        pre_tick_pending: ``store.pending`` as it was captured by the
+            caller BEFORE this tick's `record_poll_pending` call — restored
+            verbatim on a `_MaterializeError`.
+
+    Returns:
+        ``True`` if the materialize step ran (regardless of the apply
+        outcome — applied/partial/refused-sha-mismatch all count).
+        ``False`` only when the commit could not be materialized at all.
+    """
+
+    try:
+        commit_root, changed_paths, deleted_paths = _materialize_pending_commit(
+            store, head_sha
+        )
+    except _MaterializeError:
+        store.revert_pending(base_sha=pre_tick_base_sha, pending=pre_tick_pending)
+        return False
+
+    try:
+        result = apply_module.apply_commit(
+            approved_sha=head_sha,
+            commit_root=commit_root,
+            changed_paths=changed_paths,
+            store=store,
+            deleted_paths=deleted_paths,
+        )
+    finally:
+        shutil.rmtree(commit_root, ignore_errors=True)
+
+    if result.outcome == "applied":
+        try:
+            store.resolve_pending(head_sha)
+        except ValueError:
+            # #65 staleness race: pending moved between materialize and
+            # this call. apply_commit already ran against head_sha and
+            # fully applied it, but there is nothing left to resolve —
+            # leave the newer pending record exactly as it is.
+            pass
+    elif result.outcome == "partial":
+        store.record_partial_apply(sha=head_sha, not_applied=dict(result.not_applied))
+        # set_pending's bootstrap (requirements.md 4.9's "no decision has
+        # ever been made" clause) sets base_sha = head_sha unconditionally
+        # when this is the FIRST pending record ever — so base_sha is
+        # never None here, even on the very first tick. That bootstrap
+        # value is exactly the signature this partial outcome now proves
+        # wrong (head_sha was never actually fully applied): correct it
+        # back to head_sha's own parent. When base_sha instead names an
+        # EARLIER, already-fully-applied commit (a real prior boundary,
+        # from either a genuine earlier full apply or a PRIOR partial
+        # tick's own already-corrected value), it is left untouched.
+        if store.base_sha == head_sha:
+            parent_sha = _first_parent_parent_sha(str(state.get_state_dir()), head_sha)
+            if parent_sha is not None:
+                store.advance_base_sha(parent_sha)
+    # "refused-sha-mismatch": apply_commit refused before touching
+    # anything; no state mutation of ours is needed either.
+
+    _record_last_apply(store, head_sha, result, changed_paths, poll_ignored_paths)
+    return True
+
+
+def _record_last_apply(
+    store: state.StateStore,
+    head_sha: str,
+    result: Any,
+    changed_paths: Dict[str, List[str]],
+    poll_ignored_paths: List[str],
+) -> None:
+    """Record a dashboard-facing summary of the most recent automatic
+
+    apply (requirements.md: "status() reports the last apply ... for the
+    dashboard") — applied sha, not-applied paths with their real reasons,
+    paused cron names, the command checked for each, and needs-credential
+    entries. Rendered via the SAME ``_apply_result_to_dict`` the former
+    approve route used, so the shape is identical to what
+    ``routes._pending_changed_commands``'s sibling summaries already
+    produce.
+
+    ``poll_ignored_paths`` — `_classify_changed_paths`'s own ``ignored``
+    result for this tick's range — is merged into the recorded
+    ``ignored_paths`` alongside whatever `apply_commit` itself flagged
+    (`_apply_result_to_dict`'s ``ignored_paths`` comes from
+    ``ApplyResult.ignored_paths``, which only ever sees the already-
+    classified paths `_materialize_pending_commit` split by root — a path
+    the classifier matched against NO allowlist entry at all never
+    reaches `apply_commit`'s own gate, so without this merge it would be
+    silently absent from `last_apply` even though the classifier itself
+    already knew about it).
+    """
+    payload = _apply_result_to_dict(result, changed_paths)
+    payload["sha"] = head_sha
+    merged_ignored: Dict[str, None] = {}
+    for relpath in payload.get("ignored_paths", []):
+        merged_ignored.setdefault(relpath, None)
+    for relpath in poll_ignored_paths:
+        merged_ignored.setdefault(relpath, None)
+    payload["ignored_paths"] = list(merged_ignored)
+    store.record_last_apply(payload)
+
+
 def run() -> PollResult:
     """Run one poll-job tick: resolve the bundle repo's head, compare it
 
@@ -628,6 +838,15 @@ def run() -> PollResult:
         store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
+    # Captured BEFORE `record_poll_pending` below mutates `base_sha`/
+    # `pending` for this tick — `_apply_new_head` restores exactly these
+    # values via `state.revert_pending` if the commit cannot be
+    # materialized at all, so the tick leaves state byte-for-byte as it
+    # was on entry rather than with a pending record for a commit nothing
+    # was ever applied against.
+    pre_tick_base_sha = store.base_sha
+    pre_tick_pending = dict(store.pending) if store.pending is not None else None
+
     store.record_poll_pending(
         sha=head_sha,
         author=author,
@@ -636,6 +855,41 @@ def run() -> PollResult:
         ignored_paths=ignored_paths,
         touched_classes=touched_classes,
     )
+
+    # Auto-apply (requirements.md 4.4/4.9/4.14): under the operator ruling
+    # the PR merge into main IS the approval gate — this tick now
+    # materializes head_sha's tree and calls apply_commit itself, with NO
+    # operator action anywhere in this path. `_apply_new_head` owns the
+    # full materialize -> apply -> outcome-driven state mutation sequence
+    # (a "changed" tick that finds nothing to apply — every path ignored —
+    # still runs this and simply reports `outcome="applied"` with empty
+    # `applied`/`not_applied`, since `apply_commit` handles that case
+    # itself). A raised exception here (including one `_apply_new_head`
+    # deliberately re-raises from `apply_commit` itself) propagates out of
+    # `run()` unchanged — `_apply_new_head`'s own `finally` still removes
+    # the materialized temp tree first.
+    #
+    # A `False` return means the commit could not be materialized at all
+    # (the bundle-repo `git archive` step raised) — `_apply_new_head`
+    # already reverted `base_sha`/`pending` to their pre-tick values, so
+    # this tick reports an error outcome and must NOT advance
+    # `last_seen_sha` or notify: the next tick re-resolves and retries the
+    # SAME head, exactly like the `fetch-failed` degrade-and-retry path
+    # above.
+    materialized = _apply_new_head(
+        store,
+        head_sha,
+        ignored_paths,
+        pre_tick_base_sha=pre_tick_base_sha,
+        pre_tick_pending=pre_tick_pending,
+    )
+    if not materialized:
+        store.record_poll_failure(reason=f"could not materialize commit {head_sha}")
+        return PollResult(
+            outcome="apply-error",
+            head_sha=head_sha,
+            reason=f"could not materialize commit {head_sha}",
+        )
 
     # H3 (senior review round 1, still open going into round 2): advance
     # `last_seen_sha` to `head_sha` BEFORE notifying, not after. If

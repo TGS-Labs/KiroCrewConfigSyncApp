@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from backend import routes, state
+from backend import materialize, routes, state
 
 
 # ---------------------------------------------------------------------------
@@ -196,28 +196,29 @@ def test_is_app_enabled_returns_false_when_platform_import_fails(
 
 
 # ---------------------------------------------------------------------------
-# _relpath_to_root / _root_map_for: None changed_paths, an untraceable
-# relpath, and a traceable one.
+# _relpath_to_root / _root_map_for: moved to backend/materialize.py under
+# the auto-apply ruling (routes.py no longer defines these) — None
+# changed_paths, an untraceable relpath, and a traceable one.
 # ---------------------------------------------------------------------------
 
 
 def test_relpath_to_root_returns_none_when_changed_paths_is_none() -> None:
-    assert routes._relpath_to_root("x.md", None) is None
+    assert materialize._relpath_to_root("x.md", None) is None
 
 
 def test_relpath_to_root_returns_none_when_relpath_not_in_any_root() -> None:
     changed_paths = {"A": ["a.md"], "B": ["b.md"]}
-    assert routes._relpath_to_root("missing.md", changed_paths) is None
+    assert materialize._relpath_to_root("missing.md", changed_paths) is None
 
 
 def test_relpath_to_root_finds_the_owning_root() -> None:
     changed_paths = {"A": ["a.md"], "B": ["b.md"]}
-    assert routes._relpath_to_root("b.md", changed_paths) == "B"
+    assert materialize._relpath_to_root("b.md", changed_paths) == "B"
 
 
 def test_root_map_for_omits_untraceable_relpaths() -> None:
     changed_paths = {"A": ["a.md"], "B": []}
-    result = routes._root_map_for(["a.md", "untraceable.md"], changed_paths)
+    result = materialize._root_map_for(["a.md", "untraceable.md"], changed_paths)
     assert result == {"a.md": "A"}
 
 
