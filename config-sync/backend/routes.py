@@ -328,7 +328,7 @@ def status(store: "state_module.StateStore") -> Dict[str, Any]:
         return disabled
 
     redacted = _redacted_tree()
-    current_hash = push.tree_hash(redacted)
+    current_hash = push.current_push_tree_hash()
     drift_present = current_hash != store.last_pushed_hash
 
     return {
@@ -353,7 +353,7 @@ def drift(store: "state_module.StateStore") -> Dict[str, Any]:
         return disabled
 
     redacted = _redacted_tree()
-    current_hash = push.tree_hash(redacted)
+    current_hash = push.current_push_tree_hash()
     changed_files = (
         sorted(redacted.keys()) if current_hash != store.last_pushed_hash else []
     )

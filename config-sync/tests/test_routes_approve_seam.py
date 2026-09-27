@@ -484,7 +484,11 @@ class TestPollApplyRefusesWhenShaCannotBeMaterialized:
 
         result = poll_module.run()
 
-        assert result.outcome in ("fetch-failed", "apply-error")
+        assert result.outcome == "apply-error", (
+            "the archive/extract step fails inside _apply_new_head's own "
+            "materialize call, never at the earlier fetch-commit-details "
+            f"step — expected exactly 'apply-error', got {result.outcome!r}"
+        )
 
         live_x = isolated_env["root_a"] / "steering" / "x.md"
         assert not live_x.exists()

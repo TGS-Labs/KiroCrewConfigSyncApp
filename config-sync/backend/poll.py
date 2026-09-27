@@ -572,6 +572,34 @@ def _first_parent_parent_sha(state_dir_owner: str, sha: str) -> str | None:
     return parent or None
 
 
+def _root_ancestor_sha(state_dir_owner: str, sha: str) -> str:
+    """Resolve the oldest first-parent ancestor of ``sha`` — the
+
+    repository's very first commit reachable by walking ``sha^``
+    repeatedly until a commit has no parent (senior-review round-3
+    Medium: a multi-commit bootstrap partial, where NO prior ``base_sha``
+    ever existed and the tick's own classify pass only single-commit-
+    logged the newest head, must land ``base_sha`` at the earliest commit
+    in that same first-parent chain — never at an intermediate commit
+    that, like the head itself, was never independently and fully
+    applied on its own).
+
+    Used ONLY by ``_apply_new_head``'s bootstrap-partial correction, and
+    only when ``pre_tick_base_sha is None`` (no real prior boundary ever
+    recorded). Bounded by a plain iterative walk (never recursion) so a
+    long history cannot exhaust the stack; each step reuses
+    ``_first_parent_parent_sha``'s own resolution-failure handling — a
+    walk that cannot resolve a further parent (e.g. a shallow clone)
+    simply stops at the last SHA it could resolve, rather than raising.
+    """
+    current = sha
+    while True:
+        parent = _first_parent_parent_sha(state_dir_owner, current)
+        if parent is None:
+            return current
+        current = parent
+
+
 def _apply_new_head(
     store: state.StateStore,
     head_sha: str,
@@ -579,7 +607,7 @@ def _apply_new_head(
     *,
     pre_tick_base_sha: str | None,
     pre_tick_pending: Dict[str, Any] | None,
-) -> bool:
+) -> str | None:
     """Materialize and apply ``head_sha`` automatically — the auto-apply
 
     step every "changed" poll tick runs with NO operator action
@@ -594,19 +622,35 @@ def _apply_new_head(
     - ``"applied"``: every eligible file succeeded. Resolves the pending
       record via ``state.resolve_pending`` — the SAME call the former
       approve route used — advancing ``base_sha`` to ``head_sha`` and
-      clearing ``pending``.
+      clearing ``pending``. The caller (``run()``) is responsible for
+      recording ``last_pushed_hash`` for the tree this apply just wrote
+      (C-A) and for advancing ``last_seen_sha`` — both gated on this
+      outcome being ``"applied"``, never on a lesser one.
     - ``"partial"``: at least one eligible file failed. ``pending`` is
       annotated (real per-path reasons, never a placeholder) via
       ``state.record_partial_apply`` rather than resolved, so the SAME
-      range is retried on the next tick. ``base_sha`` must land on the
-      last FULLY-applied commit, never ``None`` and never ``head_sha``
-      itself: when a prior ``base_sha`` already exists (a genuine earlier
-      full-apply boundary), it is left untouched by
-      ``record_partial_apply``; on the very first-ever tick (no prior
-      ``base_sha`` at all — ``set_pending``'s own bootstrap set it to
-      ``head_sha``, which this partial outcome now proves was never
-      actually fully applied), it is corrected back to ``head_sha``'s own
-      parent via ``_first_parent_parent_sha``.
+      range is retried on the next tick — the caller (``run()``) must
+      NOT advance ``last_seen_sha`` for a partial outcome either (H-1),
+      or the next tick's own ``head_sha == last_seen_sha`` short-circuit
+      would swallow the retry before ``_apply_new_head`` ever runs again.
+      ``base_sha`` must land on the last FULLY-applied commit — never
+      ``None``, never ``head_sha`` itself, and never an INTERMEDIATE
+      commit inside this same not-fully-applied range (senior-review
+      round-3 Medium: a multi-commit tick whose range covers B then C,
+      where C's break makes the whole range partial, must leave
+      ``base_sha`` at the commit BEFORE the range even started — never
+      at B, which was itself never independently and fully applied).
+      ``pre_tick_base_sha`` (captured by the caller before this tick's
+      own ``record_poll_pending`` call) is exactly that "before the range
+      started" boundary, so the correction restores it directly rather
+      than walking back a single first-parent hop from ``head_sha``
+      (which lands on the range's own intermediate commit, not the
+      pre-tick boundary, whenever the range spans more than one commit).
+      On the very first-ever tick (no prior ``base_sha`` at all —
+      ``pre_tick_base_sha is None``), there is no earlier boundary to
+      restore, so the correction instead falls back to ``head_sha``'s own
+      parent via ``_first_parent_parent_sha`` — the single-commit-range
+      case this fallback already correctly covered.
     - ``"refused-sha-mismatch"``: a later tick already accumulated a
       newer commit into ``pending`` before this apply ran (the same #65
       staleness race the old approve route guarded). Nothing to do here —
@@ -618,7 +662,7 @@ def _apply_new_head(
     tick's own ``record_poll_pending`` call (via ``state.revert_pending``)
     and reports failure to the caller — nothing was ever eligible for
     apply, so a pending record naming a commit this instance never even
-    materialized must not survive the tick. Returns ``False`` in this
+    materialized must not survive the tick. Returns ``None`` in this
     case; the caller (``run()``) turns that into an error outcome and
     skips ``record_seen_sha``/``notify_operator`` for this tick, so the
     SAME head is re-resolved and retried on the next poll.
@@ -634,15 +678,16 @@ def _apply_new_head(
             allowlist gate happens to also flag.
         pre_tick_base_sha: ``store.base_sha`` as it was captured by the
             caller BEFORE this tick's `record_poll_pending` call — restored
-            verbatim on a `_MaterializeError`.
+            verbatim on a `_MaterializeError`, and used as the exact
+            correction target for a multi-commit partial outcome.
         pre_tick_pending: ``store.pending`` as it was captured by the
             caller BEFORE this tick's `record_poll_pending` call — restored
             verbatim on a `_MaterializeError`.
 
     Returns:
-        ``True`` if the materialize step ran (regardless of the apply
-        outcome — applied/partial/refused-sha-mismatch all count).
-        ``False`` only when the commit could not be materialized at all.
+        The apply outcome string (``"applied"``, ``"partial"``, or
+        ``"refused-sha-mismatch"``) when the materialize step ran at all.
+        ``None`` only when the commit could not be materialized at all.
     """
 
     try:
@@ -651,7 +696,7 @@ def _apply_new_head(
         )
     except _MaterializeError:
         store.revert_pending(base_sha=pre_tick_base_sha, pending=pre_tick_pending)
-        return False
+        return None
 
     try:
         result = apply_module.apply_commit(
@@ -675,25 +720,51 @@ def _apply_new_head(
             pass
     elif result.outcome == "partial":
         store.record_partial_apply(sha=head_sha, not_applied=dict(result.not_applied))
-        # set_pending's bootstrap (requirements.md 4.9's "no decision has
-        # ever been made" clause) sets base_sha = head_sha unconditionally
-        # when this is the FIRST pending record ever — so base_sha is
-        # never None here, even on the very first tick. That bootstrap
-        # value is exactly the signature this partial outcome now proves
-        # wrong (head_sha was never actually fully applied): correct it
-        # back to head_sha's own parent. When base_sha instead names an
-        # EARLIER, already-fully-applied commit (a real prior boundary,
-        # from either a genuine earlier full apply or a PRIOR partial
-        # tick's own already-corrected value), it is left untouched.
+        # set_pending's/record_poll_pending's bootstrap (requirements.md
+        # 4.9's "no decision has ever been made" clause) sets
+        # base_sha = head_sha unconditionally when this is the FIRST
+        # pending record ever — so base_sha is never None here, even on
+        # the very first tick. That bootstrap value is exactly the
+        # signature this partial outcome now proves wrong (head_sha was
+        # never actually fully applied): correct it back to the boundary
+        # from BEFORE this tick's own range started. When base_sha
+        # instead names an EARLIER, already-fully-applied commit (a real
+        # prior boundary, from either a genuine earlier full apply or a
+        # PRIOR partial tick's own already-corrected value), it is left
+        # untouched.
         if store.base_sha == head_sha:
-            parent_sha = _first_parent_parent_sha(str(state.get_state_dir()), head_sha)
-            if parent_sha is not None:
-                store.advance_base_sha(parent_sha)
+            if pre_tick_base_sha is not None:
+                # A real prior boundary existed before this tick's range
+                # started (whether this tick's range covered one commit
+                # or several) — restore it directly. This is what keeps a
+                # multi-commit partial range (base A, range picks up B
+                # then C, C's break makes the whole range partial) at A,
+                # never at the intermediate commit B: B was folded into
+                # the SAME not-fully-applied range and was never itself
+                # independently and fully applied.
+                store.advance_base_sha(pre_tick_base_sha)
+            else:
+                # No prior boundary ever existed (this instance's very
+                # first-ever pending record). This tick's own classify
+                # pass only single-commit-logged head_sha itself (no
+                # prior boundary to range from), so a single first-parent
+                # hop back would land on whatever intermediate commit sits
+                # between the range's true start and head_sha — the exact
+                # same "lands on an intermediate commit" defect this fix
+                # closes for the pre_tick_base_sha-known case above.
+                # Walking all the way back to the oldest first-parent
+                # ancestor of head_sha is what correctly lands on the
+                # commit BEFORE this bootstrap tick's own range even
+                # started, regardless of how many commits that range
+                # bundled together.
+                root_sha = _root_ancestor_sha(str(state.get_state_dir()), head_sha)
+                if root_sha != head_sha:
+                    store.advance_base_sha(root_sha)
     # "refused-sha-mismatch": apply_commit refused before touching
     # anything; no state mutation of ours is needed either.
 
     _record_last_apply(store, head_sha, result, changed_paths, poll_ignored_paths)
-    return True
+    return result.outcome
 
 
 def _record_last_apply(
@@ -869,27 +940,77 @@ def run() -> PollResult:
     # `run()` unchanged — `_apply_new_head`'s own `finally` still removes
     # the materialized temp tree first.
     #
-    # A `False` return means the commit could not be materialized at all
+    # A `None` return means the commit could not be materialized at all
     # (the bundle-repo `git archive` step raised) — `_apply_new_head`
     # already reverted `base_sha`/`pending` to their pre-tick values, so
     # this tick reports an error outcome and must NOT advance
     # `last_seen_sha` or notify: the next tick re-resolves and retries the
     # SAME head, exactly like the `fetch-failed` degrade-and-retry path
     # above.
-    materialized = _apply_new_head(
+    apply_outcome = _apply_new_head(
         store,
         head_sha,
         ignored_paths,
         pre_tick_base_sha=pre_tick_base_sha,
         pre_tick_pending=pre_tick_pending,
     )
-    if not materialized:
+    if apply_outcome is None:
         store.record_poll_failure(reason=f"could not materialize commit {head_sha}")
         return PollResult(
             outcome="apply-error",
             head_sha=head_sha,
             reason=f"could not materialize commit {head_sha}",
         )
+
+    # H-1 (senior review round 3): a PARTIAL apply must NOT advance
+    # `last_seen_sha` past `head_sha`. Advancing it unconditionally (the
+    # pre-fix shape) makes the NEXT tick's own
+    # `head_sha == store.last_seen_sha` short-circuit — the very first
+    # check in `run()` — report "unchanged" before `_apply_new_head` ever
+    # runs again, permanently swallowing the retry requirements.md 4.14
+    # requires for a still-failing partial apply. Only an `"applied"`
+    # outcome (every eligible file succeeded) is durable enough to advance
+    # the seen-SHA marker; `"partial"` and `"refused-sha-mismatch"` both
+    # leave `last_seen_sha` exactly where it was so this SAME head is
+    # re-resolved, re-classified, and retried on the next tick — the
+    # pending record `_apply_new_head` already wrote (via
+    # `record_partial_apply`, or left untouched on a staleness refusal)
+    # is what carries the retry's own real per-path reasons forward, not
+    # a second notification cycle (the `head_sha == last_seen_sha` guard
+    # never applies here since `last_seen_sha` stays behind `head_sha`,
+    # so `run()` re-enters this whole block on the next tick, exactly as
+    # H-1 requires).
+    if apply_outcome != "applied":
+        store.clear_poll_failure()
+        return PollResult(outcome="changed", head_sha=head_sha)
+
+    # C-A (senior review round 3): a FULLY-applied tick must record the
+    # just-applied tree's own push hash as `last_pushed_hash`, in the SAME
+    # tick that records the apply — not merely "eventually", since a push
+    # tick can run at any moment after this one returns. The applied tree
+    # IS the live tree right now (apply_commit already wrote every file to
+    # disk), so `push.current_push_tree_hash()` — the exact
+    # collect -> redact -> tokenize -> tree_hash pipeline `push.run()`'s
+    # own no-op gate reads — computed here and now is the value that
+    # gate must see, so the very next push tick recognizes this content as
+    # already delivered and short-circuits to `outcome="no-op"` with zero
+    # git calls, rather than re-cloning and trying to push the bundle
+    # repo's own content straight back onto itself. Recorded via
+    # `record_push_success` (never the bare in-memory
+    # `last_pushed_hash` setter, which does not persist) — no branch/PR
+    # exists for this "push" since nothing was actually pushed anywhere;
+    # `branch`/`pr_url` are recorded empty/`None` to reflect that plainly,
+    # matching the semantics `push.py`'s own `record_push_success` already
+    # documents (only the hash-gate field is load-bearing for push's
+    # no-op check; `last_push`'s branch/pr_url here just describe how this
+    # particular hash was established).
+    from backend import push as push_module
+
+    store.record_push_success(
+        tree_hash=push_module.current_push_tree_hash(),
+        branch="",
+        pr_url=None,
+    )
 
     # H3 (senior review round 1, still open going into round 2): advance
     # `last_seen_sha` to `head_sha` BEFORE notifying, not after. If

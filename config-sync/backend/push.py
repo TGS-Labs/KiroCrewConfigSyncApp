@@ -225,6 +225,30 @@ def _tokenize_tree_with_report(
     return tokenized, non_portable
 
 
+def current_push_tree_hash() -> str:
+    """Return the tree hash push's own no-op gate would compute for the
+
+    live tree RIGHT NOW: collect -> redact -> tokenize -> ``tree_hash``
+    (design.md's push step list, steps 1-2). This is the ONE shared
+    pipeline every caller that needs "what would push consider the
+    current pushed state to be" must call — never a re-derivation of the
+    same four steps at a second call site.
+
+    Factored out (senior-review round-3 Medium finding) because
+    ``routes.py``'s ``status``/``drift`` previously hashed the
+    redacted-but-NOT-tokenized tree while this module hashed the
+    redacted-AND-tokenized tree — the two disagreed for any tracked file
+    containing a portable absolute path under a tracked root, so
+    ``drift()`` could report drift immediately after a push that had just
+    recorded that exact (tokenized) tree as pushed. Both callers now share
+    this one function, so they can never diverge again.
+    """
+    collected = collect.collect()
+    redacted = redact.redact(collected)
+    tokenized, _non_portable = _tokenize_tree_with_report(redacted)
+    return tree_hash(tokenized)
+
+
 def _instance_id() -> str:
     """A short, stable identifier for this host/instance.
 
