@@ -40,23 +40,46 @@ def _root_b_path() -> Path:
     return Path(override) if override else Path.home() / ".kiro"
 
 
-def _iter_relpaths(root: Path) -> Iterator[str]:
-    """Yield every regular file under ``root`` as a ``/``-separated path
+def _iter_relpaths(root: Path, root_id: str) -> Iterator[str]:
+    """Yield every regular file under ``root`` that the allowlist could
 
-    relative to ``root``. Yields nothing if ``root`` does not exist —
-    walking a never-created root is not an error.
+    match, as a ``/``-separated path relative to ``root``. Only the
+    top-level entries named by ``allowlist.tracked_top_level_names`` are
+    entered or read, and a directory whose name is a never-tracked segment
+    (``scratch``, ``trust``, ``snapshots``) is skipped wherever it appears
+    — so the walk never visits the live root's untracked siblings
+    (``workspace/``, ``scratch/``, ``apps/`` ...), which on a real box hold
+    over a million files and made a poll tick take minutes. Yields nothing
+    if ``root`` does not exist — walking a never-created root is not an
+    error.
     """
     if not root.is_dir():
         return
-    for path in root.rglob("*"):
-        if path.is_file():
+    wanted = allowlist.tracked_top_level_names(root_id)
+    for top in sorted(root.iterdir()):
+        if top.name not in wanted:
+            continue
+        if top.is_file():
+            yield top.name
+        elif top.is_dir():
+            yield from _walk_pruned(top, root)
+
+
+def _walk_pruned(directory: Path, root: Path) -> Iterator[str]:
+    """Depth-first walk that never enters a never-tracked segment."""
+    for path in sorted(directory.iterdir()):
+        if path.is_dir():
+            if allowlist.never_tracked_segment(path.name):
+                continue
+            yield from _walk_pruned(path, root)
+        elif path.is_file():
             yield path.relative_to(root).as_posix()
 
 
 def _collect_root(root_id: str, root_path: Path) -> Dict[str, bytes]:
     """Collect allowlist hits found under one root, keyed by their relpath."""
     collected: Dict[str, bytes] = {}
-    for relpath in _iter_relpaths(root_path):
+    for relpath in _iter_relpaths(root_path, root_id):
         if allowlist.is_tracked(root_id, relpath):
             collected[relpath] = (root_path / relpath).read_bytes()
     return collected
