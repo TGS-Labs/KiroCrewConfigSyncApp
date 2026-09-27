@@ -518,8 +518,10 @@ landed from `main` without reading logs.
    the operator to the Schedule page, because KiroCrew's cron runner pauses a
    command cron after 5 consecutive failures and the app has no pause of its
    own (Push now and Undo do not touch poll state).
-2. The page SHALL show a last-apply card carrying an Undo action, and
-   displaying: the merged PR(s) the applied range corresponds to (by URL/SHA),
+2. The page SHALL show a last-apply card carrying an Undo action that restores
+   the most recent apply attempt that actually wrote files; WHEN the latest
+   attempt wrote nothing (Requirement 4.14) THEN the card SHALL say so instead
+   of offering an Undo that has no restore point. The card displays: the merged PR(s) the applied range corresponds to (by URL/SHA),
    every cron job imported paused together with its vetted command, every
    not-applied path from a `partial` outcome together with its real per-path
    reason, and every key path listed as needing a credential.

@@ -36,7 +36,11 @@ from test_review4_poll import (
     shas,
     store,
 )
-from test_routes_approve_seam import _init_origin_repo, _seed_history
+from test_routes_approve_seam import (
+    _advance_main_after,
+    _init_origin_repo,
+    _seed_history,
+)
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 
@@ -188,6 +192,73 @@ class TestStuckPartialRetry:
         assert poll_module.run().outcome == "changed"
         assert len(calls) == 2
         assert set(calls[1]["not_applied"]) < set(calls[0]["not_applied"])
+
+
+class TestUndoAfterStuckPartial:
+    """Senior review round 6 (Medium, present since round 4): a no-write
+    partial attempt discards its restore directory but ``last_apply`` still
+    named that attempt's apply id, so the page's Undo button posted an id
+    with no restore point and the earlier REAL restore point was
+    unreachable. ``last_apply.apply_id`` must keep pointing at the most
+    recent attempt that actually wrote something (or be null when there is
+    none), and Undo on it must succeed."""
+
+    def test_last_apply_keeps_the_restore_bearing_apply_id(
+        self,
+        poll_module: Any,
+        routes_module: Any,
+        store: state.StateStore,
+        origin: Path,
+        shas: dict[str, str],
+        bundle_url_patched: None,
+        isolated_env: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setattr(routes_module, "is_app_enabled", lambda _name: True)
+        # Tick 1: a real apply that writes files -> a restore-bearing id.
+        assert poll_module.run().outcome == "changed"
+        first = _reload_store().last_apply
+        assert first is not None and first["outcome"] == "applied"
+        real_id = first["apply_id"]
+        assert real_id in _reload_store().restore_dirs
+
+        # main moves on with one new file under steering/; make that
+        # directory read-only so the write fails per-path (recorded as
+        # not_applied, nothing written) while tick 1's files and restore
+        # point stay intact.
+        _advance_main_after(origin, tmp_path, shas["merge"])
+        steering = isolated_env["root_a"] / "steering"
+        steering.chmod(0o555)
+        try:
+            assert poll_module.run().outcome == "changed"
+        finally:
+            steering.chmod(0o755)
+
+        current = _reload_store()
+        assert current.last_apply is not None
+        assert current.last_apply["outcome"] == "partial"
+        assert current.last_apply["apply_id"] == real_id, (
+            "last_apply names a discarded apply id; Undo would fail with "
+            "'no restore directory recorded'"
+        )
+        result = routes_module.restore(current, real_id)
+        assert result["status"] == "ok", result
+
+    def test_last_apply_apply_id_is_null_when_nothing_was_ever_written(
+        self,
+        poll_module: Any,
+        store: state.StateStore,
+        origin: Path,
+        shas: dict[str, str],
+        bundle_url_patched: None,
+        isolated_env: dict[str, Path],
+    ) -> None:
+        _block_every_write(isolated_env["root_a"])
+        assert poll_module.run().outcome == "changed"
+        last = _reload_store().last_apply
+        assert last is not None and last["outcome"] == "partial"
+        assert last["apply_id"] is None
 
 
 def test_ui_api_base_equals_the_declared_permission_prefix() -> None:

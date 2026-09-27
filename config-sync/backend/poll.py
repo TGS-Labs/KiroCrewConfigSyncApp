@@ -819,8 +819,10 @@ def _apply_new_head(
     # that wrote at least one file keeps its restore dir untouched: it
     # is genuinely load-bearing for `routes.restore` even when OTHER
     # files in the same attempt failed.
+    restore_discarded = False
     if result.apply_id and not _restore_dir_has_backup(result.apply_id):
         store.discard_restore_dir(apply_id=result.apply_id)
+        restore_discarded = True
 
     if result.outcome == "applied":
         try:
@@ -876,7 +878,14 @@ def _apply_new_head(
     # "refused-sha-mismatch": apply_commit refused before touching
     # anything; no state mutation of ours is needed either.
 
-    _record_last_apply(store, head_sha, result, changed_paths, poll_ignored_paths)
+    _record_last_apply(
+        store,
+        head_sha,
+        result,
+        changed_paths,
+        poll_ignored_paths,
+        restore_discarded=restore_discarded,
+    )
     return result.outcome
 
 
@@ -886,6 +895,8 @@ def _record_last_apply(
     result: Any,
     changed_paths: Dict[str, List[str]],
     poll_ignored_paths: List[str],
+    *,
+    restore_discarded: bool = False,
 ) -> None:
     """Record a dashboard-facing summary of the most recent automatic
 
@@ -910,6 +921,14 @@ def _record_last_apply(
     """
     payload = _apply_result_to_dict(result, changed_paths)
     payload["sha"] = head_sha
+    if restore_discarded:
+        # Senior-review round 6: this attempt wrote nothing and its restore
+        # dir is gone, so its own apply id would make the page's Undo
+        # button post an id with no restore point. Keep Undo pointing at
+        # the most recent attempt that DID write (still in restore_dirs),
+        # or at nothing when there has never been one.
+        previous = (store.last_apply or {}).get("apply_id")
+        payload["apply_id"] = previous if previous in store.restore_dirs else None
     merged_ignored: Dict[str, None] = {}
     for relpath in payload.get("ignored_paths", []):
         merged_ignored.setdefault(relpath, None)

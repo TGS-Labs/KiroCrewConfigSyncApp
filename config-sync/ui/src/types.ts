@@ -47,7 +47,9 @@ export interface ChangedCommand {
 
  * `ui/src/__fixtures__/status.real.json`. */
 export interface LastApply {
-  apply_id: string
+  /** Id of the most recent apply attempt that actually wrote something (the
+   * one Undo restores); null when no attempt has written anything yet. */
+  apply_id: string | null
   outcome: 'applied' | 'partial' | string
   applied: string[]
   /** `{relpath: reason}` — NOT a list. The former list-shaped `not_applied`

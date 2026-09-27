@@ -434,8 +434,7 @@ class TestStatusReportsPollConsecutiveFailuresAndPausedFlag:
 
         then one succeeding tick against a real origin — status must
         report ``poll_consecutive_failures == 2`` after the two failures
-        and ``poll_consecutive_failures == 0`` (and ``poll_paused is
-        False``) after the success.
+        and ``poll_consecutive_failures == 0`` after the success.
         """
         monkeypatch.setattr(routes_module, "is_app_enabled", lambda _name: True)
         monkeypatch.setenv("CONFIG_SYNC_BUNDLE_REPO_URL_OVERRIDE_FOR_TEST", "unused")

@@ -30,14 +30,18 @@ export default function LastApplyCard({
           </p>
           <p style={mutedStyle}>Applied sha: {lastApply.sha.slice(0, 7)}</p>
 
-          <button
-            type="button"
-            style={buttonStyle()}
-            onClick={() => onUndo(lastApply.apply_id)}
-            disabled={undoing}
-          >
-            {undoing ? 'Undoing…' : 'Undo this apply'}
-          </button>
+          {lastApply.apply_id ? (
+            <button
+              type="button"
+              style={buttonStyle()}
+              onClick={() => onUndo(lastApply.apply_id as string)}
+              disabled={undoing}
+            >
+              {undoing ? 'Undoing…' : 'Undo this apply'}
+            </button>
+          ) : (
+            <p style={mutedStyle}>Nothing to undo: this attempt wrote no files.</p>
+          )}
 
           <PropagationChips lastApply={lastApply} />
 

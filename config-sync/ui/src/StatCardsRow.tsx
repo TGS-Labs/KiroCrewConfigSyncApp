@@ -112,8 +112,8 @@ export function FromMainCard({
           {likelyPausedByHost ? (
             <p style={mutedStyle}>
               KiroCrew pauses the poll job after {HOST_CRON_AUTO_PAUSE_AFTER}{' '}
-              consecutive failures; re-enable config-sync-poll on the Schedule
-              page once the cause is fixed.
+              consecutive failures; re-enable config-sync/config-sync-poll on the
+              Schedule page once the cause is fixed.
             </p>
           ) : null}
         </div>

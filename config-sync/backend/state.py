@@ -1088,12 +1088,14 @@ class StateStore:
         remote head therefore accumulates one new, empty restore
         directory per tick with nothing in it to restore. Called by
         `poll.py`'s `_apply_new_head` right after `apply_commit` returns,
-        ONLY when `result.applied` is empty (nothing was actually written
-        this attempt) — never for an attempt that wrote at least one
-        file, whose restore dir is genuinely load-bearing. A missing
-        ``apply_id`` (already absent, or never recorded) is a no-op —
-        this is a best-effort cleanup, not a mutation the caller depends
-        on succeeding.
+        ONLY when the restore directory holds no backup or created-file
+        record (`poll._restore_dir_has_backup` is false: nothing was
+        actually written this attempt) — never for an attempt that wrote
+        at least one file, whose restore dir is genuinely load-bearing.
+        Removes the state entry and the (empty) directory on disk. A
+        missing ``apply_id`` (already absent, or never recorded) is a
+        no-op — this is a best-effort cleanup, not a mutation the caller
+        depends on succeeding.
         """
 
         def _mutate(fresh: dict[str, Any]) -> None:

@@ -444,6 +444,20 @@ describe('ConfigSync dashboard — last-apply card and Undo (Requirement 7.2)', 
     expect(screen.queryByText(/^applied$/i)).not.toBeInTheDocument()
   })
 
+  it('renders no Undo button when the last attempt wrote nothing (apply_id null)', async () => {
+    installFetchMock({
+      'GET /apps/config-sync/api/status': () =>
+        statusResponse({
+          last_apply: { ...LAST_APPLY_FULL, outcome: 'partial', apply_id: null },
+        }),
+    })
+
+    render(<App />)
+
+    await screen.findByText(/nothing to undo/i)
+    expect(screen.queryByRole('button', { name: /undo this apply/i })).toBeNull()
+  })
+
   it('renders an "Undo this apply" button that POSTs restore/<id> via the real post() surface', async () => {
     const { calls } = installFetchMock({
       'GET /apps/config-sync/api/status': () =>
@@ -719,7 +733,7 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
     await waitFor(() => {
       expect(screen.getByText(/5 consecutive poll failures/i)).toBeInTheDocument()
     })
-    expect(screen.getByText(/re-enable config-sync-poll on the Schedule/i)).toBeInTheDocument()
+    expect(screen.getByText(/re-enable config-sync\/config-sync-poll on the/i)).toBeInTheDocument()
     expect(screen.getByText(/^Poll failing$/)).toBeInTheDocument()
     expect(screen.queryByText(/^Up to date$/)).toBeNull()
     expect(screen.queryByText(/Polling paused/i)).toBeNull()

@@ -1,6 +1,6 @@
 import { jsxs as r, jsx as n, Fragment as u } from "react/jsx-runtime";
-import { useAppApi as P } from "@kirocrew/app-sdk";
-import { PageHeader as N } from "@kirocrew/app-sdk/ui";
+import { useAppApi as N } from "@kirocrew/app-sdk";
+import { PageHeader as P } from "@kirocrew/app-sdk/ui";
 import { useRef as O, useState as h, useEffect as R } from "react";
 const m = {
   background: "var(--card)",
@@ -110,7 +110,7 @@ function U({
         "KiroCrew pauses the poll job after ",
         w,
         " ",
-        "consecutive failures; re-enable config-sync-poll on the Schedule page once the cause is fixed."
+        "consecutive failures; re-enable config-sync/config-sync-poll on the Schedule page once the cause is fixed."
       ] }) : null
     ] }) : null
   ] });
@@ -149,7 +149,7 @@ function I({
         "Applied sha: ",
         e.sha.slice(0, 7)
       ] }),
-      /* @__PURE__ */ n(
+      e.apply_id ? /* @__PURE__ */ n(
         "button",
         {
           type: "button",
@@ -158,37 +158,37 @@ function I({
           disabled: t,
           children: t ? "Undoing…" : "Undo this apply"
         }
-      ),
+      ) : /* @__PURE__ */ n("p", { style: d, children: "Nothing to undo: this attempt wrote no files." }),
       /* @__PURE__ */ n(H, { lastApply: e }),
       e.paused_cron_names.length > 0 ? /* @__PURE__ */ r("div", { style: g("warn"), children: [
         /* @__PURE__ */ n("strong", { children: "Paused crons" }),
         /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: e.paused_cron_names.map((o) => {
-          const s = e.changed_commands.find((c) => c.name === o);
+          const a = e.changed_commands.find((c) => c.name === o);
           return /* @__PURE__ */ r("li", { children: [
             o,
-            s ? /* @__PURE__ */ r(u, { children: [
+            a ? /* @__PURE__ */ r(u, { children: [
               " — ",
-              /* @__PURE__ */ n("code", { children: s.command })
+              /* @__PURE__ */ n("code", { children: a.command })
             ] }) : null
           ] }, o);
         }) })
       ] }) : null,
       Object.keys(e.not_applied).length > 0 ? /* @__PURE__ */ r("div", { style: g("warn"), children: [
         /* @__PURE__ */ n("strong", { children: "Not applied" }),
-        /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: Object.entries(e.not_applied).map(([o, s]) => /* @__PURE__ */ r("li", { children: [
+        /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: Object.entries(e.not_applied).map(([o, a]) => /* @__PURE__ */ r("li", { children: [
           o,
-          s ? `: ${s}` : null
+          a ? `: ${a}` : null
         ] }, o)) })
       ] }) : null,
       (() => {
         const o = new Set(
           Object.keys(e.not_applied).map((c) => c.split(":")[0])
-        ), s = e.needs_credential.filter(
+        ), a = e.needs_credential.filter(
           (c) => !o.has(c.split(":")[0])
         );
-        return s.length > 0 ? /* @__PURE__ */ r("div", { style: g("danger"), children: [
+        return a.length > 0 ? /* @__PURE__ */ r("div", { style: g("danger"), children: [
           /* @__PURE__ */ n("strong", { children: "Needs credential" }),
-          /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: s.map((c) => /* @__PURE__ */ n("li", { children: c }, c)) })
+          /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: a.map((c) => /* @__PURE__ */ n("li", { children: c }, c)) })
         ] }) : null;
       })(),
       e.applied.includes("crons.json") || e.applied.includes("instances.json") || (((l = e.changed_instance_names) == null ? void 0 : l.length) ?? 0) > 0 ? /* @__PURE__ */ r("div", { style: g("ok"), children: [
@@ -205,18 +205,18 @@ function I({
 }
 const S = "/apps/config-sync/api";
 function W() {
-  const e = P(), i = O(e);
+  const e = N(), i = O(e);
   i.current = e;
   const t = {
-    get: (a) => i.current.get(`${S}${a}`),
-    post: (a) => i.current.post(`${S}${a}`)
-  }, [l, p] = h(null), [o, s] = h(null), [c, C] = h(!0), [k, v] = h(!1), [L, b] = h(!1);
+    get: (s) => i.current.get(`${S}${s}`),
+    post: (s) => i.current.post(`${S}${s}`)
+  }, [l, p] = h(null), [o, a] = h(null), [c, C] = h(!0), [k, v] = h(!1), [L, b] = h(!1);
   async function f() {
     try {
-      const a = await t.get("/status");
-      p(a), s(null);
-    } catch (a) {
-      s(a instanceof Error ? a.message : String(a));
+      const s = await t.get("/status");
+      p(s), a(null);
+    } catch (s) {
+      a(s instanceof Error ? s.message : String(s));
     } finally {
       C(!1);
     }
@@ -228,24 +228,24 @@ function W() {
     v(!0);
     try {
       await t.post("/push"), await f();
-    } catch (a) {
-      s(a instanceof Error ? a.message : String(a));
+    } catch (s) {
+      a(s instanceof Error ? s.message : String(s));
     } finally {
       v(!1);
     }
   }
-  async function $(a) {
+  async function $(s) {
     b(!0);
     try {
-      await t.post(`/restore/${a}`), await f();
+      await t.post(`/restore/${s}`), await f();
     } catch (y) {
-      s(y instanceof Error ? y.message : String(y));
+      a(y instanceof Error ? y.message : String(y));
     } finally {
       b(!1);
     }
   }
   return /* @__PURE__ */ r(u, { children: [
-    /* @__PURE__ */ n(N, { title: "Config bundle status", subtitle: "Keeps this box aligned with Kiro-Config-Bundles" }),
+    /* @__PURE__ */ n(P, { title: "Config bundle status", subtitle: "Keeps this box aligned with Kiro-Config-Bundles" }),
     /* @__PURE__ */ n("div", { className: "px-6 pb-8 overflow-y-auto flex-1 min-h-0", children: c ? /* @__PURE__ */ n("p", { style: d, children: "Loading…" }) : o ? /* @__PURE__ */ n("div", { style: m, children: /* @__PURE__ */ n("p", { style: { color: "var(--danger)" }, children: o }) }) : l ? /* @__PURE__ */ r(u, { children: [
       /* @__PURE__ */ r(
         "div",
