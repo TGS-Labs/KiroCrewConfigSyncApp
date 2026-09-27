@@ -6,7 +6,7 @@ requirements.md 2.1 / 2.2:
 
 - 2.1: the push job runs as a `command`/`script` cron target (never
   `message`), so a tick consumes no LLM tokens. `app.json` already declares
-  `"command": "cd \"${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/config-sync\" &&
+  `"command": "cd \"$HOME/.kiro/crew/apps/config-sync\" &&
   python3 -m backend.push"` — a plain module invocation with no
   agent/LLM call in its invocation shape. These tests assert the module
   itself carries no LLM/agent-invocation surface at import time (no

@@ -31,14 +31,14 @@
     {
       "name": "config-sync-push",
       "every": 900,
-      "command": "cd \"${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/config-sync\" && python3 -m backend.push",
+      "command": "cd \"$HOME/.kiro/crew/apps/config-sync\" && python3 -m backend.push",
       "enabled": false,
       "silent": true
     },
     {
       "name": "config-sync-poll",
       "every": 900,
-      "command": "cd \"${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/config-sync\" && python3 -m backend.poll",
+      "command": "cd \"$HOME/.kiro/crew/apps/config-sync\" && python3 -m backend.poll",
       "enabled": false,
       "silent": false
     }

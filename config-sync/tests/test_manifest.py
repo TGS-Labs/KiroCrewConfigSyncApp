@@ -213,11 +213,11 @@ class TestCrons:
                 "HOME": str(fake_home),
                 "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
             }
-            # No KIROCREW_HOME override here — this fixture deliberately
-            # exercises the `$HOME/.kiro/crew` fallback half of
-            # `${KIROCREW_HOME:-$HOME/.kiro/crew}`, matching an operator who
-            # never set the override. The cron scheduler launches the
-            # command via `sh -c` with NO cwd of its own, so this
+            # The command resolves the app dir from `$HOME` alone: the host's
+            # static cron vet refuses a `${X:-default}` fallback, so a
+            # KIROCREW_HOME override is deliberately not honoured here
+            # (see tests/test_manifest_cron_vet.py). The cron scheduler
+            # launches the command via `sh -c` with NO cwd of its own, so this
             # subprocess's OWN cwd must not matter to the outcome either;
             # confirm that by deliberately launching from outside the fake
             # app dir.
