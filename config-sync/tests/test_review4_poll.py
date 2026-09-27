@@ -389,9 +389,9 @@ class TestPartialApplyRetryDoesNotAccumulateRestoreDirs:
 class TestStatusReportsPollConsecutiveFailuresAndPausedFlag:
     """``status()`` must return ``poll_consecutive_failures`` (an int that
 
-    resets to 0 on a successful tick) and ``poll_paused`` (a bool, true
-    only when the existing pause mechanism has actually paused polling) —
-    both present and correct across a fail-fail-succeed sequence.
+    resets to 0 on a successful tick), present and correct across a
+    fail-fail-succeed sequence. (Round 5 removed the app-level
+    ``poll_paused``: KiroCrew's cron runner owns pausing.)
 
     RED reason: ``backend/state.py`` has no consecutive-failure counter
     field at all (only a single ``last_poll_failure`` dict that the next
@@ -421,7 +421,6 @@ class TestStatusReportsPollConsecutiveFailuresAndPausedFlag:
         assert (
             "poll_consecutive_failures" in result
         ), "status() has no 'poll_consecutive_failures' key at all"
-        assert "poll_paused" in result, "status() has no 'poll_paused' key at all"
 
     def test_consecutive_failures_increments_on_failure_and_resets_on_success(
         self,
@@ -466,36 +465,6 @@ class TestStatusReportsPollConsecutiveFailuresAndPausedFlag:
         assert result_3.outcome == "changed"
         status_3 = routes_module.status(_reload_store())
         assert status_3["poll_consecutive_failures"] == 0
-        assert status_3["poll_paused"] is False
-
-    def test_poll_paused_is_true_when_pause_mechanism_has_paused_polling(
-        self,
-        routes_module: Any,
-        store: state.StateStore,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """When the existing pause mechanism (KiroCrew's own cron
-
-        auto-pause, per ``ui/src/StatCardsRow.tsx``'s comment: "KiroCrew
-        pauses a cron after 5 consecutive failures") reports the
-        config-sync-poll cron as paused, ``status()`` must surface
-        ``poll_paused: True`` — regardless of what
-        ``poll_consecutive_failures`` itself currently reads, since the
-        pause is an external fact this app must read and relay, not
-        derive purely from its own counter.
-        """
-        # There is no real pause-mechanism seam in this codebase yet to
-        # drive genuinely — this test pins the CONTRACT status() must
-        # expose once one exists, by asserting the key is present and
-        # boolean-typed for a plain, unpaused store; a real red comes
-        # from test_status_has_no_consecutive_failure_or_paused_fields_today
-        # above (key wholly absent) and from this test's own strict
-        # boolean-type assertion below, which the current codebase
-        # cannot satisfy since the key does not exist.
-        monkeypatch.setattr(routes_module, "is_app_enabled", lambda _name: True)
-        result = routes_module.status(store)
-        assert result["poll_paused"] is False
-        assert isinstance(result["poll_paused"], bool)
 
 
 # ---------------------------------------------------------------------------
@@ -546,50 +515,6 @@ def test_home_inside_a_test_is_under_the_pytest_tmp_tree() -> None:
 # early pause check and `_restore_dir_has_backup`'s manifest-reading
 # branches, neither of which the fixtures above happen to exercise.
 # ---------------------------------------------------------------------------
-
-
-class TestPollPause:
-    """`run()` must skip ALL network work and return `outcome="paused"`
-
-    the moment `state.poll_paused` is set — no `git ls-remote` call, no
-    state mutation beyond the read.
-    """
-
-    def test_run_returns_paused_outcome_with_no_state_mutation_when_paused(
-        self,
-        poll_module: Any,
-        store: state.StateStore,
-        isolated_env: dict[str, Path],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Force the pause via enough real failures rather than poking the
-        # field directly — proves `POLL_PAUSE_AFTER` failures really do
-        # trip `poll_paused`, and that the very next tick then short-
-        # circuits before touching `BUNDLE_REPO_URL` at all (it is left
-        # pointing at an unreachable path throughout, so a network call
-        # on the paused tick would raise instead of quietly succeeding).
-        unreachable = isolated_env["state_dir"].parent / "does-not-exist.git"
-        monkeypatch.setattr(poll_module, "BUNDLE_REPO_URL", str(unreachable))
-
-        for _ in range(poll_module.POLL_PAUSE_AFTER):
-            result = poll_module.run()
-            assert result.outcome == "ls-remote-failed"
-
-        paused_store = _reload_store()
-        assert paused_store.poll_paused is True
-        assert paused_store.poll_consecutive_failures == poll_module.POLL_PAUSE_AFTER
-
-        result = poll_module.run()
-        assert result.outcome == "paused"
-        assert result.head_sha is None
-
-        # Nothing about the failure/pause bookkeeping moved on the paused
-        # tick itself — it is a pure no-op read.
-        after_pause_store = _reload_store()
-        assert after_pause_store.poll_paused is True
-        assert (
-            after_pause_store.poll_consecutive_failures == poll_module.POLL_PAUSE_AFTER
-        )
 
 
 class TestRestoreDirHasBackup:

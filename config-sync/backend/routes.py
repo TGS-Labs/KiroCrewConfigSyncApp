@@ -309,10 +309,11 @@ def status(store: "state_module.StateStore") -> Dict[str, Any]:
     """GET status: push state, drift flag, last-seen SHA, last-apply
 
     summary, pending (still-retrying) summary, and the poll-failure
-    surface (`poll_consecutive_failures`, `poll_paused` — senior-review
-    round-4 M fix: `last_poll_failure` alone told the operator THAT the
-    most recent tick failed, never HOW MANY in a row, nor whether polling
-    has since paused itself per `poll.POLL_PAUSE_AFTER`).
+    surface (`poll_consecutive_failures` — senior-review round-4 M fix:
+    `last_poll_failure` alone told the operator THAT the most recent tick
+    failed, never HOW MANY in a row. KiroCrew's cron runner pauses the poll
+    job itself after 5 consecutive failures; the app has no pause of its
+    own — senior-review round 5).
 
     ``last_apply`` (dashboard) reports the most recent automatic apply
     ``poll.py`` ran: applied sha, not-applied paths with their real
@@ -341,7 +342,6 @@ def status(store: "state_module.StateStore") -> Dict[str, Any]:
         "last_seen_sha": store.last_seen_sha,
         "last_poll_failure": store.last_poll_failure,
         "poll_consecutive_failures": store.poll_consecutive_failures,
-        "poll_paused": store.poll_paused,
         "last_apply": store.last_apply,
         "drift": drift_present,
         "pending": _pending_with_changed_commands(store),
@@ -373,20 +373,11 @@ def drift(store: "state_module.StateStore") -> Dict[str, Any]:
 
 
 def push_now(store: "state_module.StateStore") -> Dict[str, Any]:
-    """POST push: run the push job now, on the same code path as the cron.
-
-    Also resumes polling if it was paused (senior-review round-4 M fix):
-    an operator using Push now is actively intervening on this instance's
-    sync state, which is exactly the signal `poll.py`'s module docstring
-    names as one of the two operator actions that un-pause polling (the
-    other being Undo/`restore`) — there is no other way to clear a pause
-    short of a successful tick the pause mechanism is itself skipping.
-    """
+    """POST push: run the push job now, on the same code path as the cron."""
     disabled = _require_enabled()
     if disabled is not None:
         return disabled
 
-    store.resume_polling()
     result = push_run()
     return {
         "status": "ok",

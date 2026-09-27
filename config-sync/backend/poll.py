@@ -118,46 +118,19 @@ separate, valid single-commit call: ``git show -s --format=%an%x09%s
 <head_sha>`` (``-s`` alone, no ``--name-only``, so the flag conflict above
 does not apply).
 
-## Poll pause (senior-review round-4 M fix)
+## Poll failures (senior-review rounds 4 and 5)
 
-There is no pause mechanism in this module before this fix — every tick
-attempts its network work (`git ls-remote`, then, on a changed head, the
-bundle-repo clone/fetch) regardless of how many prior ticks in a row have
-failed. `POLL_PAUSE_AFTER` (5) is the simplest honest implementation of
-one: `state.record_poll_failure` increments `state.poll_consecutive_
-failures` on every failing tick and, once that count reaches
-`POLL_PAUSE_AFTER`, sets `state.poll_paused = True`. `run()` checks
-`store.poll_paused` FIRST, before `_resolve_remote_head`'s own `git
-ls-remote` call: a paused tick skips ALL network work for this tick and
-returns `outcome="paused"` — no git call, no state mutation beyond the
-read, so a paused instance does not keep retrying (and re-failing) the
-same broken network/URL every cycle forever.
-
-**How an operator resumes**: `state.poll_paused` is cleared two ways, and
-only two — there is no automatic timeout or exponential backoff:
-
-1. **A tick that reaches a changed head is not possible while paused** —
-   this is intentional: since a paused tick returns before ever calling
-   `git ls-remote`, it cannot itself observe a changed head to recover
-   from, which is exactly why an EXTERNAL action is required rather than
-   waiting for the poll job to un-pause itself.
-2. **The operator explicitly intervenes**, via either of the two routes
-   `backend/routes.py` already exposes for a stuck sync: **Push now**
-   (`routes.push_now`, which calls `state.resume_polling()` before running
-   the push job) or **Undo** (`routes.restore`, restoring a prior apply —
-   documented here as the second resume path per this fix's own
-   requirement; wiring it is `routes.py`'s own change, outside this
-   module). Both represent the operator actively looking at and acting on
-   this instance's sync state, which is the closest available signal to
-   "an operator has seen the problem and is dealing with it" that this
-   app can observe without a dashboard-side acknowledgement flow of its
-   own.
-
-A successful tick (`clear_poll_failure`) also resets
-`poll_consecutive_failures`/`poll_paused` back to `0`/`False` — but since
-a paused tick never runs far enough to succeed, this path only matters
-for a `POLL_PAUSE_AFTER - 1`-failure streak that recovers before pausing,
-not as a way out of an already-paused state.
+`state.record_poll_failure` increments `state.poll_consecutive_failures` on
+every failing tick and `state.clear_poll_failure` resets it on the next
+tick that resolves the head cleanly; `status()` exposes the count so the
+page can say how long the poll has been failing. The app has NO pause of
+its own. A failing tick exits non-zero, and KiroCrew's cron runner already
+auto-pauses a command cron after 5 consecutive failures
+(`kiro_crew/cron.py` `_AUTO_PAUSE_THRESHOLD`); the operator re-enables it
+on the Schedule page. Round 4 added a second, app-level pause at the same
+threshold and round 5 removed it: the two fought each other (Push now
+cleared the app flag while the cron stayed off; a re-enabled cron then
+exited 0 as "paused" and did nothing).
 
 ## Concurrent-clone lock (senior review round-2 M-new-2)
 
@@ -207,15 +180,6 @@ from backend.safety import git_safety
 #: `TARGET_REPO`/`TARGET_BASE` (`TGS-Labs/Kiro-Config-Bundles`, `main`).
 BUNDLE_REPO_URL = "https://github.com/TGS-Labs/Kiro-Config-Bundles.git"
 BUNDLE_DEFAULT_BRANCH = "main"
-
-#: Consecutive failed poll ticks after which `run()` pauses all further
-#: network work until an operator resumes it (Push now / Undo — see
-#: "Poll pause" above). Chosen to match `ui/src/StatCardsRow.tsx`'s own
-#: existing comment describing KiroCrew's unrelated cron-level auto-pause
-#: ("pauses a cron after 5 consecutive failures") so the two numbers read
-#: consistently to an operator, even though this is this app's OWN pause
-#: mechanism, not that one.
-POLL_PAUSE_AFTER = 5
 
 #: Directory name, under the app's own state directory
 #: (`state.get_state_dir()`), that holds the bundle repo's working clone —
@@ -971,21 +935,16 @@ def run() -> PollResult:
         failed) or ``outcome="fetch-failed"`` (a later step on an already-
         resolved changed head failed; senior-review round-2 H-new-1) so the
         cron wrapper can turn either into a non-zero process exit without
-        this module owning the exit-code mechanics itself. Returns
-        ``outcome="paused"`` (senior-review round-4 M fix; see "Poll
-        pause" above) when `state.poll_paused` is already set — no git
-        call is made and no state is mutated on this path, so a paused
-        instance costs nothing per tick until an operator resumes it.
+        this module owning the exit-code mechanics itself. There is no
+        app-level pause: KiroCrew's cron runner auto-pauses the job after 5
+        consecutive non-zero exits (see "Poll failures" above).
     """
     store = state.load_state()
-
-    if store.poll_paused:
-        return PollResult(outcome="paused")
 
     try:
         head_sha = _resolve_remote_head(str(state.get_state_dir()))
     except (subprocess.CalledProcessError, OSError) as exc:
-        store.record_poll_failure(reason=str(exc), pause_after=POLL_PAUSE_AFTER)
+        store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="ls-remote-failed", reason=str(exc))
 
     if head_sha == store.last_seen_sha:
@@ -1001,7 +960,7 @@ def run() -> PollResult:
         # unchanged`). An empty SHA is never a genuine changed head: it
         # must not be recorded as `last_seen_sha`, classified, or notified
         # on — treat it the same as an unresolved head.
-        store.record_poll_failure(reason="empty head sha", pause_after=POLL_PAUSE_AFTER)
+        store.record_poll_failure(reason="empty head sha")
         return PollResult(outcome="ls-remote-failed", reason="empty head sha")
 
     # NOTE: no separate "already pending for this exact SHA" guard is
@@ -1062,7 +1021,7 @@ def run() -> PollResult:
         TimeoutError,
         git_safety.GitSafetyError,
     ) as exc:
-        store.record_poll_failure(reason=str(exc), pause_after=POLL_PAUSE_AFTER)
+        store.record_poll_failure(reason=str(exc))
         return PollResult(outcome="fetch-failed", head_sha=head_sha, reason=str(exc))
 
     # Captured BEFORE `record_poll_pending` below mutates `base_sha`/
@@ -1133,7 +1092,6 @@ def run() -> PollResult:
     if apply_outcome is None:
         store.record_poll_failure(
             reason=f"could not materialize commit {head_sha}",
-            pause_after=POLL_PAUSE_AFTER,
         )
         return PollResult(
             outcome="apply-error",
@@ -1174,13 +1132,25 @@ def run() -> PollResult:
     if apply_outcome != "applied":
         store.clear_poll_failure()
         not_applied = (store.last_apply or {}).get("not_applied") or {}
-        notify_operator(
-            head_sha=head_sha,
-            author=author,
-            subject=subject,
-            touched_classes=touched_classes,
-            not_applied=not_applied,
+        # Senior-review round 5: a stuck partial is retried every tick
+        # (H-1), but the operator is told once. `pre_tick_pending` is the
+        # pending record as it stood BEFORE this tick; when it names this
+        # same head and carries the identical not-applied set, nothing has
+        # changed since the last notification. A different set (a blocker
+        # cleared, a new one appeared) is news and is announced again.
+        previous = pre_tick_pending or {}
+        already_announced = (
+            previous.get("sha") == head_sha
+            and previous.get("not_applied") == not_applied
         )
+        if not already_announced:
+            notify_operator(
+                head_sha=head_sha,
+                author=author,
+                subject=subject,
+                touched_classes=touched_classes,
+                not_applied=not_applied,
+            )
         return PollResult(outcome="changed", head_sha=head_sha)
 
     # C-A (senior review round 3; guarded further in round 4 H fix): a

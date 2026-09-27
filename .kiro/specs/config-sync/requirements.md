@@ -314,7 +314,13 @@ effect without a second, redundant approval step on the box.
     NOT require any operator action to trigger the retry — it happens on the
     next scheduled poll tick, exactly like every other apply. `base_sha`
     SHALL advance, past the retried range, ONLY WHEN a poll's apply outcome
-    for that range is fully `applied` — never on `partial`.
+    for that range is fully `applied` — never on `partial`. A `partial`
+    outcome SHALL notify the operator (Requirement 4.3) the first time and
+    again only when a retry's not-applied set differs from the previous
+    attempt at the same head — an unchanged stuck partial is not re-announced
+    every tick. A retry that writes nothing SHALL leave no restore point
+    (neither a state entry nor a directory on disk); a restore point exists
+    only for an attempt that actually wrote at least one path.
 
 ### Requirement 5
 
@@ -506,6 +512,12 @@ landed from `main` without reading logs.
    and whether that PR still needs merging (open) or has merged; (c) sync from
    `main` — whether the instance is up to date with or currently applying the
    bundle repository's head, the last-seen SHA, and the time of the last check.
+   When the last poll tick failed, card (c) SHALL show the failure reason and
+   the number of consecutive failed ticks (`poll_consecutive_failures` in the
+   status response, reset by the next clean tick); at 5 or more it SHALL point
+   the operator to the Schedule page, because KiroCrew's cron runner pauses a
+   command cron after 5 consecutive failures and the app has no pause of its
+   own (Push now and Undo do not touch poll state).
 2. The page SHALL show a last-apply card carrying an Undo action, and
    displaying: the merged PR(s) the applied range corresponds to (by URL/SHA),
    every cron job imported paused together with its vetted command, every

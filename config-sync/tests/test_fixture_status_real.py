@@ -8,12 +8,13 @@ that gap for the *data* half: it drives a real poll tick (real git repo,
 real commits, real `apply_commit`) through `backend.poll.run()`, then
 calls `backend.routes.status()` on the resulting store — the exact same
 call `backend/server.py` makes for `GET /api/status` —
-and writes the JSON-serialized result to
-`ui/src/__fixtures__/status.real.json`.
+and compares its SHAPE (nested keys and scalar types) with the tracked
+`ui/src/__fixtures__/status.real.json`. With `CONFIG_SYNC_REGEN_FIXTURE=1`
+it rewrites that file instead (senior-review round 5: a plain run must
+not dirty a tracked file).
 
-This is a GENERATOR, not an assertion suite pinned to a specific field
-shape: the point is that the fixture always reflects whatever
-`backend.routes.status()` ACTUALLY returns today, so a UI test built
+The fixture always reflects whatever `backend.routes.status()` ACTUALLY
+returns today, so a UI test built
 against it fails the moment the UI's assumed field names
 (`merged_sha`, `pr_urls`, a list-shaped `not_applied`, a string
 `last_*_failure`, an `applying` key) diverge from reality — which they
@@ -52,6 +53,7 @@ would defeat the entire point of this file.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -214,13 +216,32 @@ def test_generate_real_status_fixture_from_a_real_poll_tick(
         "never a bare list"
     )
 
-    _FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _FIXTURE_PATH.write_text(
-        json.dumps(status_payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    if os.environ.get("CONFIG_SYNC_REGEN_FIXTURE") == "1":
+        # Explicit regeneration only (senior-review round 5: an ordinary
+        # test run must never rewrite a tracked file — the apply id and
+        # timestamps differ on every run, so the working tree was dirty
+        # after every `pytest`). Run with CONFIG_SYNC_REGEN_FIXTURE=1 and
+        # commit the result when status()'s shape changes.
+        _FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _FIXTURE_PATH.write_text(
+            json.dumps(status_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    tracked = json.loads(_FIXTURE_PATH.read_text(encoding="utf-8"))
+    assert _shape(tracked) == _shape(status_payload), (
+        "ui/src/__fixtures__/status.real.json no longer has the shape "
+        "backend.routes.status() returns — regenerate it with "
+        "CONFIG_SYNC_REGEN_FIXTURE=1 pytest tests/test_fixture_status_real.py "
+        "and commit the result"
     )
 
-    # Prove the write actually landed and is valid JSON — a silently-stale
-    # or malformed fixture would defeat the point of generating it.
-    written = json.loads(_FIXTURE_PATH.read_text(encoding="utf-8"))
-    assert written == status_payload
+
+def _shape(value: Any) -> Any:
+    """Structural signature: nested key sets and scalar type names, so the
+    comparison ignores run-specific values (ids, times, shas, reasons)."""
+    if isinstance(value, dict):
+        return {k: _shape(v) for k, v in sorted(value.items())}
+    if isinstance(value, list):
+        return [_shape(v) for v in value[:1]]
+    return type(value).__name__

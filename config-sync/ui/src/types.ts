@@ -74,10 +74,6 @@ export interface StatusResponse {
    * (senior-review round-4 M fix — `backend/state.py`'s
    * `poll_consecutive_failures`). */
   poll_consecutive_failures: number
-  /** Whether polling is currently paused after too many consecutive
-   * failures (`backend/poll.py`'s `POLL_PAUSE_AFTER`). Resumed by an
-   * operator using Push now or Undo. */
-  poll_paused: boolean
   drift: boolean
   last_apply: LastApply | null
 }

@@ -415,7 +415,7 @@ and fetches the path as given. The gateway forwards
 | UI calls (SDK path) | Backend route | Purpose |
 |---|---|---|
 | — (gateway probe) | `GET /health` | Scaffold-provided liveness; unsigned |
-| `GET /apps/config-sync/api/status` | `GET /api/status` | Push state, drift flag, last-seen SHA, last-apply summary (outcome, not-applied paths + reasons, `changed_commands`) |
+| `GET /apps/config-sync/api/status` | `GET /api/status` | Push state, drift flag, last-seen SHA, last-apply summary (outcome, not-applied paths + reasons, `changed_commands`), `last_poll_failure` + `poll_consecutive_failures` (no app-level pause: KiroCrew's cron runner pauses the job after 5 consecutive failures) |
 | `GET /apps/config-sync/api/drift` | `GET /api/drift` | Collected-tree hash vs last pushed, with per-file changed list |
 | `POST /apps/config-sync/api/push` | `POST /api/push` | Run the push now (same code path as the cron); mutation guard |
 | `POST /apps/config-sync/api/restore/{apply_id}` | `POST /api/restore/{apply_id}` | Restore a backup from a previous apply; mutation guard |

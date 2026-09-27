@@ -62,6 +62,7 @@ import errno
 import fcntl
 import json
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -99,7 +100,6 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "restore_dirs": {},
     "last_apply": None,
     "poll_consecutive_failures": 0,
-    "poll_paused": False,
 }
 
 
@@ -356,19 +356,6 @@ class StateStore:
         return cast("int", self._payload["poll_consecutive_failures"])
 
     @property
-    def poll_paused(self) -> bool:
-        """Whether polling is currently paused after too many consecutive
-
-        failures (`poll.POLL_PAUSE_AFTER`). Set by `record_poll_failure`
-        once the failure count reaches the threshold; cleared by
-        `clear_poll_failure` on the next successful tick, or by
-        `resume_polling` when the operator explicitly resumes via Push
-        now / Undo (see `poll.py`'s module docstring for the resume
-        contract).
-        """
-        return cast("bool", self._payload["poll_paused"])
-
-    @property
     def base_sha(self) -> str | None:
         """The head commit as of the operator's LAST approve/decline
 
@@ -490,7 +477,7 @@ class StateStore:
 
         self._locked_rmw(_mutate)
 
-    def record_poll_failure(self, *, reason: str, pause_after: int = 5) -> None:
+    def record_poll_failure(self, *, reason: str) -> None:
         """Record a failed poll tick (`outcome="fetch-failed"`), mirroring
 
         `record_push_failure`'s shape for the poll job's own equivalent
@@ -508,22 +495,21 @@ class StateStore:
         leaves that untouched on this path so the next tick retries the
         same head).
 
-        Also increments `poll_consecutive_failures` and, once the count
-        reaches `pause_after`, sets `poll_paused` (senior-review round-4
-        M fix: the failure surface reported no count and no pause state
-        at all before this). `pause_after` defaults to 5 but is always
-        passed explicitly by the caller (`poll.py`'s `POLL_PAUSE_AFTER`)
-        so the threshold has one definition and this module stays
-        agnostic of the specific constant's value.
+        Also increments `poll_consecutive_failures` (senior-review round-4
+        M fix: the failure surface reported no count before this). The app
+        deliberately has NO pause of its own: KiroCrew's cron runner already
+        auto-pauses a command cron after 5 consecutive non-zero exits
+        (`kiro_crew/cron.py` `_AUTO_PAUSE_THRESHOLD`), and a second pause at
+        the same threshold fought it (senior-review round 5). The count is
+        the page's signal to look at the Schedule page.
         """
         entry = {"reason": reason, "time": _now_iso()}
 
         def _mutate(payload: dict[str, Any]) -> None:
             payload["last_poll_failure"] = dict(entry)
-            count = int(payload.get("poll_consecutive_failures", 0)) + 1
-            payload["poll_consecutive_failures"] = count
-            if count >= pause_after:
-                payload["poll_paused"] = True
+            payload["poll_consecutive_failures"] = (
+                int(payload.get("poll_consecutive_failures", 0)) + 1
+            )
 
         self._locked_rmw(_mutate)
 
@@ -541,38 +527,13 @@ class StateStore:
         cleanly counts as a recovery regardless of whether it also found a
         new commit.
 
-        Also resets `poll_consecutive_failures` to 0 and clears
-        `poll_paused` back to `False` — a successful tick is the "un-pause
-        by a forced tick at a changed head" path `poll.py`'s module
-        docstring documents alongside the operator-driven Push now / Undo
-        path (`resume_polling`).
+        Also resets `poll_consecutive_failures` to 0: a successful tick is
+        the only thing that clears the streak.
         """
 
         def _mutate(payload: dict[str, Any]) -> None:
             payload["last_poll_failure"] = None
             payload["poll_consecutive_failures"] = 0
-            payload["poll_paused"] = False
-
-        self._locked_rmw(_mutate)
-
-    def resume_polling(self) -> None:
-        """Explicitly resume polling after a pause, without pretending a
-
-        tick actually succeeded (senior-review round-4 M fix). Called by
-        the operator-facing Push now / Undo routes so a paused poll cron
-        does not stay paused forever with no way out short of a
-        successful tick it is no longer even attempting (a paused tick
-        skips its own network work — see `poll.py`'s module docstring).
-        Resets the same two fields `clear_poll_failure` resets, but does
-        NOT touch `last_poll_failure`: the most recent failure record is
-        still true and informative until the next real tick supersedes
-        it; only the pause/counter state that BLOCKS the next tick's
-        network work is what an explicit resume needs to clear.
-        """
-
-        def _mutate(payload: dict[str, Any]) -> None:
-            payload["poll_consecutive_failures"] = 0
-            payload["poll_paused"] = False
 
         self._locked_rmw(_mutate)
 
@@ -1139,6 +1100,14 @@ class StateStore:
             fresh["restore_dirs"].pop(apply_id, None)
 
         self._locked_rmw(_mutate)
+        # Senior-review round 5: dropping only the state entry left one
+        # empty directory per retried tick on disk. The directory lives
+        # under the app's own state dir and holds no backup (that is the
+        # precondition for this call), so removing it loses nothing.
+        restores_root = (Path(get_state_dir()) / "restores").resolve()
+        target = (restores_root / apply_id).resolve()
+        if target.parent == restores_root and target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
 
     def record_last_apply(self, summary: dict[str, Any]) -> None:
         """Overwrite the dashboard-facing last-apply summary.

@@ -104,7 +104,6 @@ export default function ConfigSync() {
                 lastSeenSha={status.last_seen_sha}
                 pollFailure={status.last_poll_failure}
                 consecutiveFailures={status.poll_consecutive_failures}
-                pollPaused={status.poll_paused}
               />
             </div>
 

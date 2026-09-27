@@ -72,22 +72,27 @@ export function LastPushCard({
   )
 }
 
+/** KiroCrew's cron runner switches a command cron off after this many
+ * consecutive failures (`kiro_crew/cron.py` `_AUTO_PAUSE_THRESHOLD`). The
+ * app has no pause of its own; at this count the card points the operator
+ * to the Schedule page, where the job is re-enabled. */
+const HOST_CRON_AUTO_PAUSE_AFTER = 5
+
 export function FromMainCard({
   lastSeenSha,
   pollFailure,
   consecutiveFailures,
-  pollPaused,
 }: {
   lastSeenSha: string | null
   pollFailure: FailureRecord | null
   consecutiveFailures: number
-  pollPaused: boolean
 }) {
+  const likelyPausedByHost = consecutiveFailures >= HOST_CRON_AUTO_PAUSE_AFTER
   return (
     <div style={cardStyle}>
       <h2 style={{ margin: 0, fontSize: '0.9rem' }}>From main</h2>
       <p style={{ fontSize: '1.1rem', margin: '0.5rem 0' }}>
-        {pollPaused ? 'Polling paused' : 'Up to date'}
+        {pollFailure ? 'Poll failing' : 'Up to date'}
       </p>
       <p style={mutedStyle}>
         Last-seen sha: {lastSeenSha ? lastSeenSha.slice(0, 7) : 'none'}
@@ -104,10 +109,11 @@ export function FromMainCard({
               {consecutiveFailures === 1 ? '' : 's'}
             </p>
           ) : null}
-          {pollPaused ? (
+          {likelyPausedByHost ? (
             <p style={mutedStyle}>
-              Polling is paused after repeated failures; Push now or Undo
-              resumes it.
+              KiroCrew pauses the poll job after {HOST_CRON_AUTO_PAUSE_AFTER}{' '}
+              consecutive failures; re-enable config-sync-poll on the Schedule
+              page once the cause is fixed.
             </p>
           ) : null}
         </div>

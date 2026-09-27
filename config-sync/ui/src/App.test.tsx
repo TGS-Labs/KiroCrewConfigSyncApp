@@ -702,7 +702,7 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
     })
   })
 
-  it('shows the consecutive poll-failure count and the paused state', async () => {
+  it('shows the consecutive poll-failure count and points at the Schedule page at the host threshold', async () => {
     installFetchMock({
       'GET /apps/config-sync/api/status': () =>
         statusResponse({
@@ -711,7 +711,6 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
             time: '2026-09-27T07:17:42Z',
           },
           poll_consecutive_failures: 5,
-          poll_paused: true,
         }),
     })
 
@@ -720,8 +719,30 @@ describe('ConfigSync dashboard — error and empty states in plain language (Req
     await waitFor(() => {
       expect(screen.getByText(/5 consecutive poll failures/i)).toBeInTheDocument()
     })
-    expect(screen.getByText(/^Polling paused$/)).toBeInTheDocument()
+    expect(screen.getByText(/re-enable config-sync-poll on the Schedule/i)).toBeInTheDocument()
+    expect(screen.getByText(/^Poll failing$/)).toBeInTheDocument()
     expect(screen.queryByText(/^Up to date$/)).toBeNull()
+    expect(screen.queryByText(/Polling paused/i)).toBeNull()
+  })
+
+  it('does not mention the Schedule page below the host threshold', async () => {
+    installFetchMock({
+      'GET /apps/config-sync/api/status': () =>
+        statusResponse({
+          last_poll_failure: {
+            reason: 'could not reach bundle repository: timeout',
+            time: '2026-09-27T07:17:42Z',
+          },
+          poll_consecutive_failures: 2,
+        }),
+    })
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/2 consecutive poll failures/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/Schedule page/i)).toBeNull()
   })
 })
 
