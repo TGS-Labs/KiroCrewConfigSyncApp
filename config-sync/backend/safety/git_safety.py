@@ -94,6 +94,15 @@ from typing import Iterator
 #: attacker-controlled submodule remote plus recursive push could otherwise
 #: ship unscanned submodule objects to an unvalidated host. All options must
 #: precede the subcommand.
+#:
+#: ``user.name`` / ``user.email`` are pinned because the gateway spawns the
+#: backend with a clean environment and no global git config: without them
+#: ``git commit`` exits 128 ("Author identity unknown") and every push on a
+#: fresh box fails before anything is pushed (Phase 8 live failure). A fixed
+#: bot identity also keeps the operator's own name/email out of a public
+#: repo's history.
+COMMIT_NAME = "config-sync"
+COMMIT_EMAIL = "config-sync@users.noreply.github.com"
 GIT_SAFE_CONFIG: tuple[str, ...] = (
     "-c",
     f"core.hooksPath={os.devnull}",
@@ -105,6 +114,10 @@ GIT_SAFE_CONFIG: tuple[str, ...] = (
     "core.excludesFile=/dev/null",
     "-c",
     "push.recurseSubmodules=no",
+    "-c",
+    f"user.name={COMMIT_NAME}",
+    "-c",
+    f"user.email={COMMIT_EMAIL}",
 )
 
 #: What gets written to ``.git/info/attributes``.

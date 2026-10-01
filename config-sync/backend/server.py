@@ -97,11 +97,13 @@ import hmac
 import json
 import os
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 from backend import routes, state
+from backend.safety import redact_msg
 
 PORT = int(os.environ.get("PORT", 9100))
 APP_NAME = os.environ.get("KIROCREW_APP_NAME", "config-sync")
@@ -324,20 +326,36 @@ class Handler(BaseHTTPRequestHandler):
 
         result: Optional[Dict[str, Any]] = None
 
-        if method == "GET" and rest == ("status",):
-            result = routes.status(_get_store())
-        elif method == "GET" and rest == ("drift",):
-            result = routes.drift(_get_store())
-        elif method == "POST" and rest == ("push",):
-            result = routes.push_now(_get_store())
-        elif (
-            method == "POST"
-            and len(rest) == 2
-            and rest[0] == "restore"
-            and _is_safe_param_segment(rest[1])
-        ):
-            apply_id = rest[1]
-            result = routes.restore(_get_store(), apply_id)
+        try:
+            if method == "GET" and rest == ("status",):
+                result = routes.status(_get_store())
+            elif method == "GET" and rest == ("drift",):
+                result = routes.drift(_get_store())
+            elif method == "POST" and rest == ("push",):
+                result = routes.push_now(_get_store())
+            elif (
+                method == "POST"
+                and len(rest) == 2
+                and rest[0] == "restore"
+                and _is_safe_param_segment(rest[1])
+            ):
+                apply_id = rest[1]
+                result = routes.restore(_get_store(), apply_id)
+        except Exception as exc:
+            # Phase 8 live failure: a route that raised (push's git commit
+            # exiting 128) propagated out of the handler, which dropped the
+            # connection; the gateway proxy reported "Server disconnected"
+            # and the page showed a 502 instead of the failure the route had
+            # already recorded in state. Answer with the error instead, and
+            # keep the full traceback in the backend log. The reason passes
+            # through the same redaction as every operator-facing message:
+            # a git stderr can carry a remote URL with a credential in it.
+            traceback.print_exc()
+            self._json(
+                500,
+                {"status": "error", "reason": redact_msg.redact_message(str(exc))},
+            )
+            return
 
         if result is None:
             # Either an unknown path, or a known path reached with the
