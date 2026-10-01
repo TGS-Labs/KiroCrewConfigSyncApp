@@ -106,13 +106,13 @@ def test_collects_from_both_roots_in_one_call(
     root_b = isolated_roots["root_b"]
     _write(root_a, "config.json", b"a-content")
     _write(root_a, "steering/plan.md", b"# Plan")
-    _write(root_b, "agents/kirocrew.json", b"b-content")
+    _write(root_b, "agents/senior-reviewer.json", b"b-content")
 
     result = collect.collect()
 
     assert result["config.json"] == b"a-content"
     assert result["steering/plan.md"] == b"# Plan"
-    assert result["agents/kirocrew.json"] == b"b-content"
+    assert result["agents/senior-reviewer.json"] == b"b-content"
 
 
 def test_nested_steering_markdown_is_collected_with_correct_relpath(

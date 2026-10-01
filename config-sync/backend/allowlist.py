@@ -177,6 +177,16 @@ _NEVER_TRACKED_BASENAME_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         # at launch (kiro_crew.acp.skill_projection, NATIVE_SKILL_ALIAS_PREFIX)
         # and rewrites them every session — a different set on every box.
         r"(?:^|/)kirocrew-skill-view-[0-9a-f]+\.json$",
+        # Host-SHIPPED agents, not operator config: the gateway writes these
+        # agent files itself (kiro_crew/agent_files.py `*_AGENT_FILENAME`) and
+        # owns their registration, so a box has no config.json entry or model
+        # pin for most of them. Synced, they fail the registration check and
+        # block the shared config.json / agent_model_state.json for every
+        # other agent in the commit (first live tick, 2026-10-01: 47 files
+        # refused). tests/test_allowlist.py pins this list to the host's.
+        r"(?:^|/)agents/kirocrew(?:-(?:lite|guest|conductor|pipeline-conductor"
+        r"|ledger-conductor|security-conductor|worker|knowledge|research"
+        r"|heartbeat))?\.json$",
     )
 )
 

@@ -22,6 +22,7 @@ starting state, not a test defect.
 from __future__ import annotations
 
 import string
+import re
 from pathlib import Path
 
 import pytest
@@ -238,7 +239,7 @@ def test_root_b_admits_only_agents_json_files() -> None:
     KIRO_HOME; the allowlist must not widen that.
     """
     assert allowlist.is_tracked("B", "agents/my-agent.json")
-    assert allowlist.is_tracked("B", "agents/kirocrew.json")
+    assert allowlist.is_tracked("B", "agents/senior-reviewer.json")
 
     never_tracked_on_root_b = [
         "config.json",
@@ -556,10 +557,49 @@ class TestHostGeneratedAgentAliasesAreNeverTracked:
         "relpath",
         [
             "agents/senior-reviewer.json",
-            "agents/kirocrew.json",
-            "agents/kirocrew-worker.json",
             "agents/kirocrew-skill-viewer.json",
+            "agents/kirocrew-custom.json",
+            "agents/my-kirocrew.json",
         ],
     )
     def test_real_agent_definitions_stay_tracked(self, relpath: str) -> None:
         assert allowlist.is_tracked("B", relpath) is True
+
+
+_HOST_AGENT_FILES = Path(
+    "/usr/local/lib/python3.12/site-packages/kiro_crew/agent_files.py"
+)
+_SHIPPED_AGENT_FILENAMES = (
+    "kirocrew.json",
+    "kirocrew-lite.json",
+    "kirocrew-guest.json",
+    "kirocrew-conductor.json",
+    "kirocrew-pipeline-conductor.json",
+    "kirocrew-ledger-conductor.json",
+    "kirocrew-security-conductor.json",
+    "kirocrew-worker.json",
+    "kirocrew-knowledge.json",
+    "kirocrew-research.json",
+    "kirocrew-heartbeat.json",
+)
+
+
+class TestHostShippedAgentsAreNeverTracked:
+    """The gateway writes these agent files itself and owns their
+    registration. Synced, they failed the registration check and blocked the
+    shared ``config.json``/``agent_model_state.json`` for every other agent
+    (first live tick, 2026-10-01: 47 files refused). Excluded structurally,
+    like the skill-view aliases."""
+
+    @pytest.mark.parametrize("filename", _SHIPPED_AGENT_FILENAMES)
+    def test_shipped_agent_file_is_not_tracked(self, filename: str) -> None:
+        assert allowlist.is_tracked("B", f"agents/{filename}") is False
+
+    def test_list_matches_the_hosts_own_agent_filename_constants(self) -> None:
+        """A new host-shipped agent must fail here, not on a live tick."""
+        if not _HOST_AGENT_FILES.is_file():
+            pytest.skip("KiroCrew host not installed here")
+        text = _HOST_AGENT_FILES.read_text(encoding="utf-8")
+        host = set(re.findall(r'^[A-Z_]*AGENT_FILENAME = "([^"]+)"', text, re.M))
+        assert host, "no *_AGENT_FILENAME constants found in the host"
+        assert host == set(_SHIPPED_AGENT_FILENAMES)
