@@ -1,22 +1,21 @@
-"""Deployment 4 live install (Phase 8) failure: both manifest crons rejected.
+"""Manifest crons and the host's cron sandbox.
 
-`kirocrew app enable config-sync` registered no crons:
+Deployment 4's live install (Phase 8) found both manifest crons rejected by
+the host's static command vet (`${KIROCREW_HOME:-...}` composes a value at
+run time). Deployment 5's live install then found the deeper constraint:
+KiroCrew runs cron subprocesses inside its sandbox, which hides
+``~/.git-credentials`` by design, and the bundle repo is private — so NO
+command cron of this app can reach it, however well-formed its command.
+The poll moved to a vault-granted SCRIPT cron (``host-crons/`` and
+``skills/install-poll-cron``); the push stays on the dashboard button, whose
+backend process runs outside the cron sandbox.
 
-    cron 'config-sync/config-sync-push' command rejected: Error: cron command
-    blocked: only a plain `${NAME}` reference is permitted. Brace expansions
-    that COMPOSE a value at run time (`${X:-default}`, ...) assemble strings a
-    static check cannot see.
-
-The host vets every app-manifest cron `command` with the same static rules as
-`cron_add` (`kiro_crew/mcp_cron.py::_vet_shell_command`): no command
-substitution, no brace expansion other than a plain `${NAME}`, only `$HOME`
-as a variable reference, no positional parameters, no shell loops, no glob
-metacharacters. `${KIROCREW_HOME:-$HOME/.kiro/crew}` fails the second rule.
-
-These tests mirror those rules as text checks over `app.json` so the seam
-(manifest -> host vet) is covered without importing the host, plus a parity
-test that reads the installed `mcp_cron.py` as text and asserts the two
-rules this file relies on are still spelled the way it assumes.
+So ``app.json`` now declares **no crons**, and this file pins that. The
+mirrored vet rules are kept as a guard: if a command cron is ever re-added,
+it must still satisfy the host's static vet (`kiro_crew/mcp_cron.py::
+_vet_shell_command`): no command substitution, no brace expansion other than
+a plain `${NAME}`, only `$HOME` as a variable reference, no positional
+parameters, no shell loops, no glob metacharacters.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
@@ -44,63 +42,71 @@ _SHELL_KEYWORD_RE = re.compile(
 _GLOB_META_RE = re.compile(r"\[[^]]*\]|[?*]")
 
 
-def _cron_commands() -> Iterator[tuple[str, str]]:
-    manifest = json.loads((APP_ROOT / "app.json").read_text(encoding="utf-8"))
-    crons = manifest.get("crons", [])
-    assert crons, "app.json declares no crons"
-    for cron in crons:
+def _manifest() -> dict:
+    return json.loads((APP_ROOT / "app.json").read_text(encoding="utf-8"))
+
+
+def test_manifest_declares_no_crons_because_the_sandbox_hides_git_credentials() -> None:
+    """Both jobs need the private bundle repo; a manifest command cron runs in
+    the host sandbox with no credential and fails every tick until the host
+    auto-pauses it (live install 2026-10-01, `git ls-remote` exit 128)."""
+    crons = _manifest().get("crons", [])
+    assert crons == [], (
+        "app.json must not declare command crons that need the private bundle "
+        f"repo; the poll is a vault-granted script cron. Found: {crons!r}"
+    )
+
+
+def vet_command(name: str, command: str) -> list[str]:
+    """Return the host-vet violations for one cron command (empty = clean)."""
+    problems: list[str] = []
+    if _BRACE_EXPANSION_RE.search(command):
+        problems.append("composing brace expansion")
+    refs = set(_VAR_REF_RE.findall(command))
+    if not refs <= _VAR_REF_ALLOWED:
+        problems.append(f"variables refused: {sorted(refs - _VAR_REF_ALLOWED)}")
+    if _CMD_SUBST_RE.search(command):
+        problems.append("command substitution")
+    if _POSITIONAL_RE.search(command):
+        problems.append("positional parameter")
+    if _SHELL_KEYWORD_RE.search(command):
+        problems.append("shell loop/compound")
+    if _GLOB_META_RE.search(command):
+        problems.append("glob metacharacter")
+    return [f"{name}: {p}" for p in problems]
+
+
+def test_any_future_command_cron_must_pass_the_host_vet() -> None:
+    """Guard, not a tautology: runs over whatever the manifest declares, so a
+    re-added command cron is vetted here before the live install does it."""
+    problems: list[str] = []
+    for cron in _manifest().get("crons", []):
         command = cron.get("command")
         if command:
-            yield cron["name"], command
+            problems.extend(vet_command(cron["name"], command))
+    assert problems == [], problems
 
 
-def _commands_for_parametrize() -> list[tuple[str, str]]:
-    return list(_cron_commands())
-
-
-@pytest.mark.parametrize(("name", "command"), _commands_for_parametrize())
-def test_cron_command_uses_no_composing_brace_expansion(
-    name: str, command: str
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ('cd "$HOME/.kiro/crew/apps/config-sync" && python3 -m backend.push', []),
+        ('cd "${KIROCREW_HOME:-$HOME/.kiro/crew}/apps/x" && python3 -m b', ["brace"]),
+        ("cd $(pwd) && python3 -m b", ["command substitution"]),
+        ("cd $KIROCREW_HOME && python3 -m b", ["variables refused"]),
+        ("for f in *; do echo $f; done", ["shell loop", "glob"]),
+    ],
+)
+def test_vet_mirror_bites_on_the_constructs_the_host_refuses(
+    command: str, expected: list[str]
 ) -> None:
-    """`${X:-default}` and friends are refused by the host vet."""
-    assert not _BRACE_EXPANSION_RE.search(command), (
-        f"cron {name!r}: command contains a composing brace expansion the "
-        f"host cron vet refuses: {command!r}"
-    )
-
-
-@pytest.mark.parametrize(("name", "command"), _commands_for_parametrize())
-def test_cron_command_references_only_allowed_variables(
-    name: str, command: str
-) -> None:
-    """Only `$HOME` / `${HOME}` may be referenced (the sandboxed cron env is
-    the gateway's own environment; `KIROCREW_HOME` is an optional override
-    that is not guaranteed to exist, and an unset reference expands empty)."""
-    refs = set(_VAR_REF_RE.findall(command))
-    assert refs <= _VAR_REF_ALLOWED, (
-        f"cron {name!r}: command references variables the host vet refuses: "
-        f"{sorted(refs - _VAR_REF_ALLOWED)}"
-    )
-
-
-@pytest.mark.parametrize(("name", "command"), _commands_for_parametrize())
-def test_cron_command_has_no_other_refused_constructs(name: str, command: str) -> None:
-    assert not _CMD_SUBST_RE.search(command), f"{name}: command substitution"
-    assert not _POSITIONAL_RE.search(command), f"{name}: positional parameter"
-    assert not _SHELL_KEYWORD_RE.search(command), f"{name}: shell loop/compound"
-    assert not _GLOB_META_RE.search(command), f"{name}: glob metacharacter"
-
-
-@pytest.mark.parametrize(("name", "command"), _commands_for_parametrize())
-def test_cron_command_runs_the_backend_module_from_the_installed_app_dir(
-    name: str, command: str
-) -> None:
-    """The installed copy lives at `<config dir>/apps/config-sync`; the module
-    entrypoint needs that directory as cwd. With no fallback expression
-    available, the default config dir under $HOME is the only expressible
-    location."""
-    assert 'cd "$HOME/.kiro/crew/apps/config-sync"' in command, command
-    assert re.search(r"python3 -m backend\.(push|poll)$", command), command
+    """The mirror itself is proven to fail on each refused construct (the
+    Deployment-4 `${X:-default}` case included), so the guard above is
+    load-bearing rather than vacuous when the manifest has no crons."""
+    problems = vet_command("probe", command)
+    assert bool(problems) == bool(expected), problems
+    for needle in expected:
+        assert any(needle in p for p in problems), (needle, problems)
 
 
 def test_mirrored_rules_match_the_installed_host_vet() -> None:

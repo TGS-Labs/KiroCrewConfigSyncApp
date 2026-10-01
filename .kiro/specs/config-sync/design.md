@@ -622,22 +622,36 @@ config-sync/
                                sanitizer drop/pause, propagation table coverage
 ```
 
-`app.json` cron shape (both `enabled: false` until configured, per Requirement
-8.3 — `CronEntry` supports `command`, `script`, `every`, `cron_expr`, and
-`enabled`):
+`app.json` declares **no crons** (Requirement 8.3). Deployment 5's live
+install found why: the host runs cron subprocesses in its sandbox, which hides
+`~/.git-credentials` by design, and the bundle repo is private — the first
+real tick failed at `git ls-remote` (exit 128). A manifest command cron for
+either job can only fail until the host auto-pauses it, so none is shipped.
 
 ```json
-"crons": [
-  {"name": "config-sync-push", "every": 900,
-   "command": "python3 backend/push.py", "enabled": false, "silent": true},
-  {"name": "config-sync-poll", "every": 900,
-   "command": "python3 backend/poll.py", "enabled": false}
-]
+"crons": []
 ```
+
+The host's only sanctioned credential path for a cron is an operator-approved
+vault grant to a SCRIPT cron, pinned to the approved body ("the grant
+authorizes this body, not the binaries it calls"). So
+`host-crons/config_sync_poll.py` — stdlib-only, ~230 lines — is that body: it
+fetches the bundle repo into the shared `bundle-repo` clone with the token (by
+env-var name inside git's credential helper, after an empty
+`credential.helper=` reset so no global `store` helper can see or write it),
+then runs `backend.poll` with an allowlisted environment (no token, no host
+job-identity variables) and `CONFIG_SYNC_PREFETCHED=1`, in which mode the poll
+reads `refs/remotes/origin/main` from the clone and never touches the network.
+An agent installs it per `skills/install-poll-cron/SKILL.md` (`cron_add`
+script job → `cron_secret_request` → operator approves on the Schedule page).
+The changed-head summary is forwarded through `ctx.notify()`. The push runs
+in the backend process (dashboard "Push changes"), which is spawned by the
+gateway outside the cron sandbox and has the box's git credential; a scheduled
+push would need a second, write-scoped grant and is deferred until decided.
 
 The scaffold's `agents/sample-agent.json` and `skills/sample-skill/` are removed:
 this app needs no agent of its own. Everything on the hot path is deterministic
-Python, which is precisely why both crons are zero-token.
+Python, which is precisely why both jobs are zero-token.
 
 ## Deployment Strategy
 

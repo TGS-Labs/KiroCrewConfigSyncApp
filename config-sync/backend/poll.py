@@ -134,12 +134,13 @@ exited 0 as "paused" and did nothing).
 
 ## Concurrent-clone lock (senior review round-2 M-new-2)
 
-``config-sync-push`` and ``config-sync-poll`` are both declared in
-``app.json`` on the same ``every: 900`` cadence and both read/write the
-SAME ``_BUNDLE_CLONE_DIRNAME`` directory (poll fetches/reads it; push
-clones/fetches/commits/pushes it). Two ticks landing at the same wall-clock
-moment could both see no ``.git`` directory yet and both start a `clone`
-into the identical path concurrently — one of git's own clone attempts can
+The poll (now the pinned script cron in ``host-crons/``, every 900s) and the
+push (the backend process, on the dashboard's "Push changes") both read/write
+the SAME ``_BUNDLE_CLONE_DIRNAME`` directory (the script fetches it and the
+poll reads it; push fetches/commits/pushes it). A tick and a push landing at
+the same wall-clock moment could both see no ``.git`` directory yet and both
+start a `clone` into the identical path concurrently — one of git's own clone
+attempts can
 then fail (target directory not empty / lock contention on
 ``.git/index.lock`` or the object store), leaving a directory that exists,
 is non-empty, but has no working ``.git`` — a state
@@ -160,6 +161,7 @@ the gap where only `poll.py`'s call site held it).
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -188,6 +190,36 @@ BUNDLE_DEFAULT_BRANCH = "main"
 #: own (design.md forbids a full clone; sharing one clone means poll's
 #: object-fetch needs never trigger a second one).
 _BUNDLE_CLONE_DIRNAME = "bundle-repo"
+
+#: Env var that selects PREFETCHED mode (Deployment 5, live-install defect 7).
+#: KiroCrew runs command crons inside its sandbox, which hides
+#: ``~/.git-credentials`` by design, so a cron-launched poll can never reach
+#: the private bundle repo itself. The host's only sanctioned credential path
+#: for a cron is an operator-approved vault grant to a SCRIPT cron, and that
+#: grant pins the approved script BODY — not the binaries it calls. So the
+#: credentialed fetch lives in the small pinned script
+#: ``host-crons/config_sync_poll.py``, which then runs this module with
+#: ``CONFIG_SYNC_PREFETCHED=1`` and WITHOUT the token in its environment. In
+#: that mode this module never touches the network: the head to compare is
+#: ``refs/remotes/origin/<default-branch>`` in the already-fetched clone, and
+#: the clone-or-fetch step only verifies the clone exists. Any truthy value
+#: other than ``0``/``false``/``no`` (case-insensitive) selects the mode.
+PREFETCHED_ENV = "CONFIG_SYNC_PREFETCHED"
+_PREFETCHED_FALSE_VALUES = frozenset({"", "0", "false", "no"})
+
+
+def _prefetched() -> bool:
+    """Whether this tick must run without any network git call."""
+    return (
+        os.environ.get(PREFETCHED_ENV, "").strip().lower()
+        not in _PREFETCHED_FALSE_VALUES
+    )
+
+
+def _prefetched_clone_dir(state_dir_owner: str) -> Path:
+    """The shared clone a prefetched tick reads its head from."""
+    return Path(state_dir_owner) / _BUNDLE_CLONE_DIRNAME
+
 
 #: How long `_clone_lock` waits to acquire the shared clone-directory lock
 #: before giving up and raising — bounded so a wedged/dead lock holder
@@ -324,7 +356,31 @@ def _resolve_remote_head(state_dir_owner: str) -> str:
     Raises:
         subprocess.CalledProcessError: if the ``git ls-remote`` process
             exits non-zero.
+        OSError: in prefetched mode, when the shared clone does not exist —
+            this process holds no credential, so it must NOT fall back to
+            cloning; the failure is recorded and the next tick retries once
+            the pinned script has fetched.
     """
+    if _prefetched():
+        clone_dir = _prefetched_clone_dir(state_dir_owner)
+        if not (clone_dir / ".git").exists():
+            raise OSError(
+                f"prefetched mode ({PREFETCHED_ENV}) but no bundle clone at "
+                f"{clone_dir}; the credentialed fetch step must run first"
+            )
+        completed = subprocess.run(
+            git_safety.git_argv(
+                clone_dir,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{BUNDLE_DEFAULT_BRANCH}",
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return (completed.stdout or "").strip()
+
     completed = subprocess.run(
         git_safety.git_argv(
             state_dir_owner, "ls-remote", BUNDLE_REPO_URL, BUNDLE_DEFAULT_BRANCH
@@ -380,7 +436,19 @@ def _ensure_bundle_clone(clone_dir: Path) -> None:
     `clone`/`fetch` it selects must be atomic with respect to a concurrent
     `push.py` tick touching the same directory, or two processes can both
     observe "no `.git` yet" and both start a `clone` into the same path.
+
+    In PREFETCHED mode (see `PREFETCHED_ENV`) this is verify-only: the pinned
+    host-cron script has already fetched into ``clone_dir`` with the
+    operator-granted token, and this process holds no credential, so a
+    missing clone raises ``OSError`` instead of cloning.
     """
+    if _prefetched():
+        if not (clone_dir / ".git").exists():
+            raise OSError(
+                f"prefetched mode ({PREFETCHED_ENV}) but no bundle clone at "
+                f"{clone_dir}; the credentialed fetch step must run first"
+            )
+        return
     with _clone_lock(clone_dir):
         clone_dir.mkdir(parents=True, exist_ok=True)
         if not (clone_dir / ".git").exists():

@@ -7,7 +7,7 @@
   "iconPath": "assets/icon.png",
   "defaultEnabled": false,
   "agents": [],
-  "skills": ["skills/complete-pr-handoff"],
+  "skills": ["skills/complete-pr-handoff", "skills/install-poll-cron"],
   "tags": [],
   "permissions": {
     "api": ["/apps/config-sync/api"]
@@ -27,20 +27,5 @@
       }
     ]
   },
-  "crons": [
-    {
-      "name": "config-sync-push",
-      "every": 900,
-      "command": "cd \"$HOME/.kiro/crew/apps/config-sync\" && python3 -m backend.push",
-      "enabled": false,
-      "silent": true
-    },
-    {
-      "name": "config-sync-poll",
-      "every": 900,
-      "command": "cd \"$HOME/.kiro/crew/apps/config-sync\" && python3 -m backend.poll",
-      "enabled": false,
-      "silent": false
-    }
-  ]
+  "crons": []
 }

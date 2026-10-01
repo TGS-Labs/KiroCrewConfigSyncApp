@@ -220,27 +220,25 @@ def test_unchanged_head_produces_no_stdout_output(
     assert captured.out == ""
 
 
-def test_app_json_poll_cron_is_not_silent() -> None:
-    """`app.json`'s `config-sync-poll` cron entry must be `"silent":
+def test_app_json_has_no_poll_cron_and_the_script_forwards_the_summary() -> None:
+    """Round-4 H-A made the poll's changed-head stdout summary deliverable
 
-    false` — a `"silent": true` command-cron job's stdout is captured
-    into `last_result` for the dashboard's history view but never
-    delivered as a notification (confirmed against
-    `kiro_crew/slack/gateway.py`'s command-result handling), which would
-    make H-A's stdout summary just as invisible as the empty no-op stub
-    it replaces.
+    by declaring the manifest poll cron `"silent": false`. Deployment 5
+    moved the poll into a pinned SCRIPT cron (the host's cron sandbox hides
+    the git credential a command cron would need), so the manifest must no
+    longer carry a poll cron at all, and the summary's delivery path is
+    now the script forwarding non-empty poll stdout through `ctx.notify()`
+    (`test_host_cron_poll_script.py` proves the forwarding at run time).
     """
     import json
 
-    app_json_path = Path(__file__).resolve().parent.parent / "app.json"
-    manifest = json.loads(app_json_path.read_text(encoding="utf-8"))
+    app_root = Path(__file__).resolve().parent.parent
+    manifest = json.loads((app_root / "app.json").read_text(encoding="utf-8"))
 
     poll_crons = [c for c in manifest["crons"] if c["name"] == "config-sync-poll"]
-    assert len(poll_crons) == 1, "expected exactly one config-sync-poll cron entry"
-    assert poll_crons[0]["silent"] is False, (
-        'config-sync-poll must be "silent": false so a changed-head '
-        "tick's stdout summary is actually delivered as a notification"
-    )
+    assert poll_crons == [], "the poll must not be a manifest command cron"
+    script = (app_root / "host-crons" / "config_sync_poll.py").read_text()
+    assert "ctx.notify(" in script
 
 
 # ---------------------------------------------------------------------------

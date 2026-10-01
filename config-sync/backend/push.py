@@ -478,17 +478,18 @@ def run() -> PushResult:
         # branch.
         #
         # The `.git`-exists check and the `clone`/`fetch` it selects run
-        # under the SAME shared `git_safety.clone_lock` `backend.poll`'s
-        # `_ensure_bundle_clone` holds for this identical directory
-        # (senior-review round-2 M-new-2; round-3 H2) — `config-sync-push`
-        # and `config-sync-poll` are both scheduled every 900s and both
-        # touch this SAME `_BUNDLE_CLONE_DIRNAME` directory with no other
-        # coordination between them, so two ticks (from either job)
-        # landing close together could otherwise both observe no `.git`
-        # yet and both start a `clone` into the identical path — one
-        # losing attempt can leave the directory non-empty but without a
-        # working `.git`, a state neither job's own `.git`-exists check
-        # ever self-heals from afterward.
+        # under the SAME shared `git_safety.clone_lock` the poll side holds
+        # for this identical directory (`backend.poll._ensure_bundle_clone`
+        # and the pinned script cron `host-crons/config_sync_poll.py`, which
+        # takes the same `<clone_dir>.lock` file; senior-review round-2
+        # M-new-2, round-3 H2, Deployment-5 M3). The script fetches every
+        # 900s and a dashboard push can land at any moment, both touching
+        # this SAME `_BUNDLE_CLONE_DIRNAME` directory with no other
+        # coordination between them, so the two could otherwise both
+        # observe no `.git` yet and both start a `clone` into the identical
+        # path — one losing attempt can leave the directory non-empty but
+        # without a working `.git`, a state neither side's own
+        # `.git`-exists check ever self-heals from afterward.
         clone_dir.mkdir(parents=True, exist_ok=True)
 
         with git_safety.clone_lock(clone_dir):

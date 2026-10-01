@@ -44,11 +44,9 @@ deployment has merged, per the folder-scoped PR-first workflow.
    call.
 3. **Deployment 3 — Pull detection.** Branch `feature/config-sync-poll` (from
    `main` after Deployment 2 merges). Ships `poll.py`, `classify.py`, the
-   `last_seen_sha`/`base_sha` state fields, the notification, poll cron
-   wiring. Depends on: Deployment 2 (the bundle repo needs a config-sync
-   commit to detect). Verified by: the poll detects Deployment 2's merged
-   commit and notifies once, does not re-notify next tick; nothing is
-   applied yet (the apply path is not built until Deployment 4).
+   `last_seen_sha`/`base_sha` state fields, the notification, poll wiring.
+   Depends on: Deployment 2. Verified by: the poll detects Deployment 2's merged
+   commit and notifies once, not twice; nothing is applied yet (Deployment 4).
 4. **Deployment 4 — Apply, propagation, and UI.** Branch
    `feature/config-sync-apply` (from `main` after Deployment 3 merges). Ships
    `apply.py`, `sanitize.py`, `propagate.py`, `registration.py`, `routes.py`,
@@ -136,10 +134,11 @@ deployment has merged, per the folder-scoped PR-first workflow.
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 3.8, 7.5, 8.4_
 
-  - [ ] 2.4 `app.json` declares `defaultEnabled: false` and exactly two crons —
-        one push, one poll — each using `command` with `enabled: false`; the
-        scaffold's `agents/sample-agent.json` and `skills/sample-skill/` are
-        removed and the placeholder icon replaced. The app README states that
+  - [ ] 2.4 `app.json` declares `defaultEnabled: false` and no crons (the
+        host's cron sandbox hides git credentials); the poll is the pinned
+        SCRIPT body `host-crons/config_sync_poll.py` (Req 8.3); the scaffold's
+        sample agent and sample skill are removed and the placeholder icon
+        replaced. The app README states that
         tracking `crons.json` and `instances.json` is a DELIBERATE, DOCUMENTED
         EXCEPTION to instance isolation and names both concrete failure modes
         (foreign `command`/`script`/paths/`env`; foreign ssh aliases, SSM
