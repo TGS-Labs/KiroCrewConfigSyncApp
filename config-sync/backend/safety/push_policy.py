@@ -236,9 +236,31 @@ def scan_content_for_secrets(text: str) -> tuple[bool, str]:
 _TOKEN_PARAM_WARNING_RE = re.compile(r"Redacted token parameter value \((\d+) chars\)")
 
 #: A ``?token=`` VALUE shorter than this is treated as a placeholder, not a
-#: bearer. Same floor as the host's own credential pre-filter
-#: (``_PREFILTER_MIN_LEN``): no real token the host issues is this short.
+#: bearer. Rationale: the host's own issued tokens are JWTs, which pass 1
+#: catches regardless of this pass; what pass 4 adds for a PUSH gate is
+#: opaque third-party bearers, and a plausible one is at least this long.
+#: ACCEPTED RISK: a sub-16-char third-party token, or a token deliberately
+#: split across several short ``?token=`` values, is not refused by this
+#: pass (the other passes still apply). The number matches the host's
+#: ``_PREFILTER_MIN_LEN`` by convention only — that constant is a scan
+#: performance crossover, not a token-length fact.
 _TOKEN_PARAM_MIN_BEARER_LEN = 16
+
+
+def parse_scan_note(note: str) -> tuple[str, int]:
+    """Split a :func:`scan_content_for_secrets` note into ``(code, count)``.
+
+    ``"hit: 2 finding(s)"`` -> ``("hit", 2)``; ``"ok"`` -> ``("ok", 0)``;
+    ``"no_scanner"`` -> ``("no_scanner", 0)``. A note of an unexpected shape
+    yields its leading token as the code and a count of 1, so a caller
+    aggregating counts never under-reports a finding.
+    """
+    code, sep, rest = str(note).partition(":")
+    code = code.strip()
+    if not sep:
+        return code, 0
+    first = rest.strip().split(" ", 1)[0]
+    return code, int(first) if first.isdigit() else 1
 
 
 def _is_blocking_credential_warning(warning: str) -> bool:

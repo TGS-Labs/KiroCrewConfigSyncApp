@@ -366,6 +366,22 @@ class TestTokenParameterPlaceholders:
         assert note == "hit: 1 finding(s)", "the placeholder must not inflate the count"
 
 
+class TestParseScanNote:
+    @pytest.mark.parametrize(
+        "note, expected",
+        [
+            ("hit: 2 finding(s)", ("hit", 2)),
+            ("ok", ("ok", 0)),
+            ("no_scanner", ("no_scanner", 0)),
+            ("hit: lots", ("hit", 1)),
+        ],
+    )
+    def test_shapes(self, note: str, expected: tuple[str, int]) -> None:
+        from backend.safety.push_policy import parse_scan_note
+
+        assert parse_scan_note(note) == expected
+
+
 class TestScanContentForSecretsFailsClosed:
     """Requirement 3.7 / 8.5: an unimportable or unrunnable scanner fails
     CLOSED (refuses), because an unscannable push is indistinguishable from

@@ -273,6 +273,12 @@ def _branch_name(current_hash: str) -> str:
     return f"config-sync/{_instance_id()}-{current_hash[:12]}"
 
 
+#: How many dirty relpaths a refusal reason names before "... and N more".
+#: The reason is rendered on the dashboard card and stored in state.json, so
+#: it must stay bounded however many files are dirty.
+_MAX_NAMED_DIRTY_PATHS = 5
+
+
 def _scan_tree_for_secrets(redacted: Mapping[str, bytes]) -> tuple[bool, str]:
     """Run the content secret scan over every file in the redacted tree.
 
@@ -281,14 +287,16 @@ def _scan_tree_for_secrets(redacted: Mapping[str, bytes]) -> tuple[bool, str]:
     binary blob that cannot decode carries no scannable credential text
     either way), per push_policy's "one gate for every exit" design. Every
     file is scanned, not just up to the first dirty one, so a single
-    refusal names ALL the offending files: ``hit: N finding(s) in <path>,
-    <path>``. The paths are the tree's own keys — never scanned content — so
-    push_policy's "the note is independent of the text" contract holds; the
-    first non-OK note's code is kept as the reason's prefix.
+    refusal names the offending files: ``hit: N finding(s) in <path>,
+    <path>`` (at most `_MAX_NAMED_DIRTY_PATHS`, then ``... and N more``).
+    The paths are the tree's own keys — never scanned content — so
+    push_policy's "the note is independent of the text" contract holds.
+    An UNAVAILABLE scanner (``no_scanner``) is a property of the host, not
+    of any file: it returns immediately with push_policy's own note, so a
+    missing scanner is one refusal and one log line, not one per file.
     """
     total = 0
     dirty: list[str] = []
-    first_code = ""
     for relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
         try:
             text = content.decode("utf-8")
@@ -297,16 +305,17 @@ def _scan_tree_for_secrets(redacted: Mapping[str, bytes]) -> tuple[bool, str]:
         clean, note = push_policy.scan_content_for_secrets(text)
         if clean:
             continue
+        code, count = push_policy.parse_scan_note(note)
+        if code != push_policy.SCAN_HIT:
+            return False, note
         dirty.append(relpath)
-        code, _sep, rest = note.partition(":")
-        first_code = first_code or code
-        count = rest.strip().split(" ", 1)[0]
-        total += int(count) if count.isdigit() else 1
+        total += count
     if not dirty:
         return True, push_policy.SCAN_OK
-    if first_code == push_policy.SCAN_HIT:
-        return False, f"{first_code}: {total} finding(s) in {', '.join(dirty)}"
-    return False, f"{first_code} in {', '.join(dirty)}"
+    named = ", ".join(dirty[:_MAX_NAMED_DIRTY_PATHS])
+    if len(dirty) > _MAX_NAMED_DIRTY_PATHS:
+        named += f" and {len(dirty) - _MAX_NAMED_DIRTY_PATHS} more"
+    return False, f"{push_policy.SCAN_HIT}: {total} finding(s) in {named}"
 
 
 def _write_working_copy(clone_dir: Path, redacted: Mapping[str, bytes]) -> None:
