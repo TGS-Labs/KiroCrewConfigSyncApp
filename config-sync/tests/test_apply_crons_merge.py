@@ -10,10 +10,13 @@ was gone.
 
 The rule this file pins (requirements.md 6.11):
 
-* a job that exists live is LEFT EXACTLY AS IT IS — its enabled state, its
-  grant, its runtime bookkeeping — whether or not the commit also carries it;
+* a job that exists live (matched by name OR id) is LEFT EXACTLY AS IT IS —
+  its enabled state, its grant, its runtime bookkeeping — whether or not the
+  commit also carries it (so fleet-wide updates do not propagate by pull);
 * a job the commit carries that is NOT live is ADDED, sanitized (vet, paused)
-  as before;
+  as before — UNLESS it was in the ``crons.json`` of the last fully-applied
+  commit (``base_sha``): then the operator deleted it locally and pull must
+  not resurrect it (review round 3, H2);
 * a job that is live but absent from the commit is PRESERVED — pulling a
   ``crons.json`` can never delete a local job (removal stays an operator
   action on the Schedule page);
@@ -297,7 +300,185 @@ def test_a_live_crons_json_of_the_wrong_shape_is_refused_not_overwritten(
     assert live_path.read_text(encoding="utf-8") == json.dumps([1, 2, 3])
 
 
+# ── review round 3: three-way merge, duplicate ids, idempotency ──────────
+
+
+def test_a_job_the_operator_removed_since_the_base_commit_is_not_re_added(
+    env: dict[str, Any],
+) -> None:
+    """Review H2. Pull used to only ever ADD, so a job deleted on the
+    Schedule page came back on the next pull that touched crons.json. The
+    last fully-applied commit (``base_sha``) is the third side: a commit
+    job that is absent live but WAS in the base was removed locally."""
+    (env["root_a"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": []}) + "\n"
+    )
+    retired = _job(
+        "aaf2def9", "config-sync/config-sync-push", command="python3 -m backend.push"
+    )
+    fresh = _job("1111aaaa", "fleet-new", command="echo new")
+    base_doc = {"version": 3, "jobs": [retired]}
+    commit_doc = {"version": 3, "jobs": [retired, fresh]}
+    (env["commit_root"] / "crons.json").write_text(json.dumps(commit_doc) + "\n")
+
+    result = apply.apply_commit(
+        approved_sha=env["sha"],
+        commit_root=env["commit_root"],
+        changed_paths={"A": ["crons.json"], "B": []},
+        store=env["store"],
+        cron_vet=_always_clean,
+        base_crons_doc=base_doc,
+    )
+
+    assert "crons.json" in result.applied
+    ids = [j["id"] for j in _live(env)["jobs"]]
+    assert ids == ["1111aaaa"], ids
+    assert result.paused_cron_names == ["fleet-new"]
+
+
+def test_without_a_base_every_unmatched_commit_job_is_added(
+    env: dict[str, Any]
+) -> None:
+    """First-ever tick: no base exists, so nothing can be known as removed."""
+    (env["root_a"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": []}) + "\n"
+    )
+    job = _job("2222bbbb", "fleet-x", command="echo x")
+    result = _apply_crons(env, {"version": 3, "jobs": [job]})
+    assert [j["id"] for j in _live(env)["jobs"]] == ["2222bbbb"]
+    assert result.paused_cron_names == ["fleet-x"]
+
+
+def test_a_commit_job_whose_id_is_live_under_another_name_is_not_added(
+    env: dict[str, Any],
+) -> None:
+    """Review H3. The host keys jobs by id (`jobs_by_id`, `cron:<id>` session
+    keys), so a rename on either side must never produce two records with
+    one id. Match on EITHER name or id."""
+    live = _job("3333cccc", "old-name", command="echo a")
+    (env["root_a"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": [live]}) + "\n"
+    )
+    renamed = _job("3333cccc", "new-name", command="echo a")
+    same_name_other_id = _job("4444dddd", "old-name", command="echo b")
+    result = _apply_crons(env, {"version": 3, "jobs": [renamed, same_name_other_id]})
+
+    assert "crons.json" in result.applied
+    (only,) = _live(env)["jobs"]
+    assert only == live
+    assert result.paused_cron_names == []
+
+
+def test_applying_the_same_commit_twice_is_byte_identical(env: dict[str, Any]) -> None:
+    """Review H4 (#66): the poll's retry path re-applies a still-partial
+    range; the second pass must change nothing."""
+    (env["root_a"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": [_LIVE_POLL]}) + "\n"
+    )
+    commit_doc = {"version": 3, "jobs": [_job("5555eeee", "fleet-e", command="echo e")]}
+    first = _apply_crons(env, commit_doc)
+    bytes_after_first = (env["root_a"] / "crons.json").read_bytes()
+    assert first.paused_cron_names == ["fleet-e"]
+
+    env["store"].set_pending(
+        sha=env["sha"],
+        author="a",
+        subject="s",
+        classified_paths={},
+        ignored_paths=[],
+        touched_classes=[],
+    )
+    second = _apply_crons(env, commit_doc)
+    assert "crons.json" in second.applied
+    assert (env["root_a"] / "crons.json").read_bytes() == bytes_after_first
+    assert second.paused_cron_names == []
+
+
+def test_merge_crons_three_way_contract() -> None:
+    live = {"version": 3, "jobs": [_job("L", "local")]}
+    base = {"version": 3, "jobs": [_job("R", "removed-locally")]}
+    commit = {"version": 3, "jobs": [_job("R", "removed-locally"), _job("N", "new")]}
+    merged = sanitize.merge_crons(live, commit, base=base)
+    assert [j["id"] for j in merged.merged_store["jobs"]] == ["L", "N"]
+    assert merged.added_job_names == ["new"]
+    assert merged.removed_locally_job_names == ["removed-locally"]
+    # A malformed base is ignored (treated as no base), never fatal.
+    merged2 = sanitize.merge_crons(live, commit, base={"nope": 1})
+    assert [j["id"] for j in merged2.merged_store["jobs"]] == ["L", "R", "N"]
+
+
 # ── the merge function itself ────────────────────────────────────────────
+
+
+def test_poll_tick_passes_the_base_commits_crons_json_into_the_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seam test (testing-standards § Composition): `poll._apply_new_head`
+    must hand `apply_commit` the crons.json AT `base_sha`, read from the
+    shared clone, or the three-way rule above is dead code on the live
+    path. Commit 1 (the base) ships job R; the operator then deletes R
+    locally; commit 2 still carries R and adds N. After the tick: N only."""
+    from backend import poll
+
+    root_a = tmp_path / "kirocrew-home"
+    root_b = tmp_path / "kiro-home"
+    state_dir = tmp_path / "config-sync-state"
+    for d in (root_a, root_b, state_dir):
+        d.mkdir(parents=True)
+    monkeypatch.setenv("KIROCREW_HOME", str(root_a))
+    monkeypatch.setenv("KIRO_HOME", str(root_b))
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv(poll.PREFETCHED_ENV, "1")
+    monkeypatch.setattr(poll, "BUNDLE_REPO_URL", "https://127.0.0.1:9/unreachable.git")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git("init", "-q", "-b", "main", cwd=work)
+    retired = _job("aaf2def9", "retired", command="python3 -m backend.push")
+    (work / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": [retired]}) + "\n"
+    )
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "base", cwd=work)
+    base_sha = _git("rev-parse", "HEAD", cwd=work)
+    fresh = _job("1111aaaa", "fresh", command="echo new")
+    (work / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": [retired, fresh]}) + "\n"
+    )
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "head", cwd=work)
+    origin = tmp_path / "origin.git"
+    _git("clone", "-q", "--bare", str(work), str(origin), cwd=tmp_path)
+    clone_dir = state_dir / poll._BUNDLE_CLONE_DIRNAME
+    _git("clone", "-q", str(origin), str(clone_dir), cwd=tmp_path)
+    _git(
+        "remote",
+        "set-url",
+        "origin",
+        "https://127.0.0.1:9/unreachable.git",
+        cwd=clone_dir,
+    )
+
+    # The base is applied and the operator has since removed R locally.
+    store = state.load_state()
+    store.record_seen_sha(base_sha)
+    store.set_pending(
+        sha=base_sha,
+        author="a",
+        subject="s",
+        classified_paths={},
+        ignored_paths=[],
+        touched_classes=[],
+    )
+    store.resolve_pending(sha=base_sha)
+    (root_a / "crons.json").write_text(json.dumps({"version": 3, "jobs": []}) + "\n")
+
+    result = poll.run()
+
+    assert result.outcome == "changed", (result.outcome, result.reason)
+    written = json.loads((root_a / "crons.json").read_text(encoding="utf-8"))
+    assert [j["id"] for j in written["jobs"]] == ["1111aaaa"], written
+    assert (state.load_state().last_apply or {}).get("outcome") == "applied"
 
 
 def test_merge_crons_unit_contract() -> None:
@@ -322,3 +503,39 @@ def test_merge_crons_refuses_a_live_store_without_a_jobs_list() -> None:
         sanitize.merge_crons({"version": 3}, {"version": 3, "jobs": []})
     with pytest.raises(ValueError):
         sanitize.merge_crons({"version": 3, "jobs": "nope"}, {"version": 3, "jobs": []})
+
+
+def test_base_crons_doc_degrades_to_none_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every failure to read the base's crons.json means a two-way merge,
+    never a skipped or failed apply."""
+    from backend import poll
+
+    state_dir = tmp_path / "config-sync-state"
+    state_dir.mkdir()
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    assert poll._base_crons_doc(None) is None
+    assert poll._base_crons_doc("0" * 40) is None  # no clone yet
+
+    clone_dir = state_dir / poll._BUNDLE_CLONE_DIRNAME
+    clone_dir.mkdir()
+    _git("init", "-q", "-b", "main", cwd=clone_dir)
+    (clone_dir / "crons.json").write_text("{not json")
+    (clone_dir / "other.json").write_text("[1, 2]")
+    _git("add", "-A", cwd=clone_dir)
+    _git("commit", "-q", "-m", "c", cwd=clone_dir)
+    sha = _git("rev-parse", "HEAD", cwd=clone_dir)
+    assert poll._base_crons_doc(sha) is None  # invalid JSON at that path
+    assert poll._base_crons_doc("f" * 40) is None  # unknown object
+    (clone_dir / "crons.json").write_text("[1, 2]")
+    _git("add", "-A", cwd=clone_dir)
+    _git("commit", "-q", "-m", "d", cwd=clone_dir)
+    assert poll._base_crons_doc(_git("rev-parse", "HEAD", cwd=clone_dir)) is None
+    (clone_dir / "crons.json").write_text(json.dumps({"version": 3, "jobs": []}))
+    _git("add", "-A", cwd=clone_dir)
+    _git("commit", "-q", "-m", "e", cwd=clone_dir)
+    assert poll._base_crons_doc(_git("rev-parse", "HEAD", cwd=clone_dir)) == {
+        "version": 3,
+        "jobs": [],
+    }

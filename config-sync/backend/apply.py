@@ -794,6 +794,7 @@ def _apply_one_file(
     deleted_by_root: Dict[str, set],
     apply_roots: Dict[str, Path],
     cron_vet: Optional[VetCallable],
+    base_crons_doc: Optional[Dict[str, Any]],
     applied: List[str],
     not_applied: Dict[str, str],
     needs_credential: List[str],
@@ -952,7 +953,7 @@ def _apply_one_file(
                     return
                 try:
                     merge_result = sanitize.merge_crons(
-                        live_doc, cron_result.sanitized_store
+                        live_doc, cron_result.sanitized_store, base=base_crons_doc
                     )
                 except ValueError as exc:
                     not_applied[relpath] = f"{relpath}: refused — cannot merge: {exc}"
@@ -1079,6 +1080,7 @@ def apply_commit(
     store: "state_module.StateStore",
     deleted_paths: Optional[Dict[str, List[str]]] = None,
     cron_vet: Optional[VetCallable] = None,
+    base_crons_doc: Optional[Dict[str, Any]] = None,
 ) -> ApplyResult:
     """Apply an approved commit's allowlisted files to this instance.
 
@@ -1099,6 +1101,13 @@ def apply_commit(
             an empty mapping when omitted.
         cron_vet: Optional override for ``sanitize.sanitize_crons``'s
             shell-command vet; defaults to that module's own default.
+        base_crons_doc: The parsed ``crons.json`` at ``state.base_sha`` (the
+            last fully-applied commit), when the caller has one — the third
+            side of the ``crons.json`` merge (Requirement 6.11): a commit job
+            that is in the base but absent live was removed locally and is
+            not re-added. ``None`` means no base (first-ever tick, or the
+            file was not in the base commit) and every unmatched commit job
+            is added.
 
     Returns:
         An ``ApplyResult`` reflecting exactly what happened. Never reports
@@ -1233,6 +1242,7 @@ def apply_commit(
                 deleted_by_root=deleted_by_root,
                 apply_roots=apply_roots,
                 cron_vet=cron_vet,
+                base_crons_doc=base_crons_doc,
                 applied=applied,
                 not_applied=not_applied,
                 needs_credential=needs_credential,

@@ -186,18 +186,34 @@ def sanitize_crons(
     )
 
 
-def _identity_of(job: Dict[str, Any]) -> Tuple[str, str] | None:
-    """Stable identity for matching live and pulled jobs: ``name`` first,
-    ``id`` as the fallback when ``name`` is absent — the same precedence
-    ``apply._entry_identity`` uses for placeholder restoration, namespaced so
-    a job named ``"1"`` never collides with a job whose id is ``"1"``."""
+def _keys_of(job: Dict[str, Any]) -> set[Tuple[str, str]]:
+    """Every identity a job answers to: its ``name`` and its ``id``, namespaced
+    so a job named ``"1"`` never collides with a job whose id is ``"1"``.
+
+    The host keys jobs by ``id`` (``jobs_by_id``, the ``cron:<id>`` session
+    key), while placeholder restoration (``apply._entry_identity``) matches by
+    name first. The merge therefore treats a commit job as "already live" if
+    EITHER key is live — a rename on either side must never produce two
+    records with one id, and a fleet job sharing a local job's name must not
+    be duplicated under a new id.
+    """
+    keys: set[Tuple[str, str]] = set()
     name = job.get("name")
     if isinstance(name, str) and name:
-        return ("name", name)
+        keys.add(("name", name))
     job_id = job.get("id")
     if isinstance(job_id, str) and job_id:
-        return ("id", job_id)
-    return None
+        keys.add(("id", job_id))
+    return keys
+
+
+def _jobs_of(doc: Any) -> List[Dict[str, Any]] | None:
+    """The ``jobs`` list of a ``crons.json`` document, or ``None`` when the
+    document is not shaped ``{"jobs": [...]}``. Non-dict entries are dropped
+    (the host's loader skips them too)."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), list):
+        return None
+    return [dict(j) for j in doc["jobs"] if isinstance(j, dict)]
 
 
 @dataclass
@@ -206,30 +222,44 @@ class CronMergeResult:
 
     Attributes:
         merged_store: The document to write: the live document's own shape
-            and every live job verbatim, followed by every commit job whose
-            ``id`` is not live.
+            and every live job verbatim (non-dict entries dropped, as the
+            host's loader drops them), followed by every commit job that
+            matches no live job by name OR id and was not removed locally.
         added_job_names: Names of the commit jobs that were added.
         preserved_job_names: Names of every live job (all of them — a pull
             never removes or alters a local job).
+        removed_locally_job_names: Names of commit jobs NOT added because
+            they were in the base commit yet are absent live — the operator
+            deleted them here since the last apply.
     """
 
     merged_store: Dict[str, Any] = field(default_factory=dict)
     added_job_names: List[str] = field(default_factory=list)
     preserved_job_names: List[str] = field(default_factory=list)
+    removed_locally_job_names: List[str] = field(default_factory=list)
 
 
-def merge_crons(live: Dict[str, Any], commit: Dict[str, Any]) -> CronMergeResult:
+def merge_crons(
+    live: Dict[str, Any],
+    commit: Dict[str, Any],
+    base: Dict[str, Any] | None = None,
+) -> CronMergeResult:
     """Merge a (sanitized) pulled ``crons.json`` into the live store (6.11).
 
-    Live wins, always. A job that exists live — matched by ``name``, or by
-    ``id`` when it has no name (``_identity_of``) — is kept exactly as it
-    is: its enabled state, its vault grant, its runtime bookkeeping, even if
-    the commit carries a different version of it. A commit job with no live
-    match is appended. A live job the commit no longer carries is kept:
-    pulling can never delete a local job (removal is an operator action on
-    the Schedule page). A consequence of name-matching: a fleet job that
-    shares a local job's name is not added — the local one is the one that
-    stays.
+    Three-way, live wins:
+
+    * A job that exists live — matched by ``name`` OR ``id`` — is kept exactly
+      as it is: its enabled state, its vault grant, its runtime bookkeeping,
+      even if the commit carries a different version of it. So a fleet-wide
+      UPDATE to an existing job does not propagate by pull; this is the
+      documented trade-off for a file that holds grants and runtime state.
+    * A commit job with no live match is appended — UNLESS it was present in
+      ``base`` (the ``crons.json`` of the last fully-applied commit): then the
+      operator deleted it locally since that apply, and pull must not
+      resurrect it (review round 3, H2: the two retired app jobs kept coming
+      back, and the next push would have sent them back to the fleet).
+    * A live job the commit no longer carries is kept: pulling never deletes
+      a local job (removal is an operator action on the Schedule page).
 
     Why: the first poll tick after a box's own push used to write the
     committed snapshot over the live file wholesale, deleting every job
@@ -240,31 +270,40 @@ def merge_crons(live: Dict[str, Any], commit: Dict[str, Any]) -> CronMergeResult
     Args:
         live: The parsed live ``crons.json`` (``{"jobs": [...], ...}``).
         commit: The pulled document AFTER ``sanitize_crons``.
+        base: The ``crons.json`` at ``base_sha``, or ``None`` when there is no
+            base (first-ever tick) or it could not be read. A base of the
+            wrong shape is treated as ``None`` — never fatal, never a reason
+            to skip the apply.
 
     Raises:
         ValueError: when ``live`` is not a mapping with a ``jobs`` list — a
             live file that cannot be merged into is never overwritten.
     """
-    if not isinstance(live, dict) or not isinstance(live.get("jobs"), list):
+    live_jobs = _jobs_of(live)
+    if live_jobs is None:
         raise ValueError(
             "live crons.json is not a {'jobs': [...]} document; refusing to merge"
         )
-    live_jobs: List[Dict[str, Any]] = [
-        dict(j) for j in live["jobs"] if isinstance(j, dict)
-    ]
-    live_keys = {_identity_of(j) for j in live_jobs} - {None}
+    live_keys: set[Tuple[str, str]] = set()
+    for job in live_jobs:
+        live_keys |= _keys_of(job)
+    base_keys: set[Tuple[str, str]] = set()
+    for job in _jobs_of(base) or []:
+        base_keys |= _keys_of(job)
 
     added: List[Dict[str, Any]] = []
     added_names: List[str] = []
-    for job in commit.get("jobs", []):
-        if not isinstance(job, dict):
+    removed_locally: List[str] = []
+    for job in _jobs_of(commit) or []:
+        keys = _keys_of(job)
+        if not keys or keys & live_keys:
             continue
-        key = _identity_of(job)
-        if key is None or key in live_keys:
+        if keys & base_keys:
+            removed_locally.append(_name_of(job))
             continue
-        added.append(dict(job))
+        added.append(job)
         added_names.append(_name_of(job))
-        live_keys.add(key)
+        live_keys |= keys
 
     merged = dict(live)
     merged["jobs"] = live_jobs + added
@@ -272,6 +311,7 @@ def merge_crons(live: Dict[str, Any], commit: Dict[str, Any]) -> CronMergeResult
         merged_store=merged,
         added_job_names=added_names,
         preserved_job_names=[_name_of(j) for j in live_jobs],
+        removed_locally_job_names=removed_locally,
     )
 
 
