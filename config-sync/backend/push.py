@@ -273,25 +273,49 @@ def _branch_name(current_hash: str) -> str:
     return f"config-sync/{_instance_id()}-{current_hash[:12]}"
 
 
+#: How many dirty relpaths a refusal reason names before "... and N more".
+#: The reason is rendered on the dashboard card and stored in state.json, so
+#: it must stay bounded however many files are dirty.
+_MAX_NAMED_DIRTY_PATHS = 5
+
+
 def _scan_tree_for_secrets(redacted: Mapping[str, bytes]) -> tuple[bool, str]:
     """Run the content secret scan over every file in the redacted tree.
 
-    Concatenates each file's decoded text (best-effort; undecodable content
-    is skipped — `push_policy.scan_content_for_secrets` scans text, and a
+    Scans each file's decoded text (best-effort; undecodable content is
+    skipped — `push_policy.scan_content_for_secrets` scans text, and a
     binary blob that cannot decode carries no scannable credential text
-    either way) and scans it as one call, per push_policy's "one gate for
-    every exit" design. Returns the first non-clean verdict found, short
-    circuiting the moment one file scans dirty.
+    either way), per push_policy's "one gate for every exit" design. Every
+    file is scanned, not just up to the first dirty one, so a single
+    refusal names the offending files: ``hit: N finding(s) in <path>,
+    <path>`` (at most `_MAX_NAMED_DIRTY_PATHS`, then ``... and N more``).
+    The paths are the tree's own keys — never scanned content — so
+    push_policy's "the note is independent of the text" contract holds.
+    An UNAVAILABLE scanner (``no_scanner``) is a property of the host, not
+    of any file: it returns immediately with push_policy's own note, so a
+    missing scanner is one refusal and one log line, not one per file.
     """
-    for _relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
+    total = 0
+    dirty: list[str] = []
+    for relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError:
             continue
         clean, note = push_policy.scan_content_for_secrets(text)
-        if not clean:
-            return clean, note
-    return True, push_policy.SCAN_OK
+        if clean:
+            continue
+        code, count = push_policy.parse_scan_note(note)
+        if code != push_policy.SCAN_HIT:
+            return False, note
+        dirty.append(relpath)
+        total += count
+    if not dirty:
+        return True, push_policy.SCAN_OK
+    named = ", ".join(dirty[:_MAX_NAMED_DIRTY_PATHS])
+    if len(dirty) > _MAX_NAMED_DIRTY_PATHS:
+        named += f" and {len(dirty) - _MAX_NAMED_DIRTY_PATHS} more"
+    return False, f"{push_policy.SCAN_HIT}: {total} finding(s) in {named}"
 
 
 def _write_working_copy(clone_dir: Path, redacted: Mapping[str, bytes]) -> None:

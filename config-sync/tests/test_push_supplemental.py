@@ -153,6 +153,160 @@ def test_scan_skips_a_file_whose_content_is_not_valid_utf8(
     change_path_collaborators["scan"].assert_not_called()
 
 
+def test_scan_refusal_names_every_dirty_file_by_path(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hit: 2 finding(s)`` on its own left the operator with no way to find
+    the offending file among hundreds (first live push, 2026-10-01). The
+    tree-level refusal must name each dirty file's relpath -- a path is not
+    scanned content, so this does not weaken push_policy's no-echo contract
+    -- and must not stop at the first dirty file, so one failure lists all
+    of them.
+    """
+    root_a = isolated_roots["root_a"]
+    _write(root_a, "config.json", b'{"a": 1}')
+    _write(root_a, "crons.json", b'{"jobs": []}')
+    _write(root_a, "mcp.json", b"{}")
+
+    _seed_changed_hash(monkeypatch)
+
+    def _scan(text: str) -> tuple[bool, str]:
+        # mcp.json is the clean one; redaction may re-serialise its JSON, so
+        # key on the other two files' distinctive content instead of "{}".
+        dirty = '"a"' in text or "jobs" in text
+        return (False, "hit: 1 finding(s)") if dirty else (True, "ok")
+
+    change_path_collaborators["scan"].side_effect = _scan
+
+    result = push.run()
+
+    assert result.outcome == "refused-secret-scan"
+    assert result.reason.startswith("hit: 2 finding(s)")
+    assert "config.json" in result.reason
+    assert "crons.json" in result.reason
+    assert "mcp.json" not in result.reason
+    assert change_path_collaborators["scan"].call_count == 3
+
+
+@pytest.fixture
+def real_scanner(
+    change_path_collaborators: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undo the fixture's scanner mock so push.run() hits the REAL host
+    scanner (kiro_crew.security via push_policy). Git/network stay mocked.
+    The original function is recovered by executing push_policy's source
+    into a fresh module, since the mock replaced the module attribute."""
+    import importlib.util
+
+    from backend.safety import push_policy
+
+    spec = importlib.util.spec_from_file_location("_pp_fresh", push_policy.__file__)
+    assert spec is not None and spec.loader is not None
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    original = fresh.scan_content_for_secrets
+    monkeypatch.setattr(push_policy, "scan_content_for_secrets", original)
+    if hasattr(push, "push_policy"):
+        monkeypatch.setattr(push.push_policy, "scan_content_for_secrets", original)
+
+
+_WEB_VERIFY_DOC = (
+    b"# web-verify\n"
+    b'3. **Open it:** `playwright-cli open "http://127.0.0.1:PORT/?token='
+    b'\xe2\x80\xa6"`.\n'
+    b'  "http://127.0.0.1:PORT/?token=\xe2\x80\xa6"` then screenshot /tmp/<name>.png\n'
+)
+
+
+def test_real_scanner_pushes_a_tracked_skill_doc_with_token_placeholders(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    real_scanner: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live bug, end to end with the host's real scanner: KiroCrew's own
+    shipped `skills/web-verify/SKILL.md` carries `?token=…` placeholders, is
+    allowlisted, and must not refuse the push (2026-10-01 first live push:
+    "hit: 2 finding(s)")."""
+    root_a = isolated_roots["root_a"]
+    _write(root_a, "skills/web-verify/SKILL.md", _WEB_VERIFY_DOC)
+    _write(root_a, "steering/notes.md", b"# notes\nplain prose, no secrets.\n")
+
+    _seed_changed_hash(monkeypatch)
+
+    result = push.run()
+
+    assert result.outcome == "pushed", result.reason
+
+
+def test_real_scanner_refuses_a_real_bearer_and_names_the_file(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    real_scanner: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_a = isolated_roots["root_a"]
+    _write(root_a, "skills/web-verify/SKILL.md", _WEB_VERIFY_DOC)
+    bearer = b"q7Zp2mXv9Lk4Rt8Yw3Nb6Hs1Dg5Fj0Ca"
+    _write(root_a, "steering/leak.md", b"see http://127.0.0.1/?token=" + bearer)
+
+    _seed_changed_hash(monkeypatch)
+
+    result = push.run()
+
+    assert result.outcome == "refused-secret-scan"
+    assert result.reason.startswith("hit: 1 finding(s) in steering/leak.md")
+    assert "web-verify" not in result.reason
+    assert bearer.decode() not in result.reason
+    change_path_collaborators["subprocess_run"].assert_not_called()
+
+
+def test_unavailable_scanner_refuses_once_without_listing_every_file(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-closed must not become fail-noisy: when the scanner itself is
+    unavailable, stop at the first file -- one refusal, no per-file list,
+    no 400-traceback log storm per tick."""
+    root_a = isolated_roots["root_a"]
+    for name in ("config.json", "crons.json", "mcp.json"):
+        _write(root_a, name, b"{}")
+
+    _seed_changed_hash(monkeypatch)
+    change_path_collaborators["scan"].return_value = (False, "no_scanner")
+
+    result = push.run()
+
+    assert result.outcome == "refused-secret-scan"
+    assert result.reason == "no_scanner"
+    assert change_path_collaborators["scan"].call_count == 1
+
+
+def test_scan_refusal_caps_the_named_paths(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reason rendered on a dashboard card and stored in state.json must
+    stay bounded: name at most five files, then "... and N more"."""
+    root_a = isolated_roots["root_a"]
+    for i in range(8):
+        _write(root_a, f"steering/s{i}.md", b"x")
+
+    _seed_changed_hash(monkeypatch)
+    change_path_collaborators["scan"].return_value = (False, "hit: 1 finding(s)")
+
+    result = push.run()
+
+    assert result.outcome == "refused-secret-scan"
+    assert result.reason.startswith("hit: 8 finding(s) in ")
+    assert result.reason.count("steering/s") == 5
+    assert result.reason.endswith(" and 3 more")
+
+
 def test_run_fetches_rather_than_clones_when_bundle_repo_already_exists(
     isolated_roots: dict,
     change_path_collaborators: dict,
