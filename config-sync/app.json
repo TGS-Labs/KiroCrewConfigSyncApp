@@ -27,13 +27,5 @@
       }
     ]
   },
-  "crons": [
-    {
-      "name": "config-sync-push",
-      "every": 900,
-      "command": "cd \"$HOME/.kiro/crew/apps/config-sync\" && python3 -m backend.push",
-      "enabled": false,
-      "silent": true
-    }
-  ]
+  "crons": []
 }

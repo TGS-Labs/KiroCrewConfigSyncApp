@@ -108,17 +108,28 @@ def test_git_env_carries_the_token_and_poll_env_does_not(script: ModuleType) -> 
         "HOME": "/home/x",
         "PATH": "/usr/bin",
         script.TOKEN_ENV: TOKEN_VALUE,
-        "UNRELATED": "keep",
+        "CONFIG_SYNC_STATE_DIR": "/s",
+        "KIROCREW_HOME": "/crew",
+        "LC_ALL": "C.UTF-8",
+        # Host plumbing the granted process is seeded with: the unpinned app
+        # code must not inherit the job's identity (review M1).
+        "KIROCREW_SESSION_KEY": "cron:abc",
+        "_KIROCREW_DIAL_PORT": "9000",
+        "UNRELATED": "drop",
     }
     git_env = script.git_env(base)
     poll_env = script.poll_env(base)
 
     assert git_env[script.TOKEN_ENV] == TOKEN_VALUE
     assert git_env["GIT_TERMINAL_PROMPT"] == "0"
+    assert set(git_env) == {"HOME", "PATH", script.TOKEN_ENV, "GIT_TERMINAL_PROMPT"}
+
     assert script.TOKEN_ENV not in poll_env
     assert poll_env["CONFIG_SYNC_PREFETCHED"] == "1"
-    assert poll_env["UNRELATED"] == "keep"
-    assert poll_env["HOME"] == "/home/x"
+    for kept in ("HOME", "PATH", "CONFIG_SYNC_STATE_DIR", "KIROCREW_HOME", "LC_ALL"):
+        assert poll_env[kept] == base[kept], kept
+    for dropped in ("KIROCREW_SESSION_KEY", "_KIROCREW_DIAL_PORT", "UNRELATED"):
+        assert dropped not in poll_env, dropped
 
 
 def test_credential_helper_references_the_variable_by_name_never_the_value(
@@ -145,6 +156,76 @@ def test_fetch_argv_carries_the_same_hardening_flags_as_the_app(
         "push.recurseSubmodules=no",
     ):
         assert any(a.startswith(flag) for a in argv), flag
+    assert "core.askPass=" in argv
+
+
+def _credential_input() -> str:
+    return "protocol=https\nhost=github.com\npath=TGS-Labs/x.git\n\n"
+
+
+def _approve_input() -> str:
+    return (
+        _credential_input().rstrip("\n")
+        + f"\nusername=x-access-token\npassword={TOKEN_VALUE}\n\n"
+    )
+
+
+def test_token_helper_wins_and_a_global_store_helper_never_writes_the_token(
+    script: ModuleType, tmp_path: Path
+) -> None:
+    """Review H3. This host's own ``~/.gitconfig`` has
+    ``credential.helper=store``. Run REAL git against a HOME with that exact
+    config: ``credential fill`` must return the token (our inline helper is
+    live), and ``credential approve`` must write NO ``.git-credentials``
+    (the empty ``credential.helper=`` reset cleared the store helper before
+    ours was added). Mutation: dropping the empty reset makes the approve
+    step write the token to disk and this test red."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[credential]\n\thelper = store\n")
+    env = script.git_env(
+        {"HOME": str(home), "PATH": "/usr/bin:/bin", script.TOKEN_ENV: TOKEN_VALUE}
+    )
+    flags = script.git_config_flags()
+
+    filled = subprocess.run(
+        ["git", *flags, "credential", "fill"],
+        input=_credential_input(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert f"password={TOKEN_VALUE}" in filled
+    assert "username=x-access-token" in filled
+
+    subprocess.run(
+        ["git", *flags, "credential", "approve"],
+        input=_approve_input(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert not (
+        home / ".git-credentials"
+    ).exists(), "the global store helper was still consulted: token written to disk"
+    # Control: the SAME HOME without our flags DOES write the store file, so
+    # the assertion above is load-bearing rather than vacuous.
+    subprocess.run(
+        ["git", "credential", "approve"],
+        input=_approve_input(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert (home / ".git-credentials").exists()
+
+
+def test_git_failure_label_names_the_subcommand(script: ModuleType) -> None:
+    assert script._subcommand(script.fetch_argv(Path("/c"), "u")) == "fetch"
+    assert script._subcommand(script.clone_argv(Path("/c"), "u")) == "clone"
 
 
 def test_missing_token_fails_closed_before_any_git_or_poll_call(
@@ -358,21 +439,33 @@ def test_a_failing_fetch_surfaces_git_s_stderr_not_the_token(
     assert TOKEN_VALUE not in message
 
 
-def test_sync_clone_times_out_when_the_shared_lock_is_held(
+def test_sync_clone_is_excluded_by_the_app_s_own_clone_lock(
     script: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import fcntl
+    """Review M3: not just "same path" — hold the APP's real
+    ``git_safety.clone_lock`` and prove the script's fetch waits on it."""
+    from backend.safety import git_safety
 
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    clone_dir = state_dir / "bundle-repo"
+    monkeypatch.setattr(script, "_LOCK_TIMEOUT_SECS", 0.3)
+    monkeypatch.setattr(script, "_LOCK_POLL_SECS", 0.05)
+    with git_safety.clone_lock(clone_dir):
+        with pytest.raises(TimeoutError):
+            script.sync_clone(clone_dir, "unused", {"PATH": "/usr/bin"})
+    # And the converse: while the script holds its lock, the app's lock waits.
+    import fcntl
+
     lock_path = state_dir / "bundle-repo.lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
-    monkeypatch.setattr(script, "_LOCK_TIMEOUT_SECS", 0.3)
-    monkeypatch.setattr(script, "_LOCK_POLL_SECS", 0.05)
     try:
         with pytest.raises(TimeoutError):
-            script.sync_clone(state_dir / "bundle-repo", "unused", {"PATH": "/usr/bin"})
+            with git_safety.clone_lock(
+                clone_dir, timeout_secs=0.3, poll_interval_secs=0.05
+            ):
+                pass
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)

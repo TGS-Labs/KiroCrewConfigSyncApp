@@ -29,9 +29,21 @@ kirocrew app enable config-sync
 ## Development
 
 Edit backend code. Changes to the backend require a restart. This app ships
-no agent of its own — the push and poll jobs are zero-token `command` crons,
-both `enabled: false` by default until the operator configures the bundle
-repository target and credentials.
+no agent of its own and **no manifest crons**: KiroCrew runs cron
+subprocesses in a sandbox that hides the git credential store, and the bundle
+repo is private, so a command cron for either job can only fail. The two
+scheduled/triggered jobs are zero-token Python all the same:
+
+- **Poll** — `host-crons/config_sync_poll.py`, a stdlib-only script body an
+  agent registers as a KiroCrew *script* cron with an operator-approved vault
+  grant holding a read-only bundle-repo token. Install and update it per
+  `skills/install-poll-cron/SKILL.md`. **Uninstalling the app does not remove
+  that job** (it is owned by the agent session that created it, not by the
+  app): remove it with `cron_remove` or on the dashboard's Schedule page.
+- **Push** — `backend/push.py`, run in the backend process by the dashboard's
+  "Push changes" button (the backend runs outside the cron sandbox and has
+  the box's git credential). A scheduled push is deferred until a write-scoped
+  grant is decided.
 
 Developer tooling (pytest, black, flake8, mypy) is configured in the
 **repository-root** `pyproject.toml`, deliberately outside `config-sync/`:
@@ -50,11 +62,16 @@ source config-sync/.venv/bin/activate && black . && flake8 config-sync/backend c
 
 ```
 config-sync/
-├── app.json              ← manifest (defaultEnabled:false, two command crons)
+├── app.json              ← manifest (defaultEnabled:false, no crons — see above)
 ├── assets/
 │   └── icon.png          ← store icon
 ├── backend/               ← push/poll/apply logic
 │   └── server.py
+├── host-crons/
+│   └── config_sync_poll.py ← pinned script body for the vault-granted poll cron
+├── skills/
+│   ├── complete-pr-handoff/
+│   └── install-poll-cron/  ← how an agent registers + grants the poll cron
 └── README.md
 ```
 

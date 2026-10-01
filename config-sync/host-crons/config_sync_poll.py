@@ -93,10 +93,22 @@ def git_env(base: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
+#: What ``backend.poll`` is allowed to inherit. An allowlist, not "everything
+#: minus the token": the host seeds the granted process with its own plumbing
+#: (``KIROCREW_SESSION_KEY=cron:<id>``, ``_KIROCREW_DIAL_PORT``, ...) and the
+#: unpinned app code has no business holding the job's identity.
+_POLL_ENV_EXACT = frozenset({"HOME", "PATH", "LANG", "TZ", "TMPDIR", "USER", "LOGNAME"})
+_POLL_ENV_PREFIXES = ("LC_", "CONFIG_SYNC_", "KIROCREW_HOME", "KIRO_HOME")
+
+
 def poll_env(base: Mapping[str, str]) -> dict[str, str]:
-    """The environment ``backend.poll`` runs with: everything but the token,
-    plus the prefetched flag."""
-    env = {k: v for k, v in base.items() if k != TOKEN_ENV}
+    """The environment ``backend.poll`` runs with: the allowlisted basics and
+    the app's own variables, never the token, plus the prefetched flag."""
+    env = {
+        k: v
+        for k, v in base.items()
+        if k != TOKEN_ENV and (k in _POLL_ENV_EXACT or k.startswith(_POLL_ENV_PREFIXES))
+    }
     env[PREFETCHED_ENV] = "1"
     return env
 
@@ -110,10 +122,15 @@ def _credential_helper() -> str:
     )
 
 
-def _hardening() -> list[str]:
-    # Same flags backend/safety/git_safety.py applies to every app git call,
-    # plus: clear every configured helper (the sandbox hides the store anyway,
-    # and a helper that prompts would hang) and install the token helper.
+def git_config_flags() -> list[str]:
+    """The ``-c`` flags every git call here carries.
+
+    Same hardening backend/safety/git_safety.py applies to the app's own git
+    calls, plus the credential shape: the EMPTY ``credential.helper=`` first
+    resets the helper list (so a global ``credential.helper=store`` can never
+    see — or write — the token), then the inline helper is the only one;
+    ``core.askPass=`` clears any askpass program for the same reason.
+    """
     return [
         "-c",
         "core.hooksPath=/dev/null",
@@ -125,6 +142,8 @@ def _hardening() -> list[str]:
         "core.excludesFile=/dev/null",
         "-c",
         "push.recurseSubmodules=no",
+        "-c",
+        "core.askPass=",
         "-c",
         "credential.helper=",
         "-c",
@@ -139,7 +158,7 @@ def fetch_argv(clone_dir: Path, remote_url: str) -> list[str]:
         "git",
         "-C",
         str(clone_dir),
-        *_hardening(),
+        *git_config_flags(),
         "fetch",
         "--quiet",
         remote_url,
@@ -152,7 +171,7 @@ def clone_argv(clone_dir: Path, remote_url: str) -> list[str]:
         "git",
         "-C",
         str(clone_dir.parent),
-        *_hardening(),
+        *git_config_flags(),
         "clone",
         "--quiet",
         "--branch",
@@ -160,6 +179,17 @@ def clone_argv(clone_dir: Path, remote_url: str) -> list[str]:
         remote_url,
         str(clone_dir),
     ]
+
+
+def _subcommand(argv: list[str]) -> str:
+    """The git subcommand in *argv* (the first token after the -c pairs)."""
+    i = 1
+    while i < len(argv):
+        if argv[i] in ("-C", "-c"):
+            i += 2
+            continue
+        return argv[i]
+    return "?"
 
 
 def _run_git(argv: list[str], env: Mapping[str, str]) -> None:
@@ -170,7 +200,7 @@ def _run_git(argv: list[str], env: Mapping[str, str]) -> None:
         # argv is safe to name (the helper references the token by name) but
         # keep the message short; git's stderr is the useful part.
         raise RuntimeError(
-            f"git {argv[-3] if len(argv) >= 3 else '?'} exited {completed.returncode}: "
+            f"git {_subcommand(argv)} exited {completed.returncode}: "
             f"{(completed.stderr or '')[-_TAIL_CHARS:].strip()}"
         )
 

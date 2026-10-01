@@ -64,9 +64,12 @@ never sees the credential and makes no network call.
      minimal_context=true,
      persistent_session=false,
      hide_in_chat=true,
-     timeout=1200,
+     timeout=1500,
    )
    ```
+
+   `timeout` must exceed the script's own nested budgets (60 s lock wait +
+   300 s git + 900 s poll = 1260 s), or the host can kill a tick mid-apply.
 
    Note the returned job id.
 

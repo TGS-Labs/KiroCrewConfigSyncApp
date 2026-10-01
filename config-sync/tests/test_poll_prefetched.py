@@ -70,6 +70,11 @@ def origin_and_clone(
     monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
     clone_dir = state_dir / poll._BUNDLE_CLONE_DIRNAME
     _git("clone", "-q", str(origin), str(clone_dir), cwd=tmp_path)
+    # Review H1: the clone's OWN origin is unroutable too, so a `fetch origin`
+    # from any code path fails instead of quietly succeeding against the
+    # local bare repo. The stand-in "someone else fetched" step below names
+    # the real origin path explicitly.
+    _git("remote", "set-url", "origin", _UNROUTABLE_REMOTE, cwd=clone_dir)
 
     # Prove no network path is taken: the module-level remote is unroutable.
     monkeypatch.setattr(poll, "BUNDLE_REPO_URL", _UNROUTABLE_REMOTE)
@@ -106,8 +111,15 @@ def test_prefetched_head_tracks_a_fetch_made_by_someone_else(
     new_head = _git("rev-parse", "main", cwd=Path(str(origin_and_clone["origin"])))
     clone_dir = origin_and_clone["clone_dir"]
     assert isinstance(clone_dir, Path)
-    # Stand-in for the pinned script's credentialed fetch (local, no creds).
-    _git("fetch", "-q", "origin", cwd=clone_dir)
+    # Stand-in for the pinned script's credentialed fetch (local, no creds),
+    # naming the real origin because the clone's own `origin` is unroutable.
+    _git(
+        "fetch",
+        "-q",
+        str(origin_and_clone["origin"]),
+        "+refs/heads/main:refs/remotes/origin/main",
+        cwd=clone_dir,
+    )
 
     resolved = poll._resolve_remote_head(str(origin_and_clone["state_dir"]))
     assert resolved == new_head
@@ -167,3 +179,49 @@ def test_prefetched_run_applies_nothing_when_head_is_unchanged(
 
     assert result.outcome == "unchanged"
     assert result.head_sha == head
+
+
+def test_prefetched_tick_applies_a_changed_head_with_every_remote_unroutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review H2: the whole changed-head path — commit details, changed
+    paths, `git archive` materialisation, apply — end to end with NO
+    credential and NO reachable remote. Reuses the seam tests' real-git
+    history (merge commit M touches steering/x.md and
+    config-bundles/agent-prompts/marker.md, deletes steering/old.md)."""
+    from tests.test_routes_approve_seam import _init_origin_repo, _seed_history
+
+    root_a = tmp_path / "kiro-crew-home"
+    root_b = tmp_path / "kiro-home"
+    state_dir = tmp_path / "config-sync-state"
+    for d in (root_a, root_b, state_dir):
+        d.mkdir(parents=True)
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("KIROCREW_HOME", str(root_a))
+    monkeypatch.setenv("KIRO_HOME", str(root_b))
+    monkeypatch.setenv(poll.PREFETCHED_ENV, "1")
+    monkeypatch.setattr(poll, "BUNDLE_REPO_URL", _UNROUTABLE_REMOTE)
+
+    origin = _init_origin_repo(tmp_path)
+    shas = _seed_history(origin, tmp_path)
+    clone_dir = state_dir / poll._BUNDLE_CLONE_DIRNAME
+    _git("clone", "-q", str(origin), str(clone_dir), cwd=tmp_path)
+    _git("remote", "set-url", "origin", _UNROUTABLE_REMOTE, cwd=clone_dir)
+    # The pre-existing file the merge deletes must exist live to be deleted.
+    (root_a / "steering").mkdir()
+    (root_a / "steering" / "old.md").write_text("# old\n", encoding="utf-8")
+
+    result = poll.run()
+
+    assert result.outcome == "changed", (result.outcome, result.reason)
+    assert result.head_sha == _git("rev-parse", "main", cwd=origin)
+    assert (root_a / "steering" / "x.md").read_text(encoding="utf-8") == "# x v1\n"
+    assert (root_a / "config-bundles" / "agent-prompts" / "marker.md").is_file()
+    assert not (root_a / "steering" / "old.md").exists()
+    store = state.load_state()
+    assert store.last_seen_sha == result.head_sha
+    assert store.last_poll_failure is None
+    last_apply = store.last_apply or {}
+    assert last_apply.get("outcome") == "applied", last_apply
+    assert last_apply.get("sha") == result.head_sha
+    assert shas  # the seeded history is what was applied

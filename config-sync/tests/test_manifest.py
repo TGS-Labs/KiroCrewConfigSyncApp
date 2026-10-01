@@ -81,182 +81,35 @@ class TestDefaultEnabled:
 
 
 class TestCrons:
-    def test_required_crons_are_declared_by_name(self) -> None:
-        """Testing-standards anti-pattern guard: an exact `len(crons) == 2`
+    """Deployment 5: the manifest declares NO crons.
 
-        assertion breaks on any legitimate addition of a third cron. Assert
-        the REQUIRED push cron exists by name instead of pinning the total
-        count. The poll is deliberately NOT a manifest cron any more
-        (Deployment 5, live-install defect 7): a command cron runs in the
-        host's sandbox with no git credential and can never reach the
-        private bundle repo, so the poll ships as a pinned SCRIPT cron body
-        (`host-crons/config_sync_poll.py`) installed per
-        `skills/install-poll-cron/SKILL.md` — see
-        `test_host_cron_poll_script.py`."""
+    KiroCrew runs cron subprocesses in its sandbox, which hides the git
+    credential store, and the bundle repo is private — so a manifest command
+    cron for either job fails every tick (live install 2026-10-01, `git
+    ls-remote` exit 128). The poll ships as a vault-granted SCRIPT cron body
+    (`host-crons/config_sync_poll.py`, installed per
+    `skills/install-poll-cron/SKILL.md`; proved in
+    `test_host_cron_poll_script.py`); the push runs in the backend process
+    (dashboard "Push changes"), which lives outside the cron sandbox.
+    """
+
+    def test_manifest_declares_no_crons(self) -> None:
         manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-        names = {cron.get("name") for cron in crons}
-        assert "config-sync-push" in names, (
-            "app.json must declare the 'config-sync-push' cron "
-            f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
-        )
-        assert "config-sync-poll" not in names, (
-            "the poll must not be a manifest command cron: it cannot hold a "
-            "credential in the host's cron sandbox (install-poll-cron skill)"
-        )
-
-    def test_every_cron_is_command_or_script_based(self) -> None:
-        """A message-only (LLM) cron would consume tokens on every tick and
-        does not satisfy the zero-token command-cron design (design.md,
-        tasks.md 2.4). Each declared cron must carry a `command` or `script`
-        key, not just a bare `message`."""
-        manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-        for cron in crons:
-            has_executable_field = "command" in cron or "script" in cron
-            assert has_executable_field, (
-                "every cron in app.json must use 'command' or 'script', "
-                f"not a bare message-only cron (requirements.md 8.3): {cron!r}"
-            )
-
-    def test_every_cron_is_disabled(self) -> None:
-        manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-        for cron in crons:
-            assert cron.get("enabled") is False, (
-                "every cron in app.json must be declared with "
-                f"'enabled: false' (requirements.md 8.3): {cron!r}"
-            )
-
-    def test_crons_cover_push_and_poll(self) -> None:
-        """The two crons must be distinguishable as one push job and one
-        poll job (design.md decisions: push = scheduled cron on tree-hash
-        change; poll = every 15 minutes, notify-and-approve). This is
-        checked loosely, by name/command/script substring, since the exact
-        naming convention is an implementation choice — but each concept
-        must be represented by exactly one cron, not zero or both by one."""
-        manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-
-        def _text_blob(cron: dict[str, Any]) -> str:
-            return " ".join(
-                str(cron.get(key, ""))
-                for key in ("name", "command", "script", "message")
-            ).lower()
-
-        push_matches = [c for c in crons if "push" in _text_blob(c)]
-        poll_matches = [c for c in crons if "poll" in _text_blob(c)]
-
-        assert len(push_matches) == 1, (
-            "exactly one cron must identify itself as the push job "
-            f"(requirements.md 8.3); matched {len(push_matches)}"
-        )
-        assert poll_matches == [], (
-            "the poll job is the pinned script cron in host-crons/, never a "
-            f"manifest cron; matched {len(poll_matches)}"
-        )
-        # The poll concept is still represented exactly once: by the pinned
-        # SCRIPT body the install-poll-cron skill registers.
-        script = APP_ROOT / "host-crons" / "config_sync_poll.py"
-        assert script.is_file(), script
-        assert "backend.poll" in script.read_text()
-
-    def test_push_cron_command_resolves_the_backend_package_import(self) -> None:
-        """Senior-review P1: `python3 backend/push.py` launches push.py as a
-
-        plain script, so `sys.path[0]` resolves to `.../backend` (the
-        script's own directory) — `from backend import collect, redact,
-        state` inside push.py would then raise ModuleNotFoundError, because
-        no ancestor of `sys.path[0]` is the app root containing the
-        `backend` package. `python3 -m backend.push` only resolves
-        correctly when the process's cwd IS the app root (there is no
-        cwd/working-directory field in the app-manifest cron schema —
-        verified against `kiro_crew.apps.manifest.CronEntry`, which declares
-        no such field), so the fix must ALSO `cd` into the app's installed
-        directory before invoking the module.
-
-        This test proves both parts by reusing the declared command's own
-        `cd ... &&` prefix verbatim (so the cwd-resolution logic under test
-        is the real one, not a re-derived guess) while swapping the trailing
-        `python3 -m backend.push` for `python3 -c "import backend.push"` —
-        an IMPORT-only probe that exercises the identical package-resolution
-        seam without triggering `push.run()`'s real git/network side
-        effects, which would be unsafe to invoke from a test. Launched
-        exactly as the cron scheduler would (`sh -c <command>`, inheriting
-        HOME, with NO app-relative cwd of its own — see
-        `kiro_crew.cron_script.run_command_sandboxed`, which calls
-        `popen_limited` with no `cwd=` argument at all) from a fixture tree
-        shaped like the real installed-app layout.
-        """
-        import shutil
-        import subprocess
-        import sys
-        import tempfile
-
-        manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-        push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
-        command = push_cron.get("command", "")
-        assert command, "the push cron must declare a 'command'"
-        assert "python3 -m backend.push" in command, (
-            "the push cron's command must invoke the module by dotted path "
-            f"(`python3 -m backend.push`), not a script path; got: {command!r}"
-        )
-        import_probe_command = command.replace(
-            "python3 -m backend.push", 'python3 -c "import backend.push"'
-        )
-
-        with tempfile.TemporaryDirectory() as fake_home_str:
-            fake_home = Path(fake_home_str)
-            installed_app_dir = fake_home / ".kiro" / "crew" / "apps" / "config-sync"
-            installed_app_dir.mkdir(parents=True)
-            # Mirror only what push.py's import chain needs to resolve:
-            # backend/ as an importable package rooted at the app dir, plus
-            # its own dependency modules — not a full app install.
-            shutil.copytree(APP_ROOT / "backend", installed_app_dir / "backend")
-
-            env = {
-                "HOME": str(fake_home),
-                "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
-            }
-            # The command resolves the app dir from `$HOME` alone: the host's
-            # static cron vet refuses a `${X:-default}` fallback, so a
-            # KIROCREW_HOME override is deliberately not honoured here
-            # (see tests/test_manifest_cron_vet.py). The cron scheduler
-            # launches the command via `sh -c` with NO cwd of its own, so this
-            # subprocess's OWN cwd must not matter to the outcome either;
-            # confirm that by deliberately launching from outside the fake
-            # app dir.
-            result = subprocess.run(
-                ["sh", "-c", import_probe_command],
-                cwd=str(fake_home),
-                env=env,
-                executable=shutil.which("sh") or "/bin/sh",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
-            )
-
-        assert result.returncode == 0 and "ModuleNotFoundError" not in result.stderr, (
-            "the push cron command must resolve `backend`'s package "
-            f"imports regardless of the launching shell's own cwd; stderr:\n"
-            f"{result.stderr}"
+        assert manifest.get("crons", []) == [], (
+            "a manifest command cron cannot reach the private bundle repo from "
+            "the host's cron sandbox; neither job may be declared here"
         )
 
     def test_poll_runs_as_a_module_from_the_app_root_via_the_pinned_script(
         self,
     ) -> None:
-        """Senior-review H1 (round 1) found `python3 backend/poll.py` had the
+        """Senior-review H1 (round 1) found `python3 backend/poll.py` had a
 
-        same ModuleNotFoundError defect as the push cron: launched as a plain
-        script, `sys.path[0]` is `.../backend`, not the app root. The poll
-        is no longer a manifest command cron (Deployment 5), but the SAME
-        invariant must hold for the pinned script that now launches it: it
-        must run `python -m backend.poll` with the installed app root as
-        cwd. `test_host_cron_poll_script.py` proves the argv and cwd at run
-        time; this is the static mirror so a future edit to the body that
-        switches to a file path fails here too.
+        ModuleNotFoundError defect: launched as a plain script, `sys.path[0]`
+        is `.../backend`, not the app root. The same invariant must hold for
+        the pinned script that now launches the poll: `python -m backend.poll`
+        from the installed app root. `test_host_cron_poll_script.py` proves
+        argv and cwd at run time; this is the static mirror.
         """
         script = (APP_ROOT / "host-crons" / "config_sync_poll.py").read_text()
         assert '"-m", "backend.poll"' in script, (
@@ -265,26 +118,26 @@ class TestCrons:
         )
         assert "backend/poll.py" not in script
 
-    def test_push_cron_is_silent_and_the_poll_notifies_through_the_script(
-        self,
-    ) -> None:
-        """Push's common no-op tick has nothing to report, so the manifest's
+    def test_push_module_imports_from_the_app_root(self) -> None:
+        """Senior-review P1 (round 1): `python3 backend/push.py` could not
 
-        push cron stays `"silent": true`. The poll's changed-head summary
-        (requirements.md 4.3) used to rely on a NON-silent command cron's
-        stdout being delivered; the poll now runs inside the pinned script
-        cron, which forwards a non-empty summary through `ctx.notify()`
-        (proved in `test_host_cron_poll_script.py`). This test pins the push
-        half and the absence of a manifest poll cron that could silently
-        swallow the summary.
+        import `backend`. The push now runs in-process in the backend (the
+        dashboard route imports `backend.push`), so the surviving property is
+        that the module imports cleanly from the app root without side
+        effects — the same probe the old cron test ran, minus the shell.
         """
-        manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-        push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
-        assert (
-            push_cron.get("silent") is True
-        ), "push's common no-op tick has nothing to report and should stay silent"
-        assert not [c for c in crons if "poll" in c.get("name", "").lower()]
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import backend.push, backend.poll"],
+            cwd=str(APP_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ModuleNotFoundError" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
