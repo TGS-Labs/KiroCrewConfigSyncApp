@@ -4,6 +4,23 @@ A Kiro Crew app: Config Sync
 
 ## Installation
 
+### From the App Store (recommended)
+
+This repository doubles as a Kiro Crew app registry (`app-registry.json` at
+the repo root). Add it once, then install and update the app from the
+dashboard like any other store app:
+
+1. Dashboard → **App Store** → **Registries** → add a registry with
+   name `tgs-labs`, repo `https://github.com/TGS-Labs/KiroCrewConfigSyncApp`,
+   branch `main`.
+2. Refresh the store and install **Config Sync**.
+
+The repository is private: the gateway clones it with its own git identity
+(the same credential that lets it push config-sync branches), which the host
+permits because the app lives in the very repo you typed as the registry.
+
+### From a local checkout
+
 ```bash
 kirocrew app install /path/to/config-sync
 kirocrew app enable config-sync
