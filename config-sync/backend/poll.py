@@ -755,9 +755,10 @@ def _restore_dir_has_backup(apply_id: str) -> bool:
 
 
 def _base_crons_doc(base_sha: str | None) -> Dict[str, Any] | None:
-    """The parsed ``crons.json`` at ``base_sha`` from the shared clone, or
-    ``None`` when there is no base, the file was not in that commit, or it
-    is not valid JSON. Local object read only (``git show``), never a
+    """The parsed ``crons.json`` at ``base_sha`` (the caller passes
+    ``state.last_fully_applied_sha``) from the shared clone, or ``None``
+    when there is no base, the file was not in that commit, or it is not
+    valid JSON. Local object read only (``git show``), never a
     network call — the clone already holds the base commit because it was
     applied from it. Used as the third side of the ``crons.json`` merge
     (Requirement 6.11): a job in the base but absent live was removed by
@@ -891,7 +892,13 @@ def _apply_new_head(
             changed_paths=changed_paths,
             store=store,
             deleted_paths=deleted_paths,
-            base_crons_doc=_base_crons_doc(pre_tick_base_sha),
+            # N1(ii): the third side of the crons.json merge is the last
+            # FULLY applied commit, never `base_sha` — the bootstrap-partial
+            # path advances `base_sha` to a root ancestor that was never
+            # applied, and a never-applied base would class its jobs as
+            # "removed locally". `pre_tick_base_sha` is still the RANGE
+            # boundary; `last_fully_applied_sha` is the merge's base.
+            base_crons_doc=_base_crons_doc(store.last_fully_applied_sha),
         )
     finally:
         shutil.rmtree(commit_root, ignore_errors=True)

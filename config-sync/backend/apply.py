@@ -785,6 +785,29 @@ def _new_apply_id() -> str:
     )
 
 
+def _vetted_base_crons(
+    base_crons_doc: Optional[Dict[str, Any]], cron_vet: Optional[VetCallable]
+) -> Optional[Dict[str, Any]]:
+    """The base ``crons.json`` as it was ACTUALLY written at its own apply.
+
+    ``sanitize_crons`` drops vet-failing jobs and the file still counts as
+    applied, so a raw base over-states what was live: a job dropped then was
+    never on this box, and the fleet's fixed version must be ADDED, not
+    classed "removed locally" (review round 4, N1(i)). Running the base
+    through the same vet reproduces the written document. Works on a copy;
+    the caller's document is not mutated. A base of the wrong shape is
+    returned as-is — ``merge_crons`` treats it as no base.
+    """
+    if base_crons_doc is None:
+        return None
+    jobs = base_crons_doc.get("jobs")
+    if not isinstance(jobs, list):
+        return base_crons_doc
+    copy = dict(base_crons_doc)
+    copy["jobs"] = [dict(j) for j in jobs if isinstance(j, dict)]
+    return sanitize.sanitize_crons(copy, vet=cron_vet).sanitized_store
+
+
 def _apply_one_file(
     *,
     root: str,
@@ -952,8 +975,14 @@ def _apply_one_file(
                     )
                     return
                 try:
+                    # N1(i): the base must be what was ACTUALLY written at the
+                    # base apply. A job the vet dropped then was never live,
+                    # so it must not count as "removed locally" when the fleet
+                    # ships a fixed version. Vet the base with the same vet.
                     merge_result = sanitize.merge_crons(
-                        live_doc, cron_result.sanitized_store, base=base_crons_doc
+                        live_doc,
+                        cron_result.sanitized_store,
+                        base=_vetted_base_crons(base_crons_doc, cron_vet),
                     )
                 except ValueError as exc:
                     not_applied[relpath] = f"{relpath}: refused — cannot merge: {exc}"

@@ -407,6 +407,143 @@ def test_merge_crons_three_way_contract() -> None:
     assert [j["id"] for j in merged2.merged_store["jobs"]] == ["L", "R", "N"]
 
 
+# ── review round 4 (N1): the base must be what was ACTUALLY applied ──────
+
+
+def test_a_base_job_the_vet_dropped_was_never_live_so_the_fixed_version_is_added(
+    env: dict[str, Any],
+) -> None:
+    """N1(i). At the base apply, job X failed the vet and was dropped — the
+    file still counted as applied. X was therefore never live. When the fleet
+    ships a FIXED X, a raw base would class it "removed locally". The base
+    must be vetted with the same vet before it is used as the third side."""
+    (env["root_a"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": []}) + "\n"
+    )
+    bad = _job("6666ffff", "fleet-x", command="echo $(whoami)")
+    fixed = _job("6666ffff", "fleet-x", command="echo fixed")
+    (env["commit_root"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": [fixed]}) + "\n"
+    )
+
+    def _vet(command: str) -> str | None:
+        return "Error: command substitution" if "$(" in command else None
+
+    result = apply.apply_commit(
+        approved_sha=env["sha"],
+        commit_root=env["commit_root"],
+        changed_paths={"A": ["crons.json"], "B": []},
+        store=env["store"],
+        cron_vet=_vet,
+        base_crons_doc={"version": 3, "jobs": [bad]},
+    )
+    assert "crons.json" in result.applied
+    assert [j["id"] for j in _live(env)["jobs"]] == ["6666ffff"]
+    assert result.paused_cron_names == ["fleet-x"]
+
+
+def test_the_base_passed_in_is_not_mutated_by_the_vet(env: dict[str, Any]) -> None:
+    (env["root_a"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": []}) + "\n"
+    )
+    base = {"version": 3, "jobs": [_job("7777aaaa", "b", command="echo b")]}
+    snapshot = json.dumps(base, sort_keys=True)
+    (env["commit_root"] / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": []}) + "\n"
+    )
+    apply.apply_commit(
+        approved_sha=env["sha"],
+        commit_root=env["commit_root"],
+        changed_paths={"A": ["crons.json"], "B": []},
+        store=env["store"],
+        cron_vet=_always_clean,
+        base_crons_doc=base,
+    )
+    assert json.dumps(base, sort_keys=True) == snapshot
+
+
+def test_resolve_pending_records_the_fully_applied_sha_and_advance_base_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1(ii). `base_sha` can point at a commit that was never applied (the
+    bootstrap-partial root ancestor). The merge's third side must come from
+    the last FULLY applied commit, which only `resolve_pending` records."""
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(tmp_path / "s"))
+    store = state.load_state()
+    assert store.last_fully_applied_sha is None
+    store.advance_base_sha("a" * 40)
+    assert state.load_state().last_fully_applied_sha is None
+    store.set_pending(
+        sha="b" * 40,
+        author="a",
+        subject="s",
+        classified_paths={},
+        ignored_paths=[],
+        touched_classes=[],
+    )
+    store.resolve_pending(sha="b" * 40)
+    fresh = state.load_state()
+    assert fresh.last_fully_applied_sha == "b" * 40
+    assert fresh.base_sha == "b" * 40
+
+
+def test_poll_uses_the_last_fully_applied_commit_not_a_never_applied_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1(ii) seam. `base_sha` is advanced to a commit that ships job R but
+    was NEVER applied (bootstrap partial shape); R is not live. Head still
+    carries R. R must be ADDED — it was never removed by anyone."""
+    from backend import poll
+
+    root_a = tmp_path / "kirocrew-home"
+    root_b = tmp_path / "kiro-home"
+    state_dir = tmp_path / "config-sync-state"
+    for d in (root_a, root_b, state_dir):
+        d.mkdir(parents=True)
+    monkeypatch.setenv("KIROCREW_HOME", str(root_a))
+    monkeypatch.setenv("KIRO_HOME", str(root_b))
+    monkeypatch.setenv("CONFIG_SYNC_STATE_DIR", str(state_dir))
+    monkeypatch.setenv(poll.PREFETCHED_ENV, "1")
+    monkeypatch.setattr(poll, "BUNDLE_REPO_URL", "https://127.0.0.1:9/unreachable.git")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git("init", "-q", "-b", "main", cwd=work)
+    r_job = _job("aaf2def9", "r", command="echo r")
+    (work / "crons.json").write_text(json.dumps({"version": 3, "jobs": [r_job]}) + "\n")
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "never-applied-base", cwd=work)
+    base_sha = _git("rev-parse", "HEAD", cwd=work)
+    n_job = _job("1111aaaa", "n", command="echo n")
+    (work / "crons.json").write_text(
+        json.dumps({"version": 3, "jobs": [r_job, n_job]}) + "\n"
+    )
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "head", cwd=work)
+    origin = tmp_path / "origin.git"
+    _git("clone", "-q", "--bare", str(work), str(origin), cwd=tmp_path)
+    clone_dir = state_dir / poll._BUNDLE_CLONE_DIRNAME
+    _git("clone", "-q", str(origin), str(clone_dir), cwd=tmp_path)
+    _git(
+        "remote",
+        "set-url",
+        "origin",
+        "https://127.0.0.1:9/unreachable.git",
+        cwd=clone_dir,
+    )
+
+    store = state.load_state()
+    store.record_seen_sha(base_sha)
+    store.advance_base_sha(base_sha)  # bootstrap shape: base set, never applied
+    (root_a / "crons.json").write_text(json.dumps({"version": 3, "jobs": []}) + "\n")
+
+    result = poll.run()
+
+    assert result.outcome == "changed", (result.outcome, result.reason)
+    written = json.loads((root_a / "crons.json").read_text(encoding="utf-8"))
+    assert [j["id"] for j in written["jobs"]] == ["aaf2def9", "1111aaaa"], written
+
+
 # ── the merge function itself ────────────────────────────────────────────
 
 
