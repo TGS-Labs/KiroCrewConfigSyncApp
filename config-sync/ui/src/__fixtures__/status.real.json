@@ -4,7 +4,8 @@
     "applied": [
       "steering/fixture-demo-2.md"
     ],
-    "apply_id": "apply-20260927084446-cf6c4a85",
+    "apply_id": "apply-20261001165214-7d36028c",
+    "changed_commands": [],
     "changed_instance_names": [],
     "dropped_cron_names": [],
     "ignored_paths": [],
@@ -28,7 +29,7 @@
     "root": {
       "mcp.json": "A"
     },
-    "sha": "ea85a7ca01a34bf8d4f35c8e1f394f807914e46d",
+    "sha": "9e23328b4e7c1430fe8ffe03c055e92bc541887f",
     "unresolved_references": [],
     "untracked_prompt_agents": []
   },
@@ -36,14 +37,14 @@
   "last_push": {
     "branch": "",
     "pr_url": null,
-    "time": "2026-09-27T08:44:45Z",
+    "time": "2026-10-01T16:52:14Z",
     "tree_hash": "86852bf02dc14f9ddb4e043f9f9036472c93f03e10bad1fff89d6026aeb00f00"
   },
   "last_push_failure": {
     "reason": "secret scan found 1 finding; push refused",
-    "time": "2026-09-27T08:44:46Z"
+    "time": "2026-10-01T16:52:14Z"
   },
-  "last_seen_sha": "78e64e1ebb385d14d8644b4916f22aa872bed9bb",
+  "last_seen_sha": "b4b1cdefc44ee1eed8de4853fe67d60e962e4d0e",
   "pending": {
     "author": "t",
     "changed_commands": [],
@@ -55,7 +56,7 @@
     "not_applied": {
       "mcp.json": "mcp.json: refused \u2014 could not parse as JSON"
     },
-    "sha": "ea85a7ca01a34bf8d4f35c8e1f394f807914e46d",
+    "sha": "9e23328b4e7c1430fe8ffe03c055e92bc541887f",
     "subject": "add another file, break mcp.json",
     "touched_classes": [
       "live_in_new_session",

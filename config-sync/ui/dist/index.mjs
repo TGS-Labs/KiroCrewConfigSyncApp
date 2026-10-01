@@ -163,7 +163,7 @@ function I({
       e.paused_cron_names.length > 0 ? /* @__PURE__ */ r("div", { style: g("warn"), children: [
         /* @__PURE__ */ n("strong", { children: "Paused crons" }),
         /* @__PURE__ */ n("ul", { style: { margin: "0.25rem 0 0", paddingLeft: "1.25rem" }, children: e.paused_cron_names.map((o) => {
-          const a = e.changed_commands.find((c) => c.name === o);
+          const a = (e.changed_commands ?? []).find((c) => c.name === o);
           return /* @__PURE__ */ r("li", { children: [
             o,
             a ? /* @__PURE__ */ r(u, { children: [
