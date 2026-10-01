@@ -1,0 +1,9 @@
+[
+  {
+    "name": "config-sync",
+    "gitUrl": "https://github.com/TGS-Labs/KiroCrewConfigSyncApp",
+    "repo": "https://github.com/TGS-Labs/KiroCrewConfigSyncApp",
+    "branch": "main",
+    "subdirectory": "config-sync"
+  }
+]
