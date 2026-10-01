@@ -138,9 +138,9 @@ deployment has merged, per the folder-scoped PR-first workflow.
 
   - [ ] 2.4 `app.json` declares `defaultEnabled: false` and the push cron
         (`command`, `enabled: false`); the poll is the pinned SCRIPT body
-        `host-crons/config_sync_poll.py` (Deployment 5, Req 8.3); the
-        scaffold's `agents/sample-agent.json` and `skills/sample-skill/` are
-        removed and the placeholder icon replaced. The app README states that
+        `host-crons/config_sync_poll.py` (Req 8.3); the scaffold's sample
+        agent and sample skill are removed and the placeholder icon replaced.
+        The app README states that
         tracking `crons.json` and `instances.json` is a DELIBERATE, DOCUMENTED
         EXCEPTION to instance isolation and names both concrete failure modes
         (foreign `command`/`script`/paths/`env`; foreign ssh aliases, SSM
