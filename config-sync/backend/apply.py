@@ -785,6 +785,29 @@ def _new_apply_id() -> str:
     )
 
 
+def _vetted_base_crons(
+    base_crons_doc: Optional[Dict[str, Any]], cron_vet: Optional[VetCallable]
+) -> Optional[Dict[str, Any]]:
+    """The base ``crons.json`` as it was ACTUALLY written at its own apply.
+
+    ``sanitize_crons`` drops vet-failing jobs and the file still counts as
+    applied, so a raw base over-states what was live: a job dropped then was
+    never on this box, and the fleet's fixed version must be ADDED, not
+    classed "removed locally" (review round 4, N1(i)). Running the base
+    through the same vet reproduces the written document. Works on a copy;
+    the caller's document is not mutated. A base of the wrong shape is
+    returned as-is — ``merge_crons`` treats it as no base.
+    """
+    if base_crons_doc is None:
+        return None
+    jobs = base_crons_doc.get("jobs")
+    if not isinstance(jobs, list):
+        return base_crons_doc
+    copy = dict(base_crons_doc)
+    copy["jobs"] = [dict(j) for j in jobs if isinstance(j, dict)]
+    return sanitize.sanitize_crons(copy, vet=cron_vet).sanitized_store
+
+
 def _apply_one_file(
     *,
     root: str,
@@ -794,6 +817,7 @@ def _apply_one_file(
     deleted_by_root: Dict[str, set],
     apply_roots: Dict[str, Path],
     cron_vet: Optional[VetCallable],
+    base_crons_doc: Optional[Dict[str, Any]],
     applied: List[str],
     not_applied: Dict[str, str],
     needs_credential: List[str],
@@ -937,8 +961,40 @@ def _apply_one_file(
         if relpath == _CRONS_RELPATH:
             cron_result = sanitize.sanitize_crons(restored_doc, vet=cron_vet)
             dropped_cron_names.extend(cron_result.dropped_job_names)
-            paused_cron_names.extend(cron_result.paused_job_names)
-            final_doc = cron_result.sanitized_store
+            if existed_live:
+                # Requirement 6.11: MERGE into the live store, never replace
+                # it. A live job is kept verbatim (enabled state, grant,
+                # bookkeeping); only commit jobs absent live are added. A
+                # live file that cannot be merged into is refused rather
+                # than overwritten (live-install defect 8: a wholesale write
+                # deleted the poll's own operator-granted job).
+                if live_doc is None:
+                    not_applied[relpath] = (
+                        f"{relpath}: refused — the live crons.json could not be "
+                        "parsed, so the pulled jobs cannot be merged into it"
+                    )
+                    return
+                try:
+                    # N1(i): the base must be what was ACTUALLY written at the
+                    # base apply. A job the vet dropped then was never live,
+                    # so it must not count as "removed locally" when the fleet
+                    # ships a fixed version. Vet the base with the same vet.
+                    merge_result = sanitize.merge_crons(
+                        live_doc,
+                        cron_result.sanitized_store,
+                        base=_vetted_base_crons(base_crons_doc, cron_vet),
+                    )
+                except ValueError as exc:
+                    not_applied[relpath] = f"{relpath}: refused — cannot merge: {exc}"
+                    return
+                added = set(merge_result.added_job_names)
+                paused_cron_names.extend(
+                    name for name in cron_result.paused_job_names if name in added
+                )
+                final_doc = merge_result.merged_store
+            else:
+                paused_cron_names.extend(cron_result.paused_job_names)
+                final_doc = cron_result.sanitized_store
         else:
             instance_result = sanitize.sanitize_instances(restored_doc)
             changed_instance_names.extend(instance_result.changed_instance_names)
@@ -1053,6 +1109,7 @@ def apply_commit(
     store: "state_module.StateStore",
     deleted_paths: Optional[Dict[str, List[str]]] = None,
     cron_vet: Optional[VetCallable] = None,
+    base_crons_doc: Optional[Dict[str, Any]] = None,
 ) -> ApplyResult:
     """Apply an approved commit's allowlisted files to this instance.
 
@@ -1073,6 +1130,13 @@ def apply_commit(
             an empty mapping when omitted.
         cron_vet: Optional override for ``sanitize.sanitize_crons``'s
             shell-command vet; defaults to that module's own default.
+        base_crons_doc: The parsed ``crons.json`` at ``state.base_sha`` (the
+            last fully-applied commit), when the caller has one — the third
+            side of the ``crons.json`` merge (Requirement 6.11): a commit job
+            that is in the base but absent live was removed locally and is
+            not re-added. ``None`` means no base (first-ever tick, or the
+            file was not in the base commit) and every unmatched commit job
+            is added.
 
     Returns:
         An ``ApplyResult`` reflecting exactly what happened. Never reports
@@ -1207,6 +1271,7 @@ def apply_commit(
                 deleted_by_root=deleted_by_root,
                 apply_roots=apply_roots,
                 cron_vet=cron_vet,
+                base_crons_doc=base_crons_doc,
                 applied=applied,
                 not_applied=not_applied,
                 needs_credential=needs_credential,

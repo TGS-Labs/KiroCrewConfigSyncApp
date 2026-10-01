@@ -161,6 +161,7 @@ the gap where only `poll.py`'s call site held it).
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -753,6 +754,39 @@ def _restore_dir_has_backup(apply_id: str) -> bool:
     return False
 
 
+def _base_crons_doc(base_sha: str | None) -> Dict[str, Any] | None:
+    """The parsed ``crons.json`` at ``base_sha`` (the caller passes
+    ``state.last_fully_applied_sha``) from the shared clone, or ``None``
+    when there is no base, the file was not in that commit, or it is not
+    valid JSON. Local object read only (``git show``), never a
+    network call — the clone already holds the base commit because it was
+    applied from it. Used as the third side of the ``crons.json`` merge
+    (Requirement 6.11): a job in the base but absent live was removed by
+    the operator since that apply and must not be re-added. Any failure
+    degrades to ``None`` (two-way merge), never to a skipped apply."""
+    if not base_sha:
+        return None
+    clone_dir = Path(state.get_state_dir()) / _BUNDLE_CLONE_DIRNAME
+    if not (clone_dir / ".git").exists():
+        return None
+    try:
+        completed = subprocess.run(
+            git_safety.git_argv(clone_dir, "show", f"{base_sha}:crons.json"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, git_safety.GitSafetyError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        doc = json.loads(completed.stdout)
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def _apply_new_head(
     store: state.StateStore,
     head_sha: str,
@@ -858,6 +892,13 @@ def _apply_new_head(
             changed_paths=changed_paths,
             store=store,
             deleted_paths=deleted_paths,
+            # N1(ii): the third side of the crons.json merge is the last
+            # FULLY applied commit, never `base_sha` — the bootstrap-partial
+            # path advances `base_sha` to a root ancestor that was never
+            # applied, and a never-applied base would class its jobs as
+            # "removed locally". `pre_tick_base_sha` is still the RANGE
+            # boundary; `last_fully_applied_sha` is the merge's base.
+            base_crons_doc=_base_crons_doc(store.last_fully_applied_sha),
         )
     finally:
         shutil.rmtree(commit_root, ignore_errors=True)

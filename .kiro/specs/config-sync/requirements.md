@@ -496,6 +496,24 @@ for normal practice.
     unaffected by 6.8-6.10 and remain governed solely by Requirement 6.5 (no
     vet applies to a job with no `command`); this is a ratified non-change,
     not an oversight.
+11. WHEN an applied commit applies `crons.json` and a live `crons.json`
+    exists THEN the pulled jobs SHALL be MERGED into the live store, never
+    substituted for it, three ways against the `crons.json` at `base_sha`
+    (the last fully-applied commit): every live job (matched by `name` OR
+    `id`, so a rename on either side never yields two records with one id)
+    SHALL be kept exactly as it is — enabled state, vault grant, runtime
+    bookkeeping — whether or not the commit also carries it; a pulled job
+    with no live match SHALL be added (sanitized per 6.4-6.5) UNLESS it was
+    present in the base, in which case the operator removed it locally and
+    it SHALL NOT be re-added; a live job absent from the commit SHALL be
+    preserved (removal stays an operator action). Consequences, accepted and
+    documented: a fleet-wide UPDATE to an existing job does not propagate by
+    pull, and a fleet job sharing a local job's name is not added. A live
+    `crons.json` that cannot be parsed or is not a `{"jobs": [...]}` document
+    SHALL make the file not-applied rather than be overwritten; an unreadable
+    base degrades to a two-way merge, never a skipped apply. (Deployment 5,
+    live-install defect 8.) `instances.json` keeps its existing
+    replace-and-sanitize behaviour.
 
 ### Requirement 7
 

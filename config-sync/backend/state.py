@@ -92,6 +92,7 @@ _DEFAULT_FIELDS: dict[str, Any] = {
     "last_seen_sha": None,
     "last_poll_failure": None,
     "base_sha": None,
+    "last_fully_applied_sha": None,
     "pending": None,
     "pending_pr": None,
     "pending_pr_failure": None,
@@ -354,6 +355,14 @@ class StateStore:
         this count and that record always move together.
         """
         return cast("int", self._payload["poll_consecutive_failures"])
+
+    @property
+    def last_fully_applied_sha(self) -> str | None:
+        """The sha `resolve_pending` last recorded — the last FULLY applied
+        commit. Distinct from `base_sha`, which `advance_base_sha` can point
+        at a never-applied commit on the bootstrap-partial path (review
+        round 4, N1(ii)); the crons.json merge reads its third side here."""
+        return cast("str | None", self._payload.get("last_fully_applied_sha"))
 
     @property
     def base_sha(self) -> str | None:
@@ -1006,6 +1015,12 @@ class StateStore:
                 )
             fresh["base_sha"] = sha
             fresh["pending"] = None
+            # The ONLY writer of this marker (review round 4, N1(ii)):
+            # `base_sha` can also be advanced to a commit that was never
+            # applied (the bootstrap-partial root ancestor), so the crons.json
+            # merge takes its third side from THIS sha, which resolve_pending
+            # alone — i.e. a fully applied commit — records.
+            fresh["last_fully_applied_sha"] = sha
 
         self._locked_rmw(_mutate)
 

@@ -1268,22 +1268,19 @@ def test_apply_restores_crons_json_env_value_from_live_vet_sees_committed_comman
     command unchanged, proving restore ran before sanitize's vet call
     without restoration reaching into a field it has no business
     touching.
+
+    Under merge semantics (Requirement 6.11) a job that is live is kept
+    verbatim, so the committed job here is a NEW one (``j2``); the live
+    ``j1`` must come through untouched alongside it.
     """
     root_a = Path(os.environ["KIROCREW_HOME"])
+    live_j1 = {
+        "name": "j1",
+        "command": "echo old-live-command",
+        "env": {"TOKEN": "live-cron-secret"},
+    }
     root_a.joinpath("crons.json").write_text(
-        json.dumps(
-            {
-                "jobs": [
-                    {
-                        "name": "j1",
-                        "command": "echo old-live-command",
-                        "env": {"TOKEN": "live-cron-secret"},
-                    }
-                ]
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps({"jobs": [live_j1]}, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -1294,7 +1291,7 @@ def test_apply_restores_crons_json_env_value_from_live_vet_sees_committed_comman
             {
                 "jobs": [
                     {
-                        "name": "j1",
+                        "name": "j2",
                         "command": "echo new-committed-command",
                         "env": {"TOKEN": "<redacted>"},
                     }
@@ -1325,9 +1322,13 @@ def test_apply_restores_crons_json_env_value_from_live_vet_sees_committed_comman
 
     assert seen_commands == ["echo new-committed-command"]
     written = json.loads(root_a.joinpath("crons.json").read_text(encoding="utf-8"))
-    assert written["jobs"][0]["command"] == "echo new-committed-command"
-    assert written["jobs"][0]["env"]["TOKEN"] == "live-cron-secret"
-    assert result.needs_credential == []
+    by_name = {job["name"]: job for job in written["jobs"]}
+    assert by_name["j1"] == live_j1
+    assert by_name["j2"]["command"] == "echo new-committed-command"
+    # No live job named j2 holds a value to restore: the placeholder stays
+    # and is reported, never filled from a different job's secret.
+    assert by_name["j2"]["env"]["TOKEN"] == "<redacted>"
+    assert "crons.json:j2.env.TOKEN" in result.needs_credential
 
 
 def test_apply_never_restores_a_command_field_even_when_it_is_the_placeholder(
@@ -1357,7 +1358,7 @@ def test_apply_never_restores_a_command_field_even_when_it_is_the_placeholder(
     commit_root = tmp_path / "commit-root"
     commit_root.mkdir()
     (commit_root / "crons.json").write_text(
-        json.dumps({"jobs": [{"name": "j1", "command": "<redacted>"}]}, indent=2)
+        json.dumps({"jobs": [{"name": "j2", "command": "<redacted>"}]}, indent=2)
         + "\n",
         encoding="utf-8",
     )
@@ -1381,11 +1382,15 @@ def test_apply_never_restores_a_command_field_even_when_it_is_the_placeholder(
 
     assert seen_commands == ["<redacted>"]
     written = json.loads(root_a.joinpath("crons.json").read_text(encoding="utf-8"))
-    written_job = written["jobs"][0]
+    by_name = {job["name"]: job for job in written["jobs"]}
+    # Merge semantics (Requirement 6.11): the live j1 is kept verbatim and
+    # the committed j2 is the one added, paused like any command job.
+    assert by_name["j1"] == {"name": "j1", "command": "echo the-real-live-command"}
+    written_job = by_name["j2"]
     assert written_job["command"] == "<redacted>"
     assert written_job["user_paused"] is True
     assert written_job["enabled"] is False
-    assert not any("j1" in entry for entry in result.needs_credential)
+    assert not any("j2" in entry for entry in result.needs_credential)
 
 
 # ---------------------------------------------------------------------------
