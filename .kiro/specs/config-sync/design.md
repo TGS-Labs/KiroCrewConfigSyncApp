@@ -390,7 +390,11 @@ no longer a decision to pend), `history` (bounded), and `restore_dirs`.
 
 ### `backend/routes.py` and the UI
 
-Routes on the scaffolded backend (`backend/server.py`, `port: "auto"`,
+Routes on the scaffolded backend (`backend/server.py`, launched by the gateway
+through the app-root file `run_backend.py` named as `backend.entryPoint` —
+the host runs a file entry point as `python <file>` from the app root with no
+PYTHONPATH, so the launcher must sit at the root for `from backend import …`
+to resolve; `port: "auto"`,
 `healthCheck: "/health"`), every one wrapped in an enabled check so the app is
 inert while disabled. Request guard (Requirement 7.7), checked before any
 route runs:

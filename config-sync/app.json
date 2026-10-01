@@ -13,7 +13,7 @@
     "api": ["/apps/config-sync/api"]
   },
   "backend": {
-    "entryPoint": "backend/server.py",
+    "entryPoint": "run_backend.py",
     "port": "auto",
     "healthCheck": "/health"
   },
