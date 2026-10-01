@@ -276,22 +276,37 @@ def _branch_name(current_hash: str) -> str:
 def _scan_tree_for_secrets(redacted: Mapping[str, bytes]) -> tuple[bool, str]:
     """Run the content secret scan over every file in the redacted tree.
 
-    Concatenates each file's decoded text (best-effort; undecodable content
-    is skipped — `push_policy.scan_content_for_secrets` scans text, and a
+    Scans each file's decoded text (best-effort; undecodable content is
+    skipped — `push_policy.scan_content_for_secrets` scans text, and a
     binary blob that cannot decode carries no scannable credential text
-    either way) and scans it as one call, per push_policy's "one gate for
-    every exit" design. Returns the first non-clean verdict found, short
-    circuiting the moment one file scans dirty.
+    either way), per push_policy's "one gate for every exit" design. Every
+    file is scanned, not just up to the first dirty one, so a single
+    refusal names ALL the offending files: ``hit: N finding(s) in <path>,
+    <path>``. The paths are the tree's own keys — never scanned content — so
+    push_policy's "the note is independent of the text" contract holds; the
+    first non-OK note's code is kept as the reason's prefix.
     """
-    for _relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
+    total = 0
+    dirty: list[str] = []
+    first_code = ""
+    for relpath, content in sorted(redacted.items(), key=lambda item: item[0]):
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError:
             continue
         clean, note = push_policy.scan_content_for_secrets(text)
-        if not clean:
-            return clean, note
-    return True, push_policy.SCAN_OK
+        if clean:
+            continue
+        dirty.append(relpath)
+        code, _sep, rest = note.partition(":")
+        first_code = first_code or code
+        count = rest.strip().split(" ", 1)[0]
+        total += int(count) if count.isdigit() else 1
+    if not dirty:
+        return True, push_policy.SCAN_OK
+    if first_code == push_policy.SCAN_HIT:
+        return False, f"{first_code}: {total} finding(s) in {', '.join(dirty)}"
+    return False, f"{first_code} in {', '.join(dirty)}"
 
 
 def _write_working_copy(clone_dir: Path, redacted: Mapping[str, bytes]) -> None:

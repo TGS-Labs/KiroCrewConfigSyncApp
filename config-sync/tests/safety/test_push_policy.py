@@ -287,6 +287,85 @@ class TestScanContentForSecretsRefusesRatherThanRewrites:
         assert note != original
 
 
+class TestTokenParameterPlaceholders:
+    """The host's ``?token=`` URL-parameter pass (``redaction.py`` pass 4) is
+    documented as *output redaction only* -- "the blocking surface is
+    unchanged" -- and it fires on the ``?token=…`` placeholders in KiroCrew's
+    own shipped skill docs (``skills/web-verify/SKILL.md``), which this app
+    tracks and can never rewrite. Counting those as findings made every push
+    from a stock box refuse (KiroCrewConfigSyncApp issue: first live push
+    after the 2026-10-01 gateway restart). A pass-4 hit therefore blocks
+    only when the parameter VALUE is long enough to be a real bearer (>= 16
+    chars, the host's own ``_PREFILTER_MIN_LEN``); the classification reads
+    the scanner's warning literal, never the scanned text, so the refusal
+    note stays independent of the content.
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'playwright-cli open "http://127.0.0.1:PORT/?token=…"',
+            "curl http://127.0.0.1:8000/?token=$TOKEN",
+            "GET /?token=%s",
+        ],
+    )
+    def test_documentation_token_placeholder_is_not_refused(self, line: str) -> None:
+        from backend.safety.push_policy import SCAN_OK, scan_content_for_secrets
+
+        assert scan_content_for_secrets(line) == (True, SCAN_OK)
+
+    def test_long_token_parameter_value_is_refused(self) -> None:
+        """A plausibly real bearer value in a ``?token=`` URL still refuses
+        the push -- the placeholder carve-out must not open a leak."""
+        from backend.safety.push_policy import scan_content_for_secrets
+
+        bearer = "q7Zp2mXv9Lk4Rt8Yw3Nb6Hs1Dg5Fj0Ca"  # 32 chars, no provider shape
+        clean, note = scan_content_for_secrets(f"open http://127.0.0.1/?token={bearer}")
+
+        assert clean is False
+        assert note.startswith("hit:")
+        assert bearer not in note
+
+    def test_sixteen_char_value_is_the_floor(self) -> None:
+        from backend.safety.push_policy import scan_content_for_secrets
+
+        fifteen = "a1b2c3d4e5f6g7h"
+        sixteen = fifteen + "8"
+        assert scan_content_for_secrets(f"u=http://h/?token={fifteen}")[0] is True
+        assert scan_content_for_secrets(f"u=http://h/?token={sixteen}")[0] is False
+
+    def test_unrecognised_scanner_warning_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Classification is by the host's warning literal. A warning the
+        classifier does not recognise (a renamed or new pass) must count as
+        a finding -- the carve-out can only ever narrow in the safe
+        direction."""
+        import kiro_crew.security as sec
+
+        monkeypatch.setattr(
+            sec,
+            "redact_credentials",
+            lambda text: (text, ["Redacted something new (3 chars)"]),
+        )
+        from backend.safety.push_policy import scan_content_for_secrets
+
+        clean, note = scan_content_for_secrets("harmless prose")
+        assert clean is False
+        assert note == "hit: 1 finding(s)"
+
+    def test_real_credentials_beside_a_placeholder_still_refuse(self) -> None:
+        from backend.safety.push_policy import scan_content_for_secrets
+
+        text = (
+            'open "http://127.0.0.1:PORT/?token=…"\n'
+            "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n"
+        )
+        clean, note = scan_content_for_secrets(text)
+        assert clean is False
+        assert note == "hit: 1 finding(s)", "the placeholder must not inflate the count"
+
+
 class TestScanContentForSecretsFailsClosed:
     """Requirement 3.7 / 8.5: an unimportable or unrunnable scanner fails
     CLOSED (refuses), because an unscannable push is indistinguishable from

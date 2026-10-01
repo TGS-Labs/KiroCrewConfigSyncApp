@@ -18,6 +18,7 @@ config that names ``branch: "origin/main"`` is refused here.
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +212,10 @@ def scan_content_for_secrets(text: str) -> tuple[bool, str]:
     # Only the COUNT crosses out of this function. The findings themselves
     # are discarded here, in the one place that has them, so no caller can
     # log them by accident.
-    total = int(len(list(cred_hits)) + len(list(exfil_hits)))
+    total = int(
+        sum(1 for warning in cred_hits if _is_blocking_credential_warning(warning))
+        + len(list(exfil_hits))
+    )
     del cred_hits, exfil_hits
     if total:
         # Only a CODE and a COUNT leave this function — never a message and
@@ -221,3 +225,33 @@ def scan_content_for_secrets(text: str) -> tuple[bool, str]:
         )
         return False, f"{SCAN_HIT}: {total} finding(s)"
     return True, SCAN_OK
+
+
+#: The host's ``?token=``/``&token=`` URL-parameter pass (``redaction.py``
+#: pass 4) reports this warning literal with the VALUE's length. The host
+#: documents that pass as output redaction only — "the blocking surface is
+#: unchanged" — and accepts that it matches documentation placeholders
+#: (``?token=…``, ``?token=$TOKEN``), which KiroCrew's own shipped skill
+#: docs contain and this app tracks but can never rewrite.
+_TOKEN_PARAM_WARNING_RE = re.compile(r"Redacted token parameter value \((\d+) chars\)")
+
+#: A ``?token=`` VALUE shorter than this is treated as a placeholder, not a
+#: bearer. Same floor as the host's own credential pre-filter
+#: (``_PREFILTER_MIN_LEN``): no real token the host issues is this short.
+_TOKEN_PARAM_MIN_BEARER_LEN = 16
+
+
+def _is_blocking_credential_warning(warning: str) -> bool:
+    """Whether one ``redact_credentials`` warning counts as a push finding.
+
+    Every warning blocks EXCEPT a pass-4 token-parameter hit whose value is
+    too short to be a real bearer. The decision reads only the warning
+    literal (a fixed template plus an integer), never the scanned text, so
+    the note this module returns stays independent of the content. An
+    unrecognised warning — a renamed or newly added host pass — blocks, so
+    this carve-out can only ever narrow in the fail-closed direction.
+    """
+    match = _TOKEN_PARAM_WARNING_RE.fullmatch(str(warning))
+    if match is None:
+        return True
+    return int(match.group(1)) >= _TOKEN_PARAM_MIN_BEARER_LEN

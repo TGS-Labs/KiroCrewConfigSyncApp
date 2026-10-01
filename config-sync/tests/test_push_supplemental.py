@@ -153,6 +153,43 @@ def test_scan_skips_a_file_whose_content_is_not_valid_utf8(
     change_path_collaborators["scan"].assert_not_called()
 
 
+def test_scan_refusal_names_every_dirty_file_by_path(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hit: 2 finding(s)`` on its own left the operator with no way to find
+    the offending file among hundreds (first live push, 2026-10-01). The
+    tree-level refusal must name each dirty file's relpath -- a path is not
+    scanned content, so this does not weaken push_policy's no-echo contract
+    -- and must not stop at the first dirty file, so one failure lists all
+    of them.
+    """
+    root_a = isolated_roots["root_a"]
+    _write(root_a, "config.json", b'{"a": 1}')
+    _write(root_a, "crons.json", b'{"jobs": []}')
+    _write(root_a, "mcp.json", b"{}")
+
+    _seed_changed_hash(monkeypatch)
+
+    def _scan(text: str) -> tuple[bool, str]:
+        # mcp.json is the clean one; redaction may re-serialise its JSON, so
+        # key on the other two files' distinctive content instead of "{}".
+        dirty = '"a"' in text or "jobs" in text
+        return (False, "hit: 1 finding(s)") if dirty else (True, "ok")
+
+    change_path_collaborators["scan"].side_effect = _scan
+
+    result = push.run()
+
+    assert result.outcome == "refused-secret-scan"
+    assert result.reason.startswith("hit: 2 finding(s)")
+    assert "config.json" in result.reason
+    assert "crons.json" in result.reason
+    assert "mcp.json" not in result.reason
+    assert change_path_collaborators["scan"].call_count == 3
+
+
 def test_run_fetches_rather_than_clones_when_bundle_repo_already_exists(
     isolated_roots: dict,
     change_path_collaborators: dict,
