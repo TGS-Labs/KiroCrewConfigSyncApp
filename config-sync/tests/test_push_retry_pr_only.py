@@ -337,7 +337,7 @@ class TestRetryPrOnlyAfterReportedPrFailure:
             "last_pushed_hash"
         )
 
-    def test_reverting_the_fix_reproduces_the_fabricated_git_commit_failure(
+    def test_bypassed_gate_repushes_the_identical_tree_idempotently(
         self,
         isolated_roots: dict,
         bare_remote: Path,
@@ -345,14 +345,12 @@ class TestRetryPrOnlyAfterReportedPrFailure:
         stub_pr_handoff_external_calls: dict,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Demonstrates what the ORIGINAL bug looked like: with the new
+        """With the retry-pr-only gate bypassed (simulating pre-fix behaviour
 
-        retry-pr-only gate bypassed (simulating pre-fix behaviour by
-        clearing `last_push` the same way `pending_pr` was cleared), tick 2
-        falls through to the real change path, `git commit` finds nothing
-        to commit against the identical already-pushed tree, and real git
-        raises `CalledProcessError` — proving this test would have caught
-        the original regression had it existed at round 3.
+        by clearing `last_push` the same way `pending_pr` was cleared), tick 2
+        falls through to the real change path against the identical
+        already-pushed tree. Real git must cope: the branch is cut from
+        `origin/main`, so the result is an idempotent re-push, not a crash.
         """
         monkeypatch.setattr(push, "BUNDLE_REPO_URL", str(bare_remote))
 
@@ -384,19 +382,19 @@ class TestRetryPrOnlyAfterReportedPrFailure:
         # must fall through past both the no-op and 3a/3b gates.
         monkeypatch.setattr(store.__class__, "last_push", property(lambda self: None))
 
-        with pytest.raises(subprocess.CalledProcessError) as exc_info:
-            push.run()
+        tick2_result = push.run()
 
-        # push.py's own `subprocess.run` calls never pass `capture_output`
-        # (nor `stderr=subprocess.PIPE`), so on a real `CalledProcessError`
-        # `exc.stderr` and `exc.output` are always `None` here — asserting
-        # against them would be dead code that can never actually run.
-        # `returncode` is the only signal push.py's own call shape actually
-        # populates; real `git commit` on a clean/unchanged tree exits 1.
-        assert exc_info.value.returncode == 1, (
-            "reverting the fix must reproduce git's real 'nothing to "
-            f"commit' failure (exit 1), got: {exc_info.value!r}"
-        )
+        # Before 2026-10-01 this re-run crashed: `checkout -B <branch>` stacked
+        # tick 2's branch on tick 1's commit, so writing the identical tree
+        # left nothing to commit and real git exited 1. The branch is now cut
+        # from `origin/main`, so an identical tree yields an identical commit
+        # (git_safety pins author/committer identity and the message is the
+        # tree hash) and the push is an idempotent no-op on the remote. The
+        # gate above is still what SHOULD short-circuit this; the other tests
+        # in this class prove it does when `last_push` is intact.
+        assert tick2_result.outcome == "pushed"
+        assert tick2_result.tree_hash == tick1_result.tree_hash
+        assert tick2_result.reason == tick1_result.reason, "same branch name"
 
 
 class TestRetryPrOnlyWithStalePendingPrForOlderHash:

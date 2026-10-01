@@ -530,3 +530,36 @@ def test_no_entry_pattern_is_a_bare_wildcard() -> None:
         assert any(ch in literal_chars for ch in stripped), (
             f"entry {entry!r} pattern has no literal component: " f"{entry.pattern!r}"
         )
+
+
+class TestHostGeneratedAgentAliasesAreNeverTracked:
+    """``~/.kiro/agents/kirocrew-skill-view-<hash>.json`` files are NOT operator
+    configuration: the gateway derives them per launch from the skills
+    directory (``kiro_crew.acp.skill_projection``,
+    ``NATIVE_SKILL_ALIAS_PREFIX``) and rewrites them on every session. The
+    first store-installed push (2026-10-01) swept 145 of them into the
+    bundle PR, a different set on every box and every day. They are excluded
+    structurally, like ``.env``: an excluded path was never an allowlist hit.
+    """
+
+    @pytest.mark.parametrize(
+        "relpath",
+        [
+            "agents/kirocrew-skill-view-0079e507ed2296900727ad77.json",
+            "agents/kirocrew-skill-view-ffffffffffffffffffffffff.json",
+        ],
+    )
+    def test_skill_view_alias_is_not_tracked_under_root_b(self, relpath: str) -> None:
+        assert allowlist.is_tracked("B", relpath) is False
+
+    @pytest.mark.parametrize(
+        "relpath",
+        [
+            "agents/senior-reviewer.json",
+            "agents/kirocrew.json",
+            "agents/kirocrew-worker.json",
+            "agents/kirocrew-skill-viewer.json",
+        ],
+    )
+    def test_real_agent_definitions_stay_tracked(self, relpath: str) -> None:
+        assert allowlist.is_tracked("B", relpath) is True
