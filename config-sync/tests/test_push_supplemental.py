@@ -307,6 +307,43 @@ def test_scan_refusal_caps_the_named_paths(
     assert result.reason.endswith(" and 3 more")
 
 
+def test_push_branch_is_cut_from_fetched_origin_main(
+    isolated_roots: dict,
+    change_path_collaborators: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`git checkout -B <branch>` with no start point bases the new branch on
+    whatever the clone's HEAD happens to be -- after the first push, that is
+    the PREVIOUS push branch, so every later branch stacks on the last one
+    instead of on `main` (observed 2026-10-01: branch 4a085faf's parent was
+    the 04:14 push commit, and the clone's local `main` was still at PR #63).
+    Such a branch merges only while nothing on `main` touched a tracked file
+    and silently re-pushes stale copies of files other boxes updated. The
+    start point must be the just-fetched `origin/main`."""
+    from backend import state
+
+    root_a = isolated_roots["root_a"]
+    _write(root_a, "config.json", b'{"key": "value"}')
+    _seed_changed_hash(monkeypatch)
+    clone_dir = state.get_state_dir() / "bundle-repo"
+    (clone_dir / ".git").mkdir(parents=True, exist_ok=True)
+
+    push.run()
+
+    git_argv_calls = [
+        call.args for call in change_path_collaborators["git_argv"].call_args_list
+    ]
+    checkouts = [args for args in git_argv_calls if "checkout" in args]
+    assert len(checkouts) == 1, checkouts
+    checkout = checkouts[0]
+    assert checkout[-1] == "origin/main", (
+        "checkout -B must name origin/main as the start point; got " f"{checkout!r}"
+    )
+    fetch_index = next(i for i, a in enumerate(git_argv_calls) if "fetch" in a)
+    checkout_index = git_argv_calls.index(checkout)
+    assert fetch_index < checkout_index, "fetch must precede the checkout"
+
+
 def test_run_fetches_rather_than_clones_when_bundle_repo_already_exists(
     isolated_roots: dict,
     change_path_collaborators: dict,

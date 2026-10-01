@@ -172,6 +172,11 @@ _NEVER_TRACKED_BASENAME_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"(?:^|/)[^/]+\.pid$",
         r"(?:^|/)id_rsa(?:\.[^/]+)?$",
         r"(?:^|/)id_ed25519(?:\.[^/]+)?$",
+        # Host-DERIVED agent aliases, not operator config: the gateway projects
+        # one `kirocrew-skill-view-<hash>.json` per skill view into ~/.kiro/agents
+        # at launch (kiro_crew.acp.skill_projection, NATIVE_SKILL_ALIAS_PREFIX)
+        # and rewrites them every session — a different set on every box.
+        r"(?:^|/)kirocrew-skill-view-[0-9a-f]+\.json$",
     )
 )
 

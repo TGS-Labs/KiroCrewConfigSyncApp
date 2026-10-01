@@ -504,8 +504,13 @@ def run() -> PushResult:
                     git_safety.git_argv(clone_dir, "fetch", "origin"), check=True
                 )
 
+        # Start point is the JUST-FETCHED `origin/main`, never the clone's
+        # current HEAD: after the first push HEAD is the previous push branch,
+        # so an unqualified `checkout -B` would stack every branch on the last
+        # one and re-push stale copies of files other boxes changed on main.
         subprocess.run(
-            git_safety.git_argv(clone_dir, "checkout", "-B", branch), check=True
+            git_safety.git_argv(clone_dir, "checkout", "-B", branch, "origin/main"),
+            check=True,
         )
 
         _write_working_copy(clone_dir, tokenized)
