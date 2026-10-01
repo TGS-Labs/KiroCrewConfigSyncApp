@@ -44,11 +44,11 @@ deployment has merged, per the folder-scoped PR-first workflow.
    call.
 3. **Deployment 3 — Pull detection.** Branch `feature/config-sync-poll` (from
    `main` after Deployment 2 merges). Ships `poll.py`, `classify.py`, the
-   `last_seen_sha`/`base_sha` state fields, the notification, poll cron
-   wiring. Depends on: Deployment 2 (the bundle repo needs a config-sync
-   commit to detect). Verified by: the poll detects Deployment 2's merged
-   commit and notifies once, does not re-notify next tick; nothing is
-   applied yet (the apply path is not built until Deployment 4).
+   `last_seen_sha`/`base_sha` state fields, the notification, poll wiring.
+   Depends on: Deployment 2 (the bundle repo needs a config-sync commit to
+   detect). Verified by: the poll detects Deployment 2's merged commit and
+   notifies once, does not re-notify next tick; nothing is applied yet (the
+   apply path is not built until Deployment 4).
 4. **Deployment 4 — Apply, propagation, and UI.** Branch
    `feature/config-sync-apply` (from `main` after Deployment 3 merges). Ships
    `apply.py`, `sanitize.py`, `propagate.py`, `registration.py`, `routes.py`,
