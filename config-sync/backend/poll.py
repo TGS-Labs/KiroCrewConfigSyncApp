@@ -134,12 +134,13 @@ exited 0 as "paused" and did nothing).
 
 ## Concurrent-clone lock (senior review round-2 M-new-2)
 
-``config-sync-push`` and ``config-sync-poll`` are both declared in
-``app.json`` on the same ``every: 900`` cadence and both read/write the
-SAME ``_BUNDLE_CLONE_DIRNAME`` directory (poll fetches/reads it; push
-clones/fetches/commits/pushes it). Two ticks landing at the same wall-clock
-moment could both see no ``.git`` directory yet and both start a `clone`
-into the identical path concurrently — one of git's own clone attempts can
+The poll (now the pinned script cron in ``host-crons/``, every 900s) and the
+push (the backend process, on the dashboard's "Push changes") both read/write
+the SAME ``_BUNDLE_CLONE_DIRNAME`` directory (the script fetches it and the
+poll reads it; push fetches/commits/pushes it). A tick and a push landing at
+the same wall-clock moment could both see no ``.git`` directory yet and both
+start a `clone` into the identical path concurrently — one of git's own clone
+attempts can
 then fail (target directory not empty / lock contention on
 ``.git/index.lock`` or the object store), leaving a directory that exists,
 is non-empty, but has no working ``.git`` — a state

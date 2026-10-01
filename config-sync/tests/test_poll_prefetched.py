@@ -214,9 +214,11 @@ def test_prefetched_tick_applies_a_changed_head_with_every_remote_unroutable(
     result = poll.run()
 
     assert result.outcome == "changed", (result.outcome, result.reason)
+    assert result.head_sha == shas["merge"]
     assert result.head_sha == _git("rev-parse", "main", cwd=origin)
     assert (root_a / "steering" / "x.md").read_text(encoding="utf-8") == "# x v1\n"
-    assert (root_a / "config-bundles" / "agent-prompts" / "marker.md").is_file()
+    marker = root_a / "config-bundles" / "agent-prompts" / "marker.md"
+    assert marker.read_text(encoding="utf-8") == "# marker v1\n"
     assert not (root_a / "steering" / "old.md").exists()
     store = state.load_state()
     assert store.last_seen_sha == result.head_sha
@@ -224,4 +226,3 @@ def test_prefetched_tick_applies_a_changed_head_with_every_remote_unroutable(
     last_apply = store.last_apply or {}
     assert last_apply.get("outcome") == "applied", last_apply
     assert last_apply.get("sha") == result.head_sha
-    assert shas  # the seeded history is what was applied
