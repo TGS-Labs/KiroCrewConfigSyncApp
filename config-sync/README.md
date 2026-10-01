@@ -111,7 +111,13 @@ To bound that risk, the applier:
   deleted it here since, in which case it stays deleted; a live job the
   commit no longer carries is never removed. Two accepted consequences: a
   fleet-wide **update** to an existing job does not propagate by pull, and a
-  fleet job sharing a local job's name is not added. A live `crons.json`
+  fleet job sharing a local job's name is not added. The third side is the
+  last *fully* applied commit (vetted the same way it was when applied), so a
+  job dropped by the vet back then, or a commit that was never applied, is
+  never mistaken for a local deletion. One known edge: a job added by a
+  *partial* apply and then deleted locally before the retry tick is re-added
+  by that retry (the base does not yet include it); delete it again after
+  the range fully applies. A live `crons.json`
   that cannot be parsed is left alone and the file is reported not-applied.
   (The first live tick after this box's own push used to write the committed
   snapshot over the live file and delete the poll's own job.)
