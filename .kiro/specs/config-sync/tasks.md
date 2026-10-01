@@ -136,8 +136,9 @@ deployment has merged, per the folder-scoped PR-first workflow.
     → Agent: test-engineer (tests first), then software-engineer
     _Requirements: 3.8, 7.5, 8.4_
 
-  - [ ] 2.4 `app.json` declares `defaultEnabled: false` and exactly two crons —
-        one push, one poll — each using `command` with `enabled: false`; the
+  - [ ] 2.4 `app.json` declares `defaultEnabled: false` and the push cron
+        (`command`, `enabled: false`); the poll is the pinned SCRIPT body
+        `host-crons/config_sync_poll.py` (Deployment 5, Req 8.3); the
         scaffold's `agents/sample-agent.json` and `skills/sample-skill/` are
         removed and the placeholder icon replaced. The app README states that
         tracking `crons.json` and `instances.json` is a DELIBERATE, DOCUMENTED

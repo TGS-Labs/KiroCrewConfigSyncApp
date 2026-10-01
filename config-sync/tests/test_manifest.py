@@ -85,9 +85,14 @@ class TestCrons:
         """Testing-standards anti-pattern guard: an exact `len(crons) == 2`
 
         assertion breaks on any legitimate addition of a third cron. Assert
-        the two REQUIRED crons — push and poll — exist by name instead of
-        pinning the total count (requirements.md 8.3 only requires these
-        two exist, not that nothing else ever can)."""
+        the REQUIRED push cron exists by name instead of pinning the total
+        count. The poll is deliberately NOT a manifest cron any more
+        (Deployment 5, live-install defect 7): a command cron runs in the
+        host's sandbox with no git credential and can never reach the
+        private bundle repo, so the poll ships as a pinned SCRIPT cron body
+        (`host-crons/config_sync_poll.py`) installed per
+        `skills/install-poll-cron/SKILL.md` — see
+        `test_host_cron_poll_script.py`."""
         manifest = _load_app_json()
         crons = manifest.get("crons", [])
         names = {cron.get("name") for cron in crons}
@@ -95,9 +100,9 @@ class TestCrons:
             "app.json must declare the 'config-sync-push' cron "
             f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
         )
-        assert "config-sync-poll" in names, (
-            "app.json must declare the 'config-sync-poll' cron "
-            f"(requirements.md 8.3); found cron names: {sorted(n for n in names if n)}"
+        assert "config-sync-poll" not in names, (
+            "the poll must not be a manifest command cron: it cannot hold a "
+            "credential in the host's cron sandbox (install-poll-cron skill)"
         )
 
     def test_every_cron_is_command_or_script_based(self) -> None:
@@ -146,14 +151,15 @@ class TestCrons:
             "exactly one cron must identify itself as the push job "
             f"(requirements.md 8.3); matched {len(push_matches)}"
         )
-        assert len(poll_matches) == 1, (
-            "exactly one cron must identify itself as the poll job "
-            f"(requirements.md 8.3); matched {len(poll_matches)}"
+        assert poll_matches == [], (
+            "the poll job is the pinned script cron in host-crons/, never a "
+            f"manifest cron; matched {len(poll_matches)}"
         )
-        assert push_matches[0] is not poll_matches[0], (
-            "the push cron and the poll cron must be two distinct entries, "
-            "not the same cron matching both labels"
-        )
+        # The poll concept is still represented exactly once: by the pinned
+        # SCRIPT body the install-poll-cron skill registers.
+        script = APP_ROOT / "host-crons" / "config_sync_poll.py"
+        assert script.is_file(), script
+        assert "backend.poll" in script.read_text()
 
     def test_push_cron_command_resolves_the_backend_package_import(self) -> None:
         """Senior-review P1: `python3 backend/push.py` launches push.py as a
@@ -238,99 +244,47 @@ class TestCrons:
             f"{result.stderr}"
         )
 
-    def test_poll_cron_command_resolves_the_backend_package_import(self) -> None:
-        """Senior-review H1: `python3 backend/poll.py` has the identical
-
-        ModuleNotFoundError defect the push cron's P1 fix (commit 5ad2bba)
-        already closed — launching poll.py as a plain script puts
-        `.../backend` on `sys.path[0]` rather than the app root, so
-        `from backend import classify, state` inside poll.py raises. The
-        fix is identical in shape: `cd` into the app's installed directory
-        (there is no cwd field in the app-manifest cron schema — verified
-        against `kiro_crew.apps.manifest.CronEntry`) before invoking
-        `python3 -m backend.poll`.
-
-        Mirrors `test_push_cron_command_resolves_the_backend_package_import`
-        exactly, including the import-only probe substitution so `poll.run()`'s
-        real git/network side effects are never triggered from a test.
-        """
-        import shutil
-        import subprocess
-        import sys
-        import tempfile
-
-        manifest = _load_app_json()
-        crons = manifest.get("crons", [])
-        poll_cron = next(c for c in crons if "poll" in c.get("name", "").lower())
-        command = poll_cron.get("command", "")
-        assert command, "the poll cron must declare a 'command'"
-        assert "python3 -m backend.poll" in command, (
-            "the poll cron's command must invoke the module by dotted path "
-            f"(`python3 -m backend.poll`), not a script path; got: {command!r}"
-        )
-        import_probe_command = command.replace(
-            "python3 -m backend.poll", 'python3 -c "import backend.poll"'
-        )
-
-        with tempfile.TemporaryDirectory() as fake_home_str:
-            fake_home = Path(fake_home_str)
-            installed_app_dir = fake_home / ".kiro" / "crew" / "apps" / "config-sync"
-            installed_app_dir.mkdir(parents=True)
-            shutil.copytree(APP_ROOT / "backend", installed_app_dir / "backend")
-
-            env = {
-                "HOME": str(fake_home),
-                "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
-            }
-            result = subprocess.run(
-                ["sh", "-c", import_probe_command],
-                cwd=str(fake_home),
-                env=env,
-                executable=shutil.which("sh") or "/bin/sh",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
-            )
-
-        assert result.returncode == 0 and "ModuleNotFoundError" not in result.stderr, (
-            "the poll cron command must resolve `backend`'s package "
-            f"imports regardless of the launching shell's own cwd; stderr:\n"
-            f"{result.stderr}"
-        )
-
-    def test_poll_cron_is_not_silent_so_a_changed_head_notification_is_delivered(
+    def test_poll_runs_as_a_module_from_the_app_root_via_the_pinned_script(
         self,
     ) -> None:
-        """The push and poll crons are NOT required to be silent-parity —
+        """Senior-review H1 (round 1) found `python3 backend/poll.py` had the
 
-        senior-review round-4 H-A corrected the round-1 H1 "parity" premise
-        this test previously encoded. Push's common no-op tick genuinely
-        has nothing to report, so `"silent": true` is right for it. Poll's
-        `"changed"` outcome (requirements.md 4.3) DOES have something to
-        report — `notify_operator` now prints a non-empty stdout summary
-        on that outcome — and `kiro_crew/slack/gateway.py`'s command-cron
-        result handling only surfaces a non-empty result as a notification
-        when the job is NOT silent (its own empty-output branch is
-        commented "no output = no delivery", the exact contrapositive).
-        A `"silent": true` poll cron would capture that summary into
-        `last_result` for the dashboard's cron-history view but never
-        deliver it as a notification, leaving Requirement 4.3's "notifies
-        once" guarantee just as unmet as the empty no-op stub it replaces.
+        same ModuleNotFoundError defect as the push cron: launched as a plain
+        script, `sys.path[0]` is `.../backend`, not the app root. The poll
+        is no longer a manifest command cron (Deployment 5), but the SAME
+        invariant must hold for the pinned script that now launches it: it
+        must run `python -m backend.poll` with the installed app root as
+        cwd. `test_host_cron_poll_script.py` proves the argv and cwd at run
+        time; this is the static mirror so a future edit to the body that
+        switches to a file path fails here too.
+        """
+        script = (APP_ROOT / "host-crons" / "config_sync_poll.py").read_text()
+        assert '"-m", "backend.poll"' in script, (
+            "the pinned script must invoke the poll by dotted module path "
+            "(`-m backend.poll`), never as a file path"
+        )
+        assert "backend/poll.py" not in script
+
+    def test_push_cron_is_silent_and_the_poll_notifies_through_the_script(
+        self,
+    ) -> None:
+        """Push's common no-op tick has nothing to report, so the manifest's
+
+        push cron stays `"silent": true`. The poll's changed-head summary
+        (requirements.md 4.3) used to rely on a NON-silent command cron's
+        stdout being delivered; the poll now runs inside the pinned script
+        cron, which forwards a non-empty summary through `ctx.notify()`
+        (proved in `test_host_cron_poll_script.py`). This test pins the push
+        half and the absence of a manifest poll cron that could silently
+        swallow the summary.
         """
         manifest = _load_app_json()
         crons = manifest.get("crons", [])
-        poll_cron = next(c for c in crons if "poll" in c.get("name", "").lower())
         push_cron = next(c for c in crons if "push" in c.get("name", "").lower())
-
-        assert push_cron.get("silent") is True, (
-            "push's common no-op tick has nothing to report and should " "stay silent"
-        )
-        assert poll_cron.get("silent") is False, (
-            'the poll cron must declare "silent": false so its '
-            '"changed"-outcome stdout summary is actually delivered as a '
-            "notification (senior-review round-4 H-A)"
-        )
+        assert (
+            push_cron.get("silent") is True
+        ), "push's common no-op tick has nothing to report and should stay silent"
+        assert not [c for c in crons if "poll" in c.get("name", "").lower()]
 
 
 # ---------------------------------------------------------------------------

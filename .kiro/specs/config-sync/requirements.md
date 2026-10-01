@@ -560,10 +560,18 @@ overwrites it and enabling it is my decision.
    SHALL NOT be added to, or edited inside, the installed `kiro_crew` package.
 2. `app.json` SHALL declare `defaultEnabled: false`, so a first registration
    leaves the app off.
-3. `app.json` SHALL declare exactly two crons — one push, one poll — each using
-   `command` or `script`, and each SHALL be declared with `enabled: false` so
-   that neither fires before the operator has configured the bundle repository
-   target and credentials.
+3. `app.json` SHALL declare the push cron (`command`, `enabled: false`) so it
+   cannot fire before the operator has configured the bundle repository target
+   and credentials. The poll SHALL NOT be a manifest cron: KiroCrew runs cron
+   subprocesses in a sandbox that hides the git credential store, so a command
+   cron can never reach the private bundle repository. The poll SHALL instead
+   ship as a standard-library-only script body (`host-crons/config_sync_poll.py`)
+   that an agent registers as a SCRIPT cron and whose read-only bundle-repo
+   token is an operator-approved vault grant (Deployment 5, live-install defect
+   7; see `skills/install-poll-cron/SKILL.md`). That body SHALL hand the token
+   to `git` only (by env-var name, never the value in argv) and SHALL run
+   `backend.poll` with the token removed and `CONFIG_SYNC_PREFETCHED=1`, in
+   which mode the poll SHALL make no network call.
 4. The app SHALL reuse the three named safety concerns by porting them —
    protected-branch authorization and the pre-push secret scan, the hardened git
    configuration and its symlink/TOCTOU defences, and commit-message credential
