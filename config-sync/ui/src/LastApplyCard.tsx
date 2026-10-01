@@ -50,7 +50,7 @@ export default function LastApplyCard({
               <strong>Paused crons</strong>
               <ul style={{ margin: '0.25rem 0 0', paddingLeft: '1.25rem' }}>
                 {lastApply.paused_cron_names.map((name) => {
-                  const cmd = lastApply.changed_commands.find((c) => c.name === name)
+                  const cmd = (lastApply.changed_commands ?? []).find((c) => c.name === name)
                   return (
                     <li key={name}>
                       {name}

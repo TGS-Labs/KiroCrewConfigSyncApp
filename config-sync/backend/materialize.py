@@ -301,6 +301,12 @@ def _apply_result_to_dict(
         "ignored_paths": ignored_paths,
         "dropped_cron_names": list(getattr(result, "dropped_cron_names", [])),
         "paused_cron_names": list(getattr(result, "paused_cron_names", [])),
+        # Requirement 6.10; the page's LastApply type requires this key and
+        # LastApplyCard calls `.find` on it whenever a cron was paused
+        # (live-install defect 9: it was never emitted -> page crash).
+        "changed_commands": [
+            dict(c) for c in getattr(result, "changed_commands", []) or []
+        ],
         "changed_instance_names": list(getattr(result, "changed_instance_names", [])),
         "incomplete_registrations": dict(
             getattr(result, "incomplete_registrations", {})

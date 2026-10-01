@@ -828,3 +828,33 @@ describe('ConfigSync dashboard — accessibility (buttons have accessible names)
     }
   })
 })
+
+describe('ConfigSync dashboard — live-install defect 9 (paused crons without changed_commands)', () => {
+  it('renders a last_apply that paused crons but carries no changed_commands key', async () => {
+    // The exact shape the first real apply persisted on 2026-10-01: a partial
+    // outcome, two paused crons, and NO `changed_commands` (the backend never
+    // emitted it). The page crashed with "Cannot read properties of undefined
+    // (reading 'find')". The backend now emits the key; the card must also
+    // tolerate the older persisted record.
+    const { changed_commands: _dropped, ...withoutChangedCommands } = LAST_APPLY_FULL
+    installFetchMock({
+      'GET /apps/config-sync/api/status': () =>
+        statusResponse({
+          last_apply: {
+            ...withoutChangedCommands,
+            outcome: 'partial',
+            paused_cron_names: ['config-sync/config-sync-push', 'config-sync/config-sync-poll'],
+            not_applied: { 'agent_model_state.json': 'refused — incomplete registration' },
+          },
+        }),
+    })
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/paused crons/i)).toBeInTheDocument()
+    })
+    expect(screen.getByText('config-sync/config-sync-push')).toBeInTheDocument()
+    expect(screen.getByText('config-sync/config-sync-poll')).toBeInTheDocument()
+  })
+})
