@@ -496,6 +496,18 @@ for normal practice.
     unaffected by 6.8-6.10 and remain governed solely by Requirement 6.5 (no
     vet applies to a job with no `command`); this is a ratified non-change,
     not an oversight.
+11. WHEN an applied commit applies `crons.json` and a live `crons.json`
+    exists THEN the pulled jobs SHALL be MERGED into the live store, never
+    substituted for it: every live job (matched by `name`, or by `id` when it
+    has no name) SHALL be kept exactly as it is — enabled state, vault grant,
+    runtime bookkeeping — whether or not the commit also carries it; only
+    pulled jobs with no live match SHALL be added (sanitized per 6.4-6.5);
+    a live job absent from the commit SHALL be preserved (removal stays an
+    operator action). A live `crons.json` that cannot be parsed or is not a
+    `{"jobs": [...]}` document SHALL make the file not-applied rather than
+    be overwritten. (Deployment 5, live-install defect 8: a wholesale write
+    deleted the poll's own operator-granted job.) `instances.json` keeps
+    its existing replace-and-sanitize behaviour.
 
 ### Requirement 7
 

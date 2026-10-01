@@ -103,6 +103,14 @@ To bound that risk, the applier:
 - Imports every surviving `command` job, and every job naming a `script`,
   **paused** (`user_paused`) rather than live; message-only jobs may import
   live, since they only prompt an agent and do not execute anything.
+- **Merges** a pulled `crons.json` into the live one rather than replacing
+  it: every live job is kept exactly as it is (enabled state, vault grant,
+  bookkeeping), only pulled jobs with no live match (by name, or id when
+  unnamed) are added, and a live job the commit no longer carries is never
+  deleted — removal stays an operator action on the Schedule page. A live
+  `crons.json` that cannot be parsed is left alone and the file is reported
+  not-applied. (The first live tick after this box's own push used to write
+  the committed snapshot over the live file and delete the poll's own job.)
 - Imports every `instances.json` record **disconnected**, regardless of any
   `was_connected` value in the pulled file — no instance is auto-connected as
   a result of an apply.

@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 VetCallable = Callable[[str], "str | None"]
 
@@ -183,6 +183,95 @@ def sanitize_crons(
         sanitized_store=sanitized_store,
         dropped_job_names=dropped_names,
         paused_job_names=paused_names,
+    )
+
+
+def _identity_of(job: Dict[str, Any]) -> Tuple[str, str] | None:
+    """Stable identity for matching live and pulled jobs: ``name`` first,
+    ``id`` as the fallback when ``name`` is absent — the same precedence
+    ``apply._entry_identity`` uses for placeholder restoration, namespaced so
+    a job named ``"1"`` never collides with a job whose id is ``"1"``."""
+    name = job.get("name")
+    if isinstance(name, str) and name:
+        return ("name", name)
+    job_id = job.get("id")
+    if isinstance(job_id, str) and job_id:
+        return ("id", job_id)
+    return None
+
+
+@dataclass
+class CronMergeResult:
+    """Outcome of merging a sanitized pulled ``crons.json`` into the live one.
+
+    Attributes:
+        merged_store: The document to write: the live document's own shape
+            and every live job verbatim, followed by every commit job whose
+            ``id`` is not live.
+        added_job_names: Names of the commit jobs that were added.
+        preserved_job_names: Names of every live job (all of them — a pull
+            never removes or alters a local job).
+    """
+
+    merged_store: Dict[str, Any] = field(default_factory=dict)
+    added_job_names: List[str] = field(default_factory=list)
+    preserved_job_names: List[str] = field(default_factory=list)
+
+
+def merge_crons(live: Dict[str, Any], commit: Dict[str, Any]) -> CronMergeResult:
+    """Merge a (sanitized) pulled ``crons.json`` into the live store (6.11).
+
+    Live wins, always. A job that exists live — matched by ``name``, or by
+    ``id`` when it has no name (``_identity_of``) — is kept exactly as it
+    is: its enabled state, its vault grant, its runtime bookkeeping, even if
+    the commit carries a different version of it. A commit job with no live
+    match is appended. A live job the commit no longer carries is kept:
+    pulling can never delete a local job (removal is an operator action on
+    the Schedule page). A consequence of name-matching: a fleet job that
+    shares a local job's name is not added — the local one is the one that
+    stays.
+
+    Why: the first poll tick after a box's own push used to write the
+    committed snapshot over the live file wholesale, deleting every job
+    created since the push — including the poll's own operator-granted
+    script job (live install, 2026-10-01). The host owns a job's state; the
+    bundle repo only introduces jobs.
+
+    Args:
+        live: The parsed live ``crons.json`` (``{"jobs": [...], ...}``).
+        commit: The pulled document AFTER ``sanitize_crons``.
+
+    Raises:
+        ValueError: when ``live`` is not a mapping with a ``jobs`` list — a
+            live file that cannot be merged into is never overwritten.
+    """
+    if not isinstance(live, dict) or not isinstance(live.get("jobs"), list):
+        raise ValueError(
+            "live crons.json is not a {'jobs': [...]} document; refusing to merge"
+        )
+    live_jobs: List[Dict[str, Any]] = [
+        dict(j) for j in live["jobs"] if isinstance(j, dict)
+    ]
+    live_keys = {_identity_of(j) for j in live_jobs} - {None}
+
+    added: List[Dict[str, Any]] = []
+    added_names: List[str] = []
+    for job in commit.get("jobs", []):
+        if not isinstance(job, dict):
+            continue
+        key = _identity_of(job)
+        if key is None or key in live_keys:
+            continue
+        added.append(dict(job))
+        added_names.append(_name_of(job))
+        live_keys.add(key)
+
+    merged = dict(live)
+    merged["jobs"] = live_jobs + added
+    return CronMergeResult(
+        merged_store=merged,
+        added_job_names=added_names,
+        preserved_job_names=[_name_of(j) for j in live_jobs],
     )
 
 

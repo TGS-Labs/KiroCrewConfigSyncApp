@@ -937,8 +937,34 @@ def _apply_one_file(
         if relpath == _CRONS_RELPATH:
             cron_result = sanitize.sanitize_crons(restored_doc, vet=cron_vet)
             dropped_cron_names.extend(cron_result.dropped_job_names)
-            paused_cron_names.extend(cron_result.paused_job_names)
-            final_doc = cron_result.sanitized_store
+            if existed_live:
+                # Requirement 6.11: MERGE into the live store, never replace
+                # it. A live job is kept verbatim (enabled state, grant,
+                # bookkeeping); only commit jobs absent live are added. A
+                # live file that cannot be merged into is refused rather
+                # than overwritten (live-install defect 8: a wholesale write
+                # deleted the poll's own operator-granted job).
+                if live_doc is None:
+                    not_applied[relpath] = (
+                        f"{relpath}: refused — the live crons.json could not be "
+                        "parsed, so the pulled jobs cannot be merged into it"
+                    )
+                    return
+                try:
+                    merge_result = sanitize.merge_crons(
+                        live_doc, cron_result.sanitized_store
+                    )
+                except ValueError as exc:
+                    not_applied[relpath] = f"{relpath}: refused — cannot merge: {exc}"
+                    return
+                added = set(merge_result.added_job_names)
+                paused_cron_names.extend(
+                    name for name in cron_result.paused_job_names if name in added
+                )
+                final_doc = merge_result.merged_store
+            else:
+                paused_cron_names.extend(cron_result.paused_job_names)
+                final_doc = cron_result.sanitized_store
         else:
             instance_result = sanitize.sanitize_instances(restored_doc)
             changed_instance_names.extend(instance_result.changed_instance_names)
