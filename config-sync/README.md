@@ -33,6 +33,19 @@ no agent of its own — the push and poll jobs are zero-token `command` crons,
 both `enabled: false` by default until the operator configures the bundle
 repository target and credentials.
 
+Developer tooling (pytest, black, flake8, mypy) is configured in the
+**repository-root** `pyproject.toml`, deliberately outside `config-sync/`:
+the App Store runs `pip install .` in any app directory that contains a
+`pyproject.toml`, and this stdlib app is run in place, never installed as a
+package (`tests/test_store_install_contract.py` guards this). Run the tools
+from the repository root so flake8 and mypy find their config:
+
+```bash
+source config-sync/.venv/bin/activate && pip install -e ".[dev]"
+source config-sync/.venv/bin/activate && pytest
+source config-sync/.venv/bin/activate && black . && flake8 config-sync/backend config-sync/tests && mypy config-sync/backend
+```
+
 ## Structure
 
 ```

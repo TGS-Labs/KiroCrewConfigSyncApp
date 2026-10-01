@@ -1,0 +1,52 @@
+# Developer tooling for the config-sync app. This file deliberately lives at
+# the REPOSITORY root, not in config-sync/: the KiroCrew App Store runs
+# `pip install .` in any app directory that contains a pyproject.toml, and
+# this app is plain stdlib Python run in place by the gateway, never a
+# package to install (tests/test_store_install_contract.py guards this).
+# Run Python tooling from the repository root, or from config-sync/ -- both
+# resolve this file.
+
+[project]
+name = "config-sync-dev"
+version = "0.1.0"
+description = "Developer tooling for the config-sync Kiro Crew app (not the app itself)"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "hypothesis>=6.100,<7",
+    "black>=24.0,<25",
+    "flake8>=7.0,<8",
+    "flake8-pyproject>=1.2,<2",
+    "mypy>=1.10,<2",
+]
+
+[tool.setuptools]
+# No package to ship: this project exists only to pin the dev toolchain.
+packages = []
+
+[tool.black]
+line-length = 88
+extend-exclude = "node_modules|\\.venv"
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+exclude = [".venv", ".git", "__pycache__", ".hypothesis", ".pytest_cache", "node_modules"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+mypy_path = "config-sync"
+
+[[tool.mypy.overrides]]
+module = "kiro_crew.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["config-sync/tests"]
+pythonpath = ["config-sync"]
