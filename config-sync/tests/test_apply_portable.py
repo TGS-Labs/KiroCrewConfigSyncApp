@@ -939,8 +939,11 @@ def test_apply_result_carries_untracked_prompt_agents_from_registration(
 ) -> None:
     """An agent whose ``prompt`` is a ``file://`` reference resolving to a
 
-    root but an UNTRACKED relpath (``config-bundles/skills/**`` --
-    requirements.md 5.11(c) / 1.8) must surface by name in
+    root but an UNTRACKED relpath (``config-bundles/sync-bundles.sh``'s
+    own directory shape, still untracked per requirements.md 1.8's other
+    half -- only ``config-bundles/skills/**`` was narrowed into scope by
+    the 2026-10-03 operator ruling, not every path under
+    ``config-bundles/``) must surface by name in
     ``ApplyResult.untracked_prompt_agents``, verbatim from
     ``registration.Result.untracked_prompt_agents`` -- this pins that
     ``apply_commit`` actually plumbs the field through rather than
@@ -952,7 +955,7 @@ def test_apply_result_carries_untracked_prompt_agents_from_registration(
             {
                 "name": "untracked-prompt-agent",
                 "prompt": (
-                    "file://${KIROCREW_HOME}/config-bundles/skills/" "foo/SKILL.md"
+                    "file://${KIROCREW_HOME}/config-bundles/some-other-dir/" "foo.md"
                 ),
             },
             indent=2,

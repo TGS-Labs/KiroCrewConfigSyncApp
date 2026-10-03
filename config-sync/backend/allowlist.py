@@ -79,11 +79,23 @@ class AllowlistEntry:
       crosses a ``/``).
     - ``**/`` matches zero or more whole path segments.
     - every other character is literal.
+
+    ``write_relpath_prefix_strip`` is ``None`` for every ordinary entry —
+    the matched relpath is both the collected (push-side) identity and the
+    applied (pull-side) write target, unchanged. It is set to a literal
+    prefix string ONLY for an entry whose on-disk staging location differs
+    from where the file must be WRITTEN on apply: `config-bundles/skills/`
+    is tracked at its real staging path (so push collects the right bytes
+    from where `sync-bundles.sh` actually puts them) but applied with that
+    prefix stripped, landing at the live `skills/` path the gateway and
+    `skill_search` scan (operator ruling, 2026-10-03, see
+    `test_allowlist_bundle_skills.py`). No other entry needs or uses this.
     """
 
     root: str
     pattern: str
     propagation_class: PropagationClass
+    write_relpath_prefix_strip: str | None = None
 
 
 def _compile_pattern(pattern: str) -> re.Pattern[str]:
@@ -144,6 +156,29 @@ _ROOT_A_ENTRIES: Sequence[AllowlistEntry] = (
         "A",
         "config-bundles/agent-prompts/*.md",
         PropagationClass.LIVE_IN_NEW_SESSION,
+    ),
+    # Operator ruling, 2026-10-03 (supersedes the prior exclusion in
+    # requirements.md 1.8, which this entry pair narrows rather than
+    # reverses wholesale — config-bundles/sync-bundles.sh itself, and any
+    # OTHER config-bundles/ path, stays untracked): sync-bundles.sh
+    # flattens every <bundle>/skills/<name>/ in the source repo into
+    # config-bundles/skills/<name>/ on this host, but that staging path
+    # was never scanned by skill_search or the gateway's own skill
+    # loader (~/.kiro/crew/skills/). Tracking it here with a prefix-strip
+    # write remap means a bundle-nested skill (e.g. tgs-labs/skills/sdlc)
+    # becomes loadable via the normal push/apply cycle instead of staying
+    # staged forever pending a manual copy.
+    AllowlistEntry(
+        "A",
+        "config-bundles/skills/**/SKILL.md",
+        PropagationClass.LIVE_IMMEDIATE,
+        write_relpath_prefix_strip="config-bundles/",
+    ),
+    AllowlistEntry(
+        "A",
+        "config-bundles/skills/**/scripts/**",
+        PropagationClass.LIVE_IMMEDIATE,
+        write_relpath_prefix_strip="config-bundles/",
     ),
 )
 
@@ -272,3 +307,29 @@ def is_tracked(root: str, relpath: str) -> bool:
     return any(
         entry.root == root and entry_matches(entry, relpath) for entry in ALLOWLIST
     )
+
+
+def write_relpath(root: str, relpath: str) -> str:
+    """The relpath a MATCHED file is actually WRITTEN to on apply.
+
+    For every entry except the ``config-bundles/skills/**`` pair, this is
+    the identity function: the collected relpath IS the applied relpath,
+    unchanged. For a ``config-bundles/skills/**`` hit, the entry's
+    ``write_relpath_prefix_strip`` ("config-bundles/") is stripped from the
+    front, so ``config-bundles/skills/sdlc/SKILL.md`` resolves to
+    ``skills/sdlc/SKILL.md`` — the live path, not the staging path.
+
+    Looks up the FIRST matching entry for ``(root, relpath)`` (matching
+    ``is_tracked``'s own admission order); a ``relpath`` that matches no
+    entry at all returns itself unchanged as a safe fallback — callers are
+    expected to gate on ``is_tracked`` first, exactly as ``apply.py`` does,
+    so this never needs to signal "untracked" on its own.
+    """
+    for entry in ALLOWLIST:
+        if entry.root != root or not entry_matches(entry, relpath):
+            continue
+        prefix = entry.write_relpath_prefix_strip
+        if prefix and relpath.startswith(prefix):
+            return relpath[len(prefix) :]
+        return relpath
+    return relpath

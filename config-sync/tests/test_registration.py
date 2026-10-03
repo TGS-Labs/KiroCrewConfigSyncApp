@@ -1394,10 +1394,12 @@ class TestUntrackedPromptLocationNotRequiredButReported:
     ) -> None:
         """A ``file://`` value under root A but at a path the allowlist
 
-        does NOT track (e.g. ``config-bundles/skills/**``, ratified as
-        untracked per requirements.md 1.8) also makes the prompt part
-        not required, reported as an untracked location -- distinct from
-        "outside both roots" but the same reporting outcome per 5.11(c).
+        does NOT track (``config-bundles/some-other-dir/**`` -- the other
+        half of requirements.md 1.8 that the 2026-10-03 operator ruling
+        left untracked; only ``config-bundles/skills/**`` was narrowed
+        into scope) also makes the prompt part not required, reported as
+        an untracked location -- distinct from "outside both roots" but
+        the same reporting outcome per 5.11(c).
         """
         root = tmp_path / "commit"
         root_a = tmp_path / "root-a"
@@ -1410,7 +1412,7 @@ class TestUntrackedPromptLocationNotRequiredButReported:
             root,
             _75_AGENT_NAME,
             prompt=(
-                "file://${KIROCREW_HOME}/config-bundles/skills/" "some-skill/SKILL.md"
+                "file://${KIROCREW_HOME}/config-bundles/some-other-dir/" "some-skill.md"
             ),
         )
         _75_write_shared_files_with_key(root, _75_AGENT_NAME)

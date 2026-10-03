@@ -846,6 +846,16 @@ def _apply_one_file(
     """
     root_path = _root_path(root)
 
+    # The relpath this file is actually WRITTEN to on the live filesystem
+    # — identity for every entry except config-bundles/skills/**, whose
+    # staging prefix is stripped here so a bundle-nested skill lands at
+    # its live skills/<name>/... path, not at config-bundles/skills/
+    # itself (operator ruling, 2026-10-03; see allowlist.write_relpath).
+    # `relpath` keeps referring to the COMMIT-side path throughout this
+    # function (where `source` reads from); only the live-side target,
+    # backup destination, and reporting keys use `live_relpath`.
+    live_relpath = allowlist.write_relpath(root, relpath)
+
     # Resolve and check containment ONCE, before any filesystem touch
     # (exists/read/backup/unlink/write). `live_target` below is the
     # single resolved path every later operation on this file uses —
@@ -854,7 +864,7 @@ def _apply_one_file(
     # `steering/` itself pointing outside the root) is caught HERE,
     # before the backup step's `exists()`/read or the delete branch's
     # `unlink()` can ever reach through it.
-    live_target = _resolve_target(root_path, relpath)
+    live_target = _resolve_target(root_path, live_relpath)
     if live_target is None:
         not_applied[relpath] = (
             f"{relpath}: refused — the live path escapes root {root}'s "
@@ -875,8 +885,8 @@ def _apply_one_file(
     # every earlier file's write and the restore dir stay intact.
     live_existed_before = live_target.exists()
     if live_existed_before:
-        _backup_file(live_target, restore_dir, root, relpath)
-        backup_copy = restore_dir / root / relpath
+        _backup_file(live_target, restore_dir, root, live_relpath)
+        backup_copy = restore_dir / root / live_relpath
         if not backup_copy.is_file():
             raise RuntimeError(
                 f"refusing to modify {relpath}: backup was not "
@@ -892,7 +902,7 @@ def _apply_one_file(
             return
         applied.append(relpath)
         applied_files.append(
-            AppliedFile(root=root, relpath=relpath, kind=ChangeKind.removed)
+            AppliedFile(root=root, relpath=live_relpath, kind=ChangeKind.removed)
         )
         return
 
@@ -1090,13 +1100,13 @@ def _apply_one_file(
         applied_files.append(
             AppliedFile(
                 root=root,
-                relpath=relpath,
+                relpath=live_relpath,
                 kind=_classify_kind(existed_live),
                 frontmatter_changed=frontmatter_changed,
             )
         )
         if not existed_live:
-            created_by_root[root].append(relpath)
+            created_by_root[root].append(live_relpath)
     except OSError as exc:
         not_applied[relpath] = f"{relpath}: write failed — {exc}"
 
