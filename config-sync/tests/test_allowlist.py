@@ -161,6 +161,14 @@ EXPECTED_CLASSIFICATION = {
         "A",
         "config-bundles/agent-prompts/*.md",
     ): allowlist.PropagationClass.LIVE_IN_NEW_SESSION,
+    (
+        "A",
+        "config-bundles/skills/**/SKILL.md",
+    ): allowlist.PropagationClass.LIVE_IMMEDIATE,
+    (
+        "A",
+        "config-bundles/skills/**/scripts/**",
+    ): allowlist.PropagationClass.LIVE_IMMEDIATE,
     ("B", "agents/*.json"): allowlist.PropagationClass.LIVE_ON_NEXT_RESOLUTION,
 }
 
@@ -438,13 +446,10 @@ def test_agent_prompt_direct_child_is_tracked_with_live_in_new_session() -> None
         # requirements.md 1.7: a non-.md file directly in agent-prompts/
         # must not be selected.
         "config-bundles/agent-prompts/x.txt",
-        # requirements.md 1.8: nothing under config-bundles/skills/** is
-        # selected, including a nested SKILL.md that would otherwise match
-        # the unrelated skills/**/SKILL.md entry by basename alone.
-        "config-bundles/skills/foo/SKILL.md",
-        "config-bundles/skills/foo/scripts/run.sh",
-        # requirements.md 1.8: config-bundles/sync-bundles.sh is not
-        # selected — it is delivered by its own mechanism.
+        # config-bundles/sync-bundles.sh is not selected — it is delivered
+        # by its own mechanism, not by this app (requirements.md 1.8's
+        # OTHER half, which the 2026-10-03 operator ruling leaves intact:
+        # only config-bundles/skills/** was narrowed back into scope).
         "config-bundles/sync-bundles.sh",
     ],
 )

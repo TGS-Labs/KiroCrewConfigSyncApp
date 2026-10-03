@@ -83,11 +83,18 @@ public-facing commit by accident.
    (`config-bundles/agent-prompts/x/y.md`) or a non-`.md` file there SHALL
    NOT be selected.
 8. No allowlist entry SHALL select any other path under `config-bundles/` —
-   in particular `config-bundles/skills/**` and `config-bundles/sync-bundles.sh`
-   SHALL NOT be selected. (An agent `resources` entry is not a registration
-   part, so an absent skill degrades an agent without breaking its
-   registration; `config-bundles/skills/` is delivered by `sync-bundles.sh`,
-   and widening scope to it needs its own operator ruling.)
+   in particular `config-bundles/sync-bundles.sh` SHALL NOT be selected.
+   **SUPERSEDED IN PART (operator ruling, 2026-10-03):** the prior text of
+   this criterion also excluded `config-bundles/skills/**`; that exclusion
+   is now narrowed away. `config-bundles/skills/**/SKILL.md` and
+   `config-bundles/skills/**/scripts/**` ARE tracked on root A, with
+   `LIVE_IMMEDIATE` propagation, because a skill a sub-bundle flattens into
+   `config-bundles/skills/<name>/` via `sync-bundles.sh` was never
+   otherwise reachable by this app and stayed permanently invisible to
+   `skill_search`/the gateway's own skill loader (`~/.kiro/crew/skills/`).
+   Applying such a hit writes to the LIVE `skills/<name>/...` relpath, not
+   to `config-bundles/skills/<name>/...` — see Requirement 4.15.
+   `config-bundles/sync-bundles.sh` itself remains untracked.
 
 ### Requirement 2
 
@@ -295,8 +302,10 @@ effect without a second, redundant approval step on the box.
     whose target does not exist on this host (glob patterns are checked for
     at least one match) THEN the apply result SHALL list it as an unresolved
     reference, and SHALL NOT refuse the file — an agent resource under an
-    untracked location such as `config-bundles/skills/` is delivered by that
-    location's own mechanism, not by this app.
+    untracked location (one still not covered by Requirement 1.8, e.g. a
+    path under `config-bundles/` other than `agent-prompts/*.md` or
+    `skills/**`) is delivered by that location's own mechanism, not by
+    this app.
 14. WHEN a poll's automatic apply outcome is `partial` (Requirement 4.8) THEN
     `base_sha` SHALL NOT advance from the range's start; the app SHALL record
     the not-applied paths and their REAL per-path failure reasons (the actual
@@ -321,8 +330,18 @@ effect without a second, redundant approval step on the box.
     every tick. A retry that writes nothing SHALL leave no restore point
     (neither a state entry nor a directory on disk); a restore point exists
     only for an attempt that actually wrote at least one path.
-
-### Requirement 5
+15. (Operator ruling, 2026-10-03.) WHEN an applied commit contains a path
+    matching the Requirement 1.8 `config-bundles/skills/**/SKILL.md` or
+    `config-bundles/skills/**/scripts/**` entries THEN the app SHALL write
+    that file's content to the LIVE relpath with the `config-bundles/`
+    prefix stripped (`skills/<name>/SKILL.md`, `skills/<name>/scripts/
+    ...`), NEVER to the staging relpath it was collected/matched at. This
+    is the one allowlist class whose collected (push-side) identity and
+    applied (pull-side) write target differ; every other tracked class's
+    collected relpath IS its write target, unchanged. The apply result's
+    `applied` list and propagation report are keyed to the per-file
+    outcome of this remapped write (requirements.md 5.3's `LIVE_IMMEDIATE`
+    classification applies to the live path, not the staging path).
 
 **User Story:** As a KiroCrew operator, I want an applied pull to actually take
 effect — and to be told plainly when it will not take effect until I do
